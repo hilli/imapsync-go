@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.57.0
 )

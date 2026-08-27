@@ -9,14 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/hilli/imapsync-go/internal/budget"
 	"github.com/hilli/imapsync-go/internal/config"
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/state"
 	"github.com/hilli/imapsync-go/internal/syncer"
 )
@@ -50,6 +54,10 @@ type syncFlags struct {
 	insecureSrc bool
 	insecureDst bool
 	trace       bool
+
+	srcConns    int
+	dstConns    int
+	memoryLimit string
 }
 
 func newSyncCmd() *cobra.Command {
@@ -64,8 +72,10 @@ It is safe to interrupt and re-run. Progress is recorded in a state database as
 the copy proceeds, and a message whose append was in flight when the process
 stopped is searched for on the destination before it is copied again.
 
-This is the single-connection engine: folders and messages are copied in
-sequence. Concurrency arrives in a later release.`,
+Copying runs over several connections at once, across folders and within a
+single large one. Servers differ enormously in how many connections they will
+tolerate, so raise --source-connections and --dest-connections gradually and
+watch for authentication failures.`,
 		Example: `  # Straight from flags
   imapsync-go sync \
       --source-url imaps://you@imap.mail.me.com --source-password-env ICLOUD_APP_PW \
@@ -106,6 +116,10 @@ sequence. Concurrency arrives in a later release.`,
 	cmd.Flags().BoolVar(&f.automap, "automap", true, "map special folders such as Sent and Trash onto the destination's own names")
 	cmd.Flags().BoolVar(&f.includeVirtual, "include-virtual", false, "copy virtual mailboxes such as Gmail's All Mail, which duplicate the account")
 
+	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
+	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
+	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once")
+
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
 	cmd.Flags().BoolVar(&f.insecureSrc, "source-insecure", false, "skip TLS certificate verification for the source (test use only)")
 	cmd.Flags().BoolVar(&f.insecureDst, "dest-insecure", false, "skip TLS certificate verification for the destination, for example a self-signed server on your own network")
@@ -145,17 +159,35 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		trace = os.Stderr
 	}
 
-	src, err := connect(ctx, source, f, f.insecureSrc, trace)
+	limit, err := parseBytes(f.memoryLimit)
 	if err != nil {
-		return fmt.Errorf("connecting to source: %w", err)
+		return fmt.Errorf("invalid --memory-limit: %w", err)
 	}
-	defer closeConn(ctx, src, "source")
+	bytesInFlight, err := budget.New(limit)
+	if err != nil {
+		return fmt.Errorf("invalid --memory-limit: %w", err)
+	}
 
-	dst, err := connect(ctx, dest, f, f.insecureDst, trace)
+	// EXAMINE on the source: reading a message must not mark it \Seen, which
+	// would rewrite an account this tool is only supposed to read.
+	srcPool, err := pool.New(pool.Options{
+		Cap:    f.srcConns,
+		Dial:   dialer(source, f, f.insecureSrc, trace),
+		Select: imapx.SelectOptions{ReadOnly: true},
+	})
 	if err != nil {
-		return fmt.Errorf("connecting to destination: %w", err)
+		return fmt.Errorf("source connections: %w", err)
 	}
-	defer closeConn(ctx, dst, "dest")
+	defer closePool(ctx, srcPool, "source")
+
+	dstPool, err := pool.New(pool.Options{
+		Cap:  f.dstConns,
+		Dial: dialer(dest, f, f.insecureDst, trace),
+	})
+	if err != nil {
+		return fmt.Errorf("destination connections: %w", err)
+	}
+	defer closePool(ctx, dstPool, "dest")
 
 	if pairName == "" {
 		pairName, err = derivePairID(source, dest)
@@ -165,7 +197,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	}
 
 	started := time.Now()
-	report, err := syncer.New(src, dst, db, syncer.Options{
+	report, err := syncer.New(srcPool, dstPool, db, bytesInFlight, syncer.Options{
 		PairID:  pairName,
 		Folders: opts,
 		DryRun:  f.dryRun,
@@ -282,32 +314,73 @@ func compilePatterns(patterns []string, label string) ([]*regexp.Regexp, error) 
 // the flags because the two sides routinely differ: a self-signed destination
 // on your own network is a reasonable thing to accept, and accepting it must
 // not also stop verifying a public source over the internet.
-func connect(ctx context.Context, ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) (imapx.Conn, error) {
-	addr, err := ep.Address()
-	if err != nil {
-		return nil, err
+// dialer builds the function a pool calls to open one more connection.
+//
+// The password is resolved once, here, rather than on every dial: a keychain
+// lookup can prompt, and a pool that grows to thirty connections should not
+// prompt thirty times.
+func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) pool.DialFunc {
+	var (
+		once     sync.Once
+		addr     config.Address
+		password string
+		resolve  error
+	)
+	return func(ctx context.Context) (imapx.Conn, error) {
+		once.Do(func() {
+			if addr, resolve = ep.Address(); resolve != nil {
+				return
+			}
+			password, resolve = ep.Password.Resolve()
+		})
+		if resolve != nil {
+			return nil, resolve
+		}
+		return imapx.Dial(ctx, imapx.DialOptions{
+			Addr:               addr,
+			Password:           password,
+			DebugWriter:        trace,
+			Timeout:            f.dialTimeout,
+			InsecureSkipVerify: insecure,
+		})
 	}
-	password, err := ep.Password.Resolve()
-	if err != nil {
-		return nil, err
-	}
-	return imapx.Dial(ctx, imapx.DialOptions{
-		Addr:               addr,
-		Password:           password,
-		DebugWriter:        trace,
-		Timeout:            f.dialTimeout,
-		InsecureSkipVerify: insecure,
-	})
 }
 
-func closeConn(ctx context.Context, c imapx.Conn, label string) {
+func closePool(ctx context.Context, p *pool.Pool, label string) {
 	// LOGOUT is the polite ending and lets a server release the session
 	// promptly, which matters on accounts with a low connection ceiling. A
 	// failure here cannot affect what was already copied.
-	if err := c.Logout(ctx); err != nil {
-		slog.Debug("logout failed", "side", label, "error", err)
+	if err := p.Close(ctx); err != nil {
+		slog.Debug("closing connections failed", "side", label, "error", err)
 	}
-	_ = c.Close()
+}
+
+// parseBytes reads a size written the way people write sizes.
+func parseBytes(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+		{"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3},
+		{"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1},
+	}
+	mult := int64(1)
+	for _, u := range units {
+		if rest, ok := strings.CutSuffix(t, u.suffix); ok {
+			t, mult = strings.TrimSpace(rest), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a size such as 256MiB", s)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%q must be greater than zero", s)
+	}
+	return n * mult, nil
 }
 
 // derivePairID names this migration in the state database.
@@ -388,8 +461,9 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if dryRun {
 		copiedWord = "to copy"
 	}
-	p.printf("\n%d %s, %d %s, %d adopted, %d failed, in %s\n",
-		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, failed, elapsed.Round(time.Millisecond))
+	p.printf("\n%d %s, %d %s, %d adopted, %d failed, in %s%s\n",
+		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, failed,
+		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
 
 	// Skips the caller asked for are not news: narrowing a 144-folder account
 	// to two with --folder should not bury the two skips that were our own
@@ -423,6 +497,20 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 		}
 	}
 	return p.err
+}
+
+// rate reports how fast messages were copied.
+//
+// It is the number that says whether a run of 776,747 messages will take days
+// or hours, and the only way to tell whether raising --source-connections
+// helped. Adopted and already-recorded messages are left out: they cost a
+// header comparison rather than a transfer, and counting them would flatter a
+// re-run into looking like a fast copy.
+func rate(copied int, elapsed time.Duration, dryRun bool) string {
+	if dryRun || copied == 0 || elapsed <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%.1f messages/second)", float64(copied)/elapsed.Seconds())
 }
 
 func plural(n int, word string) string {

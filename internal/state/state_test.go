@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -394,4 +396,128 @@ func mustSyncedUIDs(t *testing.T, db *DB, folderID int64, srcUIDValidity uint32)
 		t.Fatalf("SyncedUIDs() error = %v", err)
 	}
 	return got
+}
+
+// The concurrent engine writes twice per message, from as many goroutines as
+// there are destination connections. SQLite serialises writers, so the question
+// is whether that serialisation surfaces as SQLITE_BUSY errors under a load the
+// engine will really produce. It is cheaper to find out here than to find out
+// halfway through a 414,022-message folder.
+func TestConcurrentWritersDoNotContend(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	folder, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder: %v", err)
+	}
+
+	const (
+		workers         = 32
+		perWorker       = 40
+		srcUIDValidity  = uint32(1)
+		destUIDValidity = uint32(2)
+	)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*perWorker*2)
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perWorker {
+				uid := uint32(w*perWorker + i + 1)
+				m := Message{
+					FolderID:       folder.ID,
+					SrcUIDValidity: srcUIDValidity,
+					SrcUID:         uid,
+					IdentHash:      fmt.Sprintf("hash-%d", uid),
+					Size:           int64(uid) * 10,
+					InternalDate:   time.Unix(int64(uid), 0).UTC(),
+				}
+				if err := db.BeginAppend(ctx, m); err != nil {
+					errs <- fmt.Errorf("BeginAppend(%d): %w", uid, err)
+					continue
+				}
+				if err := db.CompleteAppend(ctx, folder.ID, srcUIDValidity, uid, destUIDValidity, uid+1000); err != nil {
+					errs <- fmt.Errorf("CompleteAppend(%d): %w", uid, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent write failed: %v", err)
+	}
+
+	synced, err := db.SyncedUIDs(ctx, folder.ID, srcUIDValidity)
+	if err != nil {
+		t.Fatalf("SyncedUIDs: %v", err)
+	}
+	if len(synced) != workers*perWorker {
+		t.Fatalf("recorded %d messages, want %d", len(synced), workers*perWorker)
+	}
+	for uid, st := range synced {
+		if st != StateDone {
+			t.Fatalf("uid %d is %q, want done", uid, st)
+		}
+	}
+}
+
+// Readers must not be blocked out by a steady stream of writes, or a folder
+// diff on one folder would stall every worker on every other folder. WAL exists
+// precisely so this is true, but the DSN has to actually be asking for it.
+func TestReadsProceedDuringWrites(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	folder, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		var uid uint32
+		for {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			uid++
+			if err := db.BeginAppend(ctx, Message{
+				FolderID: folder.ID, SrcUIDValidity: 1, SrcUID: uid,
+				IdentHash: fmt.Sprintf("h%d", uid), InternalDate: time.Unix(1, 0).UTC(),
+			}); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	reads := 0
+	for time.Now().Before(deadline) {
+		if _, err := db.SyncedUIDs(ctx, folder.ID, 1); err != nil {
+			close(stop)
+			t.Fatalf("read %d during writes: %v", reads, err)
+		}
+		reads++
+	}
+	close(stop)
+	if err := <-done; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	if reads < 10 {
+		t.Errorf("only %d reads completed in 500ms of concurrent writing", reads)
+	}
 }
