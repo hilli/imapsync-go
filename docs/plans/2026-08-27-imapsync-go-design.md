@@ -42,10 +42,43 @@ the available connections.
 | Config file | Yes, multi-pair, credentials referenced not inlined |
 | Output | `log/slog` (text on TTY, JSON when piped) + compact live progress |
 
-## 3. Library verification
+## 3. IMAP library selection
 
-Checked against `github.com/emersion/go-imap/v2@v2.0.0-beta.8` source, not from
-memory:
+### 3.1 Survey
+
+| Library | Stars | State | Verdict |
+|---|---|---|---|
+| `emersion/go-imap` **v2** | 2350 (repo) | `v2.0.0-beta.8`, actively pushed | **Chosen** |
+| `emersion/go-imap` **v1** | same repo, `v1` branch | stable, maintenance only | Rejected: no CONDSTORE |
+| `mjl-/mox/imapclient` | n/a | MIT, actively developed | Rejected as a dependency; kept as a reference |
+| `BrianLeishman/go-imap` | 109 | active | Rejected: package-level mutable global state |
+| `mxk/go-imap` | 213 | no commits since 2020 | Rejected: unmaintained |
+| `evmar/go-imap` | 74 | no commits since 2011 | Rejected: unmaintained |
+
+**v1 is eliminated on a single fact.** Its extensions live in twelve separate
+repositories — `appendlimit`, `compress`, `enable`, `id`, `idle`, `metadata`,
+`move`, `quota`, `sortthread`, `specialuse`, `uidplus`, `unselect` — and
+CONDSTORE is not among them. Most were last touched between 2019 and 2021. The
+largest performance lever in this design exists only in v2.
+
+**`BrianLeishman/go-imap` is eliminated on our exact axis.** Its `vars.go`
+exposes package-level mutable globals (`Verbose`, `RetryCount`, `DialTimeout`,
+`CommandTimeout`, `TLSSkipVerify`) plus a package-global `lastResp` holding the
+most recent server response. That races under concurrent connections and makes
+it impossible to configure the source and destination endpoints differently
+within one process. For a tool built on many simultaneous connections, this is
+disqualifying regardless of the library's other merits.
+
+**`mox/imapclient` is rejected as a dependency but retained as a reference.** Its
+`parse.go` already handles `VANISHED` and `MODSEQ`, quite possibly making it the
+only Go client that understands QRESYNC. However it self-describes as
+"primarily for testing the mox IMAP4 server", offers no API stability guarantee,
+and pulls in mox's `mlog` and `moxio` packages. It is MIT licensed, so it is a
+legitimate implementation reference when we write QRESYNC ourselves.
+
+### 3.2 Capability verification
+
+Checked against `github.com/emersion/go-imap/v2@v2.0.0-beta.8` source:
 
 | Requirement | Status |
 |---|---|
@@ -54,21 +87,27 @@ memory:
 | SPECIAL-USE, MOVE, ESEARCH, IDLE, SORT, ENABLE, UNSELECT | Supported |
 | **QRESYNC** | **Capability constant only.** No `VANISHED` handling anywhere |
 | **MULTIAPPEND** | **Capability constant only.** `Append()` is single-message |
-| **COMPRESS** (RFC 4978) | **Absent entirely** |
+| **COMPRESS** (RFC 4978) | **Absent entirely** (v1 has `go-imap-compress`; v2 does not) |
 | `imapserver/imapmemserver` | Present — usable as an in-process test backend |
 
-Consequences:
+### 3.3 Consequences
 
-- QRESYNC moves to post-v1 and would require an upstream contribution.
-  CONDSTORE alone delivers most of the repeat-sync win.
+- **QRESYNC will not arrive upstream on its own.** PR #423, "Support for QRESYNC
+  (RFC 7162) only for the client", was opened in 2021 and closed unmerged; the
+  tracking issue `imapclient: support QRESYNC` remains open. Post-v1 QRESYNC
+  means we implement it, not that we wait for it.
 - `Append(mailbox string, size int64, ...)` requires the literal length **before**
   the body is written. This vindicates spooling: we append our own *measured*
   byte count rather than trusting `RFC822.SIZE`, which some servers misreport.
 - go-imap's client is not safe for concurrent commands. Our one-goroutine-per-
   connection pool makes that structurally impossible rather than merely avoided.
 
-The library sits behind a narrow internal interface from day one, so replacing or
-forking it stays cheap.
+### 3.4 Residual risk
+
+v2 has shipped eight beta releases with no stable tag, so API churn is a live
+risk. The `internal/imapx` façade is therefore load-bearing rather than
+ceremonial: everything the rest of the codebase knows about IMAP passes through
+it, so forking, extending or replacing the library stays a contained change.
 
 ## 4. Architecture
 
@@ -261,8 +300,9 @@ That single invariant is the tombstone for the duplication bug.
 - **M3** — AIMD governor + fault-injection suite.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping.
 - **M5** — `compat` shim, `--delete2` + safety valve, progress UI.
-- **Post-v1** — QRESYNC (upstream contribution), MULTIAPPEND batching, COMPRESS,
-  and broader server support: Dovecot, Gmail, Microsoft 365, Cyrus.
+- **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed unmerged),
+  MULTIAPPEND batching, COMPRESS, and broader server support: Dovecot, Gmail,
+  Microsoft 365, Cyrus.
 
 M1 precedes M2 deliberately. Concurrency bugs layered on an unproven diff are
 undebuggable.
