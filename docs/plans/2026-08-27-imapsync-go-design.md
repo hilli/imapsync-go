@@ -143,6 +143,28 @@ whole premise is hundreds of connections to a throttling server.
 closes the socket on expiry. Any future blocking call added to the façade needs
 the same treatment.
 
+Commands are a weaker case. go-imap's command API predates `context` and offers
+no way to abandon a command in flight, so `imapx`'s operations check `ctx.Err()`
+on entry and honour cancellation *between* commands only. That is enough to stop
+a cancelled run from issuing the next few hundred thousand commands, and the
+alternative — closing the connection to interrupt a command — is exactly what
+§3.7 reserves for genuine desynchronisation.
+
+### 3.7 A short APPEND literal is unrecoverable
+
+APPEND declares its literal's length before sending the bytes, and IMAP has no
+way to retract that number. If fewer bytes follow than were promised, the server
+goes on reading message data expecting the remainder, no tagged response is ever
+sent, and a client that waits for one blocks until the process dies. Measured:
+reverting the guard makes the test hang for its full timeout rather than fail.
+
+This makes the "spool with a *measured* byte count" rule from §4 load-bearing for
+connection survival, not merely for correctness: `RFC822.SIZE` is a claim servers
+get wrong, and trusting it would hang the run. `imapx.Append` verifies the copied
+length against the declared one and, on any mismatch, destroys the connection and
+returns `ErrConnectionBroken` rather than waiting. A connection is cheap; a hung
+sync of 776,747 messages is not.
+
 ## 4. Architecture
 
 ```

@@ -62,11 +62,11 @@ type Folder struct {
 	SpecialUse string   `json:"special_use,omitempty"`
 	Selectable bool     `json:"selectable"`
 
-	NumMessages   *uint32  `json:"num_messages,omitempty"`
-	Size          *int64   `json:"size,omitempty"`
-	UIDValidity   uint32   `json:"uidvalidity,omitempty"`
-	UIDNext       imap.UID `json:"uidnext,omitempty"`
-	HighestModSeq uint64   `json:"highest_modseq,omitempty"`
+	NumMessages   *uint32 `json:"num_messages,omitempty"`
+	Size          *int64  `json:"size,omitempty"`
+	UIDValidity   uint32  `json:"uidvalidity,omitempty"`
+	UIDNext       uint32  `json:"uidnext,omitempty"`
+	HighestModSeq uint64  `json:"highest_modseq,omitempty"`
 }
 
 // Namespaces reports the personal namespace prefix and hierarchy delimiter.
@@ -88,6 +88,7 @@ type Conn interface {
 	Caps() Caps
 	Namespaces(ctx context.Context) (Namespaces, error)
 	ListFolders(ctx context.Context, opts ListOptions) ([]Folder, error)
+	SyncOps
 	Logout(ctx context.Context) error
 	Close() error
 }
@@ -410,7 +411,7 @@ func applyStatus(f *Folder, st *imap.StatusData) {
 	f.NumMessages = st.NumMessages
 	f.Size = st.Size
 	f.UIDValidity = st.UIDValidity
-	f.UIDNext = st.UIDNext
+	f.UIDNext = uint32(st.UIDNext)
 	f.HighestModSeq = st.HighestModSeq
 }
 

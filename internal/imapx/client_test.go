@@ -371,6 +371,10 @@ type fakeServerOptions struct {
 	// rejectExtendedList makes the server answer BAD to a LIST carrying return
 	// options, imitating a server whose capability list overpromises.
 	rejectExtendedList bool
+
+	// selectWithoutUIDValidity imitates a server that completes SELECT without
+	// telling the client how to detect renumbering.
+	selectWithoutUIDValidity bool
 }
 
 // fakeServer is a hand-rolled IMAP server that answers just enough to exercise
@@ -475,6 +479,20 @@ func (s *fakeServer) serve(conn net.Conn) {
 			send(`* LIST (\HasNoChildren \Sent) "/" "Sent Messages"`)
 			send("%s OK done", tag)
 
+		case "SELECT", "EXAMINE":
+			if s.opts.selectWithoutUIDValidity {
+				send("* 3 EXISTS")
+				send("%s OK [READ-WRITE] done", tag)
+				continue
+			}
+			send("* 3 EXISTS")
+			send("* OK [UIDVALIDITY 42] uids valid")
+			send("* OK [UIDNEXT 9] predicted next")
+			if strings.Contains(strings.ToUpper(s.opts.caps), "CONDSTORE") {
+				send("* OK [HIGHESTMODSEQ 406622125881845] highest")
+			}
+			send("%s OK [READ-WRITE] done", tag)
+
 		case "STATUS":
 			send(`* STATUS "%s" (MESSAGES 3 UIDNEXT 4 UIDVALIDITY 1)`, commandMailbox(line, fields))
 			send("%s OK done", tag)
@@ -503,4 +521,76 @@ func commandMailbox(line string, fields []string) string {
 		return fields[2]
 	}
 	return "INBOX"
+}
+
+// TestSelectAsksForCondStoreOnlyWhenAdvertised applies the rule that a client
+// must never send syntax the server has not offered. SELECT (CONDSTORE) is
+// CONDSTORE syntax; a server without the extension answers BAD to the whole
+// command, which would take the folder out of the sync entirely.
+func TestSelectAsksForCondStoreOnlyWhenAdvertised(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		caps          string
+		wantCondStore bool
+	}{
+		{"server with CONDSTORE", "IMAP4rev1 CONDSTORE", true},
+		{"server without CONDSTORE", "IMAP4rev1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := startFakeServer(t, fakeServerOptions{caps: tc.caps})
+			conn := dialFake(t, srv)
+			defer func() { _ = conn.Close() }()
+
+			mbox, err := conn.Select(context.Background(), "INBOX", SelectOptions{})
+			if err != nil {
+				t.Fatalf("Select() error = %v", err)
+			}
+
+			sent := srv.commandsMatching("SELECT")
+			if len(sent) != 1 {
+				t.Fatalf("got %d SELECT commands, want 1: %v", len(sent), sent)
+			}
+			gotCondStore := strings.Contains(strings.ToUpper(sent[0]), "CONDSTORE")
+			if gotCondStore != tc.wantCondStore {
+				t.Errorf("sent %q, CONDSTORE present = %v, want %v", sent[0], gotCondStore, tc.wantCondStore)
+			}
+
+			if mbox.UIDValidity != 42 {
+				t.Errorf("UIDValidity = %d, want 42", mbox.UIDValidity)
+			}
+			if mbox.NumMessages != 3 {
+				t.Errorf("NumMessages = %d, want 3", mbox.NumMessages)
+			}
+			if tc.wantCondStore && mbox.HighestModSeq != 406622125881845 {
+				t.Errorf("HighestModSeq = %d, want the value the server reported", mbox.HighestModSeq)
+			}
+		})
+	}
+}
+
+// TestSelectRefusesAMailboxWithoutUIDValidity covers a server that completes
+// SELECT without saying how renumbering can be detected. Syncing the folder
+// anyway would make every recorded UID untrustworthy, which is worse than
+// leaving the folder alone and saying so.
+func TestSelectRefusesAMailboxWithoutUIDValidity(t *testing.T) {
+	t.Parallel()
+
+	srv := startFakeServer(t, fakeServerOptions{
+		caps:                     "IMAP4rev1",
+		selectWithoutUIDValidity: true,
+	})
+	conn := dialFake(t, srv)
+	defer func() { _ = conn.Close() }()
+
+	_, err := conn.Select(context.Background(), "INBOX", SelectOptions{})
+	if err == nil {
+		t.Fatal("Select() accepted a mailbox with no UIDVALIDITY")
+	}
+	if !strings.Contains(err.Error(), "UIDVALIDITY") {
+		t.Errorf("error = %v, want it to name the missing UIDVALIDITY", err)
+	}
 }
