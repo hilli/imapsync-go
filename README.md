@@ -8,7 +8,9 @@ per connection, so throughput comes from running many connections and slicing
 work across them — folder-parallel *and* intra-folder parallel, so a single
 200k-message INBOX still saturates the available connections.
 
-> **Status:** early development. Milestone M0 (`probe`) works; the sync engine
+> **Status:** early development. Milestone M1 works: `probe` reports what a
+> server supports, and `sync` performs a correct, resumable, one-way copy over a
+> single connection per side. The concurrency the project exists for is M2 and
 > does not exist yet. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
 
 ## Build and run
@@ -75,6 +77,63 @@ and share.
 
 Inline passwords (`imaps://user:pass@host`) are rejected. Credentials come from
 `--password-env`, `--password-file` or `--password-keychain` (macOS).
+
+## sync
+
+`sync` copies every message the destination does not already hold.
+
+```sh
+go run ./cmd/imapsync-go sync \
+    --source-url 'imaps://you%40example.com@imap.mail.me.com' \
+    --source-password-env ICLOUD_APP_PW \
+    --dest-url imaps://you@mox.example.net \
+    --dest-password-keychain mox-imap
+```
+
+```
+Created 1 destination folder: Work
+
+SOURCE  DESTINATION  MESSAGES  COPIED  ADOPTED  ALREADY  FAILED
+INBOX   INBOX        2         2       0        0        0
+Work    Work         1         1       0        0        0
+
+2 folders, 3 copied, 0 adopted, 0 failed, in 5ms
+```
+
+Use `--dry-run` first: it reports the folders it would create and the messages
+it would copy, and writes nothing to either the destination or the state
+database.
+
+### It is safe to interrupt
+
+Progress is recorded as the copy proceeds, in a SQLite database under your user
+configuration directory (override with `--state`). Re-running skips what is
+already there:
+
+- **Already** counts messages the state database has recorded. A second run of
+  an unchanged account is entirely this column.
+- **Adopted** counts messages found already present at the destination and
+  recorded rather than copied again. This is what happens when the state
+  database is lost, when the destination was not empty to begin with, or when a
+  message's append was in flight at the moment the process stopped.
+
+Deleting the state database costs a pass over the destination's headers, not a
+duplicated account.
+
+### Choosing folders
+
+| Flag | Effect |
+| --- | --- |
+| `--folder NAME` | copy only these source folders, by exact name |
+| `--include REGEX` / `--exclude REGEX` | filter by pattern |
+| `--map SOURCE=DEST` | map one folder explicitly |
+| `--subfolder2 NAME` | nest the whole tree under one destination folder |
+| `--automap` | map `Sent`, `Trash` and friends onto the destination's own names (default) |
+| `--include-virtual` | also copy virtual mailboxes such as Gmail's All Mail |
+
+Virtual mailboxes are **skipped by default**, which differs from imapsync.
+Gmail's All Mail is a view over every other folder, so copying it duplicates the
+account.
 
 ## Configuration
 
