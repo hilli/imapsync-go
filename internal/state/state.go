@@ -1,0 +1,416 @@
+// Package state persists what has been synchronised.
+//
+// The store exists to make APPEND survivable. APPEND is not idempotent and no
+// transaction spans IMAP and SQLite, so a crash between "the server accepted
+// the message" and "we recorded it" would otherwise duplicate that message on
+// the next run. Every write here is ordered so that a crash leaves a suspect
+// row to investigate rather than a silent gap.
+package state
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite" // pure Go driver, registered as "sqlite"
+)
+
+// State is the lifecycle of one message copy.
+type State string
+
+const (
+	// StatePlanned means the message was seen on the source and not yet copied.
+	StatePlanned State = "planned"
+	// StateInFlight means an APPEND was issued and its outcome is unknown. Every
+	// such row is a suspect after a crash.
+	StateInFlight State = "in_flight"
+	// StateDone means the destination UID is known and recorded.
+	StateDone State = "done"
+	// StateFailed means the copy was abandoned with a recorded reason.
+	StateFailed State = "failed"
+)
+
+// Folder is one source mailbox and the destination it maps to.
+type Folder struct {
+	ID     int64
+	PairID string
+	Source string
+	Dest   string
+
+	SrcUIDValidity   uint32
+	DstUIDValidity   uint32
+	SrcHighestModSeq uint64
+	LastSync         time.Time
+}
+
+// Message is one message copy, keyed by its source identity.
+type Message struct {
+	FolderID       int64
+	SrcUIDValidity uint32
+	SrcUID         uint32
+
+	DstUIDValidity uint32
+	DstUID         uint32
+
+	// IdentHash is the tier-3 header digest, used to adopt messages already
+	// present on the destination when the UID map cannot answer.
+	IdentHash string
+	// StampID is the tier-4 marker, set only for messages with no usable
+	// Message-ID.
+	StampID string
+
+	State        State
+	Size         int64
+	Flags        string
+	InternalDate time.Time
+	LastError    string
+}
+
+// DB is the state store. It is safe for concurrent use.
+type DB struct {
+	db *sql.DB
+}
+
+// schema is applied in full on every open; each statement is idempotent.
+const schema = `
+CREATE TABLE IF NOT EXISTS folders (
+  id                 INTEGER PRIMARY KEY,
+  pair_id            TEXT    NOT NULL,
+  source             TEXT    NOT NULL,
+  dest               TEXT    NOT NULL,
+  src_uidvalidity    INTEGER NOT NULL DEFAULT 0,
+  dst_uidvalidity    INTEGER NOT NULL DEFAULT 0,
+  src_highestmodseq  INTEGER NOT NULL DEFAULT 0,
+  last_sync          INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (pair_id, source)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  folder_id        INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  src_uidvalidity  INTEGER NOT NULL,
+  src_uid          INTEGER NOT NULL,
+  dst_uidvalidity  INTEGER NOT NULL DEFAULT 0,
+  dst_uid          INTEGER NOT NULL DEFAULT 0,
+  ident_hash       TEXT    NOT NULL DEFAULT '',
+  stamp_id         TEXT    NOT NULL DEFAULT '',
+  state            TEXT    NOT NULL,
+  size             INTEGER NOT NULL DEFAULT 0,
+  flags            TEXT    NOT NULL DEFAULT '',
+  internaldate     INTEGER NOT NULL DEFAULT 0,
+  last_error       TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (folder_id, src_uidvalidity, src_uid)
+) WITHOUT ROWID;
+
+-- Recovery scans by state within a folder, and adoption looks messages up by
+-- digest without knowing their source UID.
+CREATE INDEX IF NOT EXISTS messages_by_state ON messages (folder_id, state);
+CREATE INDEX IF NOT EXISTS messages_by_ident ON messages (folder_id, ident_hash);
+`
+
+// Open opens or creates the state database at path.
+//
+// WAL is enabled because M2 runs many connections against this file at once,
+// and a busy timeout is set so a concurrent writer waits rather than failing
+// the run outright.
+func Open(ctx context.Context, path string) (*DB, error) {
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(10000)" +
+		"&_pragma=foreign_keys(1)" +
+		"&_pragma=synchronous(NORMAL)"
+
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening state database %s: %w", path, err)
+	}
+	if err := sqlDB.PingContext(ctx); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("opening state database %s: %w", path, err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, schema); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("applying schema to %s: %w", path, err)
+	}
+	return &DB{db: sqlDB}, nil
+}
+
+// Close releases the database.
+func (d *DB) Close() error {
+	if err := d.db.Close(); err != nil {
+		return fmt.Errorf("closing state database: %w", err)
+	}
+	return nil
+}
+
+// EnsureFolder returns the stored row for a source mailbox, creating it if this
+// is the first time the folder has been seen.
+func (d *DB) EnsureFolder(ctx context.Context, pairID, source, dest string) (Folder, error) {
+	const insert = `
+INSERT INTO folders (pair_id, source, dest) VALUES (?, ?, ?)
+ON CONFLICT (pair_id, source) DO UPDATE SET dest = excluded.dest`
+
+	if _, err := d.db.ExecContext(ctx, insert, pairID, source, dest); err != nil {
+		return Folder{}, fmt.Errorf("recording folder %q: %w", source, err)
+	}
+
+	const query = `
+SELECT id, pair_id, source, dest, src_uidvalidity, dst_uidvalidity, src_highestmodseq, last_sync
+FROM folders WHERE pair_id = ? AND source = ?`
+
+	var (
+		f        Folder
+		lastSync int64
+	)
+	err := d.db.QueryRowContext(ctx, query, pairID, source).Scan(
+		&f.ID, &f.PairID, &f.Source, &f.Dest,
+		&f.SrcUIDValidity, &f.DstUIDValidity, &f.SrcHighestModSeq, &lastSync,
+	)
+	if err != nil {
+		return Folder{}, fmt.Errorf("reading folder %q: %w", source, err)
+	}
+	if lastSync != 0 {
+		f.LastSync = time.Unix(lastSync, 0).UTC()
+	}
+	return f, nil
+}
+
+// FenceUIDValidity reconciles the stored UIDVALIDITY pair with what the servers
+// currently report, and reports whether the stored message rows survived.
+//
+// UIDVALIDITY changing means the server has renumbered the mailbox, so every
+// recorded UID on that side is meaningless. Discarding the rows forces the next
+// run to rebuild them by digest, which re-adopts the messages already on the
+// destination instead of copying them again.
+func (d *DB) FenceUIDValidity(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) (kept bool, err error) {
+	const query = `SELECT src_uidvalidity, dst_uidvalidity FROM folders WHERE id = ?`
+
+	var storedSrc, storedDst uint32
+	if err := d.db.QueryRowContext(ctx, query, folderID).Scan(&storedSrc, &storedDst); err != nil {
+		return false, fmt.Errorf("reading folder %d: %w", folderID, err)
+	}
+
+	// A zero stored value means this folder has never been synchronised, which
+	// is not an invalidation.
+	changed := (storedSrc != 0 && storedSrc != srcUIDValidity) ||
+		(storedDst != 0 && storedDst != dstUIDValidity)
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("beginning UIDVALIDITY fence: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if changed {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE folder_id = ?`, folderID); err != nil {
+			return false, fmt.Errorf("invalidating folder %d: %w", folderID, err)
+		}
+	}
+	const update = `UPDATE folders SET src_uidvalidity = ?, dst_uidvalidity = ? WHERE id = ?`
+	if _, err := tx.ExecContext(ctx, update, srcUIDValidity, dstUIDValidity, folderID); err != nil {
+		return false, fmt.Errorf("updating folder %d: %w", folderID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("committing UIDVALIDITY fence: %w", err)
+	}
+
+	return !changed, nil
+}
+
+// MarkSynced records a successful pass over a folder.
+func (d *DB) MarkSynced(ctx context.Context, folderID int64, highestModSeq uint64, at time.Time) error {
+	const update = `UPDATE folders SET src_highestmodseq = ?, last_sync = ? WHERE id = ?`
+	//nolint:gosec // modseq values are far below 2^63 in practice
+	if _, err := d.db.ExecContext(ctx, update, int64(highestModSeq), at.Unix(), folderID); err != nil {
+		return fmt.Errorf("marking folder %d synced: %w", folderID, err)
+	}
+	return nil
+}
+
+// SyncedUIDs returns the state of every recorded message in a folder, keyed by
+// source UID. It is the left-hand side of the folder diff.
+func (d *DB) SyncedUIDs(ctx context.Context, folderID int64, srcUIDValidity uint32) (map[uint32]State, error) {
+	const query = `SELECT src_uid, state FROM messages WHERE folder_id = ? AND src_uidvalidity = ?`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, srcUIDValidity)
+	if err != nil {
+		return nil, fmt.Errorf("reading synchronised UIDs for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[uint32]State)
+	for rows.Next() {
+		var (
+			uid uint32
+			st  State
+		)
+		if err := rows.Scan(&uid, &st); err != nil {
+			return nil, fmt.Errorf("reading synchronised UIDs for folder %d: %w", folderID, err)
+		}
+		out[uid] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading synchronised UIDs for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
+// BeginAppend records a message as in flight and commits before returning.
+//
+// The commit must happen before the APPEND is issued. Recording afterwards
+// would leave a crash in that window invisible, and the message would be
+// appended a second time on the next run.
+func (d *DB) BeginAppend(ctx context.Context, m Message) error {
+	const upsert = `
+INSERT INTO messages (
+  folder_id, src_uidvalidity, src_uid, ident_hash, stamp_id, state, size, flags, internaldate
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (folder_id, src_uidvalidity, src_uid) DO UPDATE SET
+  ident_hash   = excluded.ident_hash,
+  stamp_id     = excluded.stamp_id,
+  state        = excluded.state,
+  size         = excluded.size,
+  flags        = excluded.flags,
+  internaldate = excluded.internaldate,
+  last_error   = ''`
+
+	_, err := d.db.ExecContext(ctx, upsert,
+		m.FolderID, m.SrcUIDValidity, m.SrcUID, m.IdentHash, m.StampID,
+		StateInFlight, m.Size, m.Flags, m.InternalDate.Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("recording append of UID %d as in flight: %w", m.SrcUID, err)
+	}
+	return nil
+}
+
+// CompleteAppend records the destination UID an APPEND produced.
+func (d *DB) CompleteAppend(ctx context.Context, folderID int64, srcUIDValidity, srcUID, dstUIDValidity, dstUID uint32) error {
+	const update = `
+UPDATE messages SET state = ?, dst_uidvalidity = ?, dst_uid = ?, last_error = ''
+WHERE folder_id = ? AND src_uidvalidity = ? AND src_uid = ?`
+
+	res, err := d.db.ExecContext(ctx, update, StateDone, dstUIDValidity, dstUID, folderID, srcUIDValidity, srcUID)
+	if err != nil {
+		return fmt.Errorf("recording completion of UID %d: %w", srcUID, err)
+	}
+	return expectOneRow(res, srcUID)
+}
+
+// FailAppend records that a copy was abandoned, keeping the reason for the
+// operator rather than discarding it.
+func (d *DB) FailAppend(ctx context.Context, folderID int64, srcUIDValidity, srcUID uint32, reason string) error {
+	const update = `
+UPDATE messages SET state = ?, last_error = ?
+WHERE folder_id = ? AND src_uidvalidity = ? AND src_uid = ?`
+
+	res, err := d.db.ExecContext(ctx, update, StateFailed, reason, folderID, srcUIDValidity, srcUID)
+	if err != nil {
+		return fmt.Errorf("recording failure of UID %d: %w", srcUID, err)
+	}
+	return expectOneRow(res, srcUID)
+}
+
+// InFlight returns every message whose APPEND outcome is unknown. On startup
+// each one is a suspect: it may or may not have reached the destination.
+func (d *DB) InFlight(ctx context.Context, folderID int64) ([]Message, error) {
+	const query = `
+SELECT src_uidvalidity, src_uid, ident_hash, stamp_id, size, flags, internaldate, last_error
+FROM messages WHERE folder_id = ? AND state = ?
+ORDER BY src_uid`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, StateInFlight)
+	if err != nil {
+		return nil, fmt.Errorf("reading in-flight messages for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Message
+	for rows.Next() {
+		m := Message{FolderID: folderID, State: StateInFlight}
+		var internalDate int64
+		if err := rows.Scan(&m.SrcUIDValidity, &m.SrcUID, &m.IdentHash, &m.StampID, &m.Size, &m.Flags, &internalDate, &m.LastError); err != nil {
+			return nil, fmt.Errorf("reading in-flight messages for folder %d: %w", folderID, err)
+		}
+		if internalDate != 0 {
+			m.InternalDate = time.Unix(internalDate, 0).UTC()
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading in-flight messages for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
+// Failures returns every abandoned copy with the reason it was abandoned, so a
+// run can end by telling the operator what did not make it rather than only how
+// many messages did not.
+func (d *DB) Failures(ctx context.Context, folderID int64) ([]Message, error) {
+	const query = `
+SELECT src_uidvalidity, src_uid, ident_hash, size, last_error
+FROM messages WHERE folder_id = ? AND state = ?
+ORDER BY src_uid`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, StateFailed)
+	if err != nil {
+		return nil, fmt.Errorf("reading failures for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Message
+	for rows.Next() {
+		m := Message{FolderID: folderID, State: StateFailed}
+		if err := rows.Scan(&m.SrcUIDValidity, &m.SrcUID, &m.IdentHash, &m.Size, &m.LastError); err != nil {
+			return nil, fmt.Errorf("reading failures for folder %d: %w", folderID, err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading failures for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
+// Counts summarises a folder's rows by state, for progress and for status.
+func (d *DB) Counts(ctx context.Context, folderID int64) (map[State]int, error) {
+	const query = `SELECT state, COUNT(*) FROM messages WHERE folder_id = ? GROUP BY state`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID)
+	if err != nil {
+		return nil, fmt.Errorf("counting messages in folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[State]int)
+	for rows.Next() {
+		var (
+			st State
+			n  int
+		)
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, fmt.Errorf("counting messages in folder %d: %w", folderID, err)
+		}
+		out[st] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("counting messages in folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
+// ErrNotRecorded means an update targeted a message the store has never seen,
+// which indicates the caller skipped BeginAppend.
+var ErrNotRecorded = errors.New("message not recorded")
+
+func expectOneRow(res sql.Result, srcUID uint32) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking update of UID %d: %w", srcUID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("UID %d: %w", srcUID, ErrNotRecorded)
+	}
+	return nil
+}
