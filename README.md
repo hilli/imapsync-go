@@ -119,6 +119,7 @@ a folder leaves the remaining mailboxes to trickle through one at a time.
 | `--source-connections` | 4 | Connections to the source, and the number of folders in flight |
 | `--dest-connections` | 8 | Connections to the destination |
 | `--memory-limit` | 256MiB | Ceiling on message bodies held in memory at once |
+| `--progress-interval` | 30s | How often to report what the run has done; `0` to keep quiet |
 
 The destination gets more connections than the source because appending is the
 slower half: the server has to accept, store and index a whole message where the
@@ -135,6 +136,33 @@ disk. `--memory-limit` bounds that. A message larger than the whole limit is
 still copied, alone, so no message is too big to sync. Accepts `512MiB`, `2GB`,
 `1G` or a plain byte count.
 
+### When the network misbehaves
+
+Connections to a distant server break, and a sync of a large account runs long
+enough to be certain of it. A dropped connection is reconnected and the work
+resumes at the message that failed, rather than at the start of the batch or by
+abandoning the folder. Servers that ask to be left alone — `LIMIT`, `INUSE`, or
+iCloud's "too many simultaneous connections" — are backed off further than a
+plain disconnect, by a randomised amount, so that connections which all failed
+together do not all come back together.
+
+A message the server will never accept, because it is too large or the mailbox
+is full, is reported and skipped rather than retried. It is not written off: the
+next run tries it again, since only messages that were copied are skipped when a
+run repeats.
+
+Folders that failed are attempted once more at the end of the run, on fresh
+connections. Whatever stopped them has often stopped being true by then.
+
+If the destination stops accepting mail altogether, the run ends rather than
+spending hours discovering that one message at a time. The threshold is fifty
+failures in a row with nothing copied in between; scattered failures across a
+long run do not count against it.
+
+While a long run is working, it reports what it has copied every 30 seconds, so
+that a slow folder can be told apart from a hang. `--progress-interval 0` turns
+that off.
+
 ### It is safe to interrupt
 
 Progress is recorded as the copy proceeds, in a SQLite database under your user
@@ -150,6 +178,11 @@ already there:
 
 Deleting the state database costs a pass over the destination's headers, not a
 duplicated account.
+
+Interrupting a run prints what it managed to copy before it stopped, which is
+what the next run will not have to do again. Press Ctrl-C once and the run winds
+down: in-flight appends are recorded before it exits, so an interrupt costs a
+few seconds rather than a folder.
 
 ### Choosing folders
 

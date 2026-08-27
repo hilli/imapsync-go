@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -32,6 +33,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/ident"
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
+	"github.com/hilli/imapsync-go/internal/retry"
 	"github.com/hilli/imapsync-go/internal/state"
 )
 
@@ -41,6 +43,10 @@ import (
 // trips against footprint. iCloud's INBOX holds 414k messages (§6.3); fetching
 // their metadata in one command would be neither.
 const metaBatch = 500
+
+// stateWriteGrace bounds a write that records work already done on the server,
+// which has to run even when the run itself has been cancelled.
+const stateWriteGrace = 10 * time.Second
 
 // copyChunk is how many messages one fetch worker claims at a time.
 //
@@ -74,6 +80,24 @@ type Options struct {
 	// destination or to the state database.
 	DryRun bool
 
+	// Retry is how hard the run tries again when the network or the server
+	// misbehaves. The zero value means retry.Default.
+	Retry retry.Policy
+
+	// GiveUpAfter is how many failures in a row, with nothing copied in
+	// between, end the run. Zero means the default.
+	//
+	// It exists because retrying is only worth doing when something might
+	// still succeed. A destination that has stopped accepting mail fails every
+	// message identically, and without a ceiling the run would spend hours
+	// discovering that one message at a time.
+	GiveUpAfter int
+
+	// ProgressEvery is how often the run says what it has done so far. Zero
+	// silences it, which is the right default for a caller that has its own
+	// idea of what to report; the command line sets its own interval.
+	ProgressEvery time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -98,6 +122,12 @@ func New(src, dst *pool.Pool, db *state.DB, bytes *budget.Budget, opts Options) 
 	if opts.PairID == "" {
 		opts.PairID = "default"
 	}
+	if opts.Retry.Attempts == 0 {
+		opts.Retry = retry.Default()
+	}
+	if opts.GiveUpAfter == 0 {
+		opts.GiveUpAfter = 50
+	}
 	return &Syncer{src: src, dst: dst, bytes: bytes, db: db, opts: opts, log: log}
 }
 
@@ -108,6 +138,21 @@ type Report struct {
 	Skips []folder.Skip
 	// Created are destination mailboxes this run brought into existence.
 	Created []string
+}
+
+// replace swaps in a later attempt at a folder already reported on.
+func (r *Report) replace(fr FolderReport) {
+	for i := range r.Folders {
+		if r.Folders[i].Source == fr.Source {
+			// The counts a folder accumulated before it failed are still true,
+			// and the second attempt starts from what the state database
+			// already records, so its own AlreadyDone covers them. Only the
+			// error is worth carrying over when it is still there.
+			r.Folders[i] = fr
+			return
+		}
+	}
+	r.Folders = append(r.Folders, fr)
 }
 
 // FolderReport is the outcome for one mailbox.
@@ -145,12 +190,84 @@ func (r Report) Totals() (copied, adopted, failed int) {
 	return copied, adopted, failed
 }
 
+// health tells the difference between a run meeting the ordinary friction of a
+// long copy and a run shouting into a void.
+//
+// Retrying assumes something might still succeed. When a destination stops
+// accepting mail every message fails identically, and each one costs its full
+// allowance of attempts and backoff. Counting failures that have nothing
+// between them puts a bound on how long that can go on: a run that has failed
+// fifty times in a row without copying anything is not going to be rescued by
+// the fifty-first.
+//
+// The counter is shared by every folder in flight rather than kept per folder,
+// because the thing being detected is a property of the server, not of a
+// mailbox. Per-folder counters would each have to fill up separately before the
+// run wound down.
+type health struct {
+	ceiling int64
+	inARow  atomic.Int64
+	stop    context.CancelCauseFunc
+
+	// copied, adopted and folders are run-wide totals, for the progress the
+	// run prints as it goes. They live here because this is already the one
+	// object every folder shares and every success reports to, and because
+	// what has been copied lately is the same signal the ceiling watches.
+	copied  atomic.Int64
+	adopted atomic.Int64
+	folders atomic.Int64
+
+	mu     sync.Mutex
+	reason error
+}
+
+// progress notes that something worked, which is what makes the count
+// consecutive rather than cumulative. Scattered failures against a working
+// server never accumulate.
+func (h *health) progress(copied, adopted int) {
+	if copied == 0 && adopted == 0 {
+		return
+	}
+	h.copied.Add(int64(copied))
+	h.adopted.Add(int64(adopted))
+	h.inARow.Store(0)
+}
+
+// trouble notes a failure and ends the run if there have been too many with
+// nothing in between.
+func (h *health) trouble(err error) {
+	if h.inARow.Add(1) < h.ceiling {
+		return
+	}
+
+	h.mu.Lock()
+	if h.reason == nil {
+		h.reason = fmt.Errorf("stopping after %d failures in a row with nothing copied in between; the last was: %w",
+			h.ceiling, err)
+	}
+	reason := h.reason
+	h.mu.Unlock()
+
+	h.stop(reason)
+}
+
+// verdict is the reason the run was ended, or nil if it was not.
+func (h *health) verdict() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reason
+}
+
 // Run copies every mapped folder.
 //
 // A folder that fails is recorded and the run continues: one unreadable mailbox
 // should not strand the rest of an account. Only a failure to plan the run at
 // all, or cancellation, returns an error.
 func (s *Syncer) Run(ctx context.Context) (Report, error) {
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	hp := &health{ceiling: int64(s.opts.GiveUpAfter), stop: stop}
+
 	plan, err := s.plan(ctx)
 	if err != nil {
 		return Report{}, err
@@ -174,33 +291,132 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 	// folder's report, not in a cancellation that would abandon every other
 	// folder mid-copy. Cancellation comes from the caller's context, which
 	// every worker already watches.
-	var mu sync.Mutex
-	var g errgroup.Group
-	g.SetLimit(s.src.Cap())
-	for _, pair := range plan.Pairs {
-		if ctx.Err() != nil {
-			break
+	done := s.announce(ctx, hp, len(plan.Pairs))
+	report.Folders = s.pass(ctx, plan.Pairs, hp)
+
+	// One more go at whatever failed. A folder is abandoned for reasons that
+	// are usually gone by the time the rest of the run has finished — a server
+	// that was restarting, a mailbox that was locked, a burst of throttling —
+	// and by now the pools have been rebuilt around fresh connections and the
+	// load that provoked it has stopped. It costs one attempt on the folders
+	// that failed, and saves running the whole thing again to catch them.
+	if again := retryable(report.Folders); len(again) > 0 && ctx.Err() == nil {
+		s.log.Info("retrying folders that failed", "folders", len(again))
+		for _, fr := range s.pass(ctx, again, hp) {
+			report.replace(fr)
 		}
-		g.Go(func() error {
-			fr, err := s.syncFolder(ctx, pair)
-			if err != nil {
-				fr.Err = err
-				s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
-			}
-			mu.Lock()
-			report.Folders = append(report.Folders, fr)
-			mu.Unlock()
-			return nil
-		})
 	}
-	_ = g.Wait()
+	done()
 
 	// Folders finish in whatever order their sizes dictate. Sorting restores
 	// the plan's order so that a report reads the same way twice.
 	slices.SortFunc(report.Folders, func(a, b FolderReport) int {
 		return strings.Compare(a.Source, b.Source)
 	})
+
+	// The run's own verdict outranks the cancellation it caused, which would
+	// otherwise be reported as though the caller had asked for it.
+	if err := hp.verdict(); err != nil {
+		return report, err
+	}
 	return report, ctx.Err()
+}
+
+// announce reports what the run has done so far, at intervals, and returns the
+// function that stops it.
+//
+// A sync of this size runs for hours, and without this it says nothing between
+// folders — and the largest folder in the account holds half of it, so that
+// silence can last most of the run. This is not a progress bar and does not try
+// to be one: no total is known until the last folder is diffed, and the useful
+// question during a long run is not "how far along" but "is it still moving".
+func (s *Syncer) announce(ctx context.Context, hp *health, folders int) func() {
+	if s.opts.ProgressEvery <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	start := time.Now()
+
+	go func() {
+		defer close(done)
+		t := time.NewTicker(s.opts.ProgressEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				elapsed := time.Since(start)
+				copied := hp.copied.Load()
+				s.log.Info("still going",
+					"folders", fmt.Sprintf("%d/%d", hp.folders.Load(), folders),
+					"copied", copied,
+					"adopted", hp.adopted.Load(),
+					"rate", fmt.Sprintf("%.1f msg/s", float64(copied)/elapsed.Seconds()),
+					// A duration is rendered as a bare nanosecond count by
+					// the JSON handler, which is unreadable in exactly the
+					// place this line is meant to be read.
+					"elapsed", elapsed.Round(time.Second).String())
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+// pass copies a set of folders, as many at once as the source pool is wide.
+//
+// The group carries no errors of its own: a folder failure belongs in that
+// folder's report, not in a cancellation that would abandon every other folder
+// mid-copy. Cancellation comes from the context, which every worker watches.
+func (s *Syncer) pass(ctx context.Context, pairs []folder.Pair, hp *health) []FolderReport {
+	var mu sync.Mutex
+	out := make([]FolderReport, 0, len(pairs))
+
+	var g errgroup.Group
+	g.SetLimit(s.src.Cap())
+	for _, pair := range pairs {
+		if ctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			fr, err := s.syncFolder(ctx, pair, hp)
+			if err != nil {
+				fr.Err = err
+				s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
+			}
+			mu.Lock()
+			out = append(out, fr)
+			mu.Unlock()
+			hp.folders.Add(1)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return out
+}
+
+// retryable is the folders worth a second attempt.
+//
+// A folder that was cut short by the run being cancelled or given up on is not
+// among them: whatever stopped it is still true, and asking again would only
+// produce the same error more slowly.
+func retryable(reports []FolderReport) []folder.Pair {
+	var out []folder.Pair
+	for _, fr := range reports {
+		if fr.Err == nil || errors.Is(fr.Err, context.Canceled) || errors.Is(fr.Err, context.DeadlineExceeded) {
+			continue
+		}
+		out = append(out, folder.Pair{Source: fr.Source, Dest: fr.Dest})
+	}
+	return out
 }
 
 // createFolders brings the missing destination mailboxes into existence.
@@ -382,6 +598,9 @@ type live struct {
 	mu     sync.Mutex
 	report FolderReport
 	index  adoption
+
+	// health is shared with every other folder in the run.
+	health *health
 }
 
 // adopt claims a destination message for a source identity, if one is free.
@@ -395,12 +614,14 @@ func (l *live) copied() {
 	l.mu.Lock()
 	l.report.Copied++
 	l.mu.Unlock()
+	l.health.progress(1, 0)
 }
 
 func (l *live) adopted(n int) {
 	l.mu.Lock()
 	l.report.Adopted += n
 	l.mu.Unlock()
+	l.health.progress(0, n)
 }
 
 // failed records an abandoned message. Only the first few reasons are kept:
@@ -433,12 +654,12 @@ type prepared struct {
 }
 
 // syncFolder copies one mailbox.
-func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair) (FolderReport, error) {
+func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (FolderReport, error) {
 	if s.opts.DryRun {
 		return s.dryRunFolder(ctx, pair)
 	}
 
-	lv := &live{report: FolderReport{Source: pair.Source, Dest: pair.Dest}}
+	lv := &live{report: FolderReport{Source: pair.Source, Dest: pair.Dest}, health: hp}
 	p, err := s.prepareFolder(ctx, pair, lv)
 	if err != nil {
 		return lv.snapshot(), err
@@ -651,7 +872,18 @@ func (s *Syncer) copyFolder(ctx context.Context, pair folder.Pair, p *prepared, 
 	return err
 }
 
-// fetchChunk reads one run of messages from the source.
+// errRenumbered means the source mailbox was renumbered while the folder was
+// being copied. It is not retryable and not skippable: every UID chosen for
+// this folder now names a different message or none at all.
+var errRenumbered = errors.New("source mailbox renumbered mid-run")
+
+// fetchChunk reads one run of messages from the source, replacing the
+// connection under itself as often as the network requires.
+//
+// The retry resumes at the message that failed instead of restarting the chunk.
+// That is a correctness requirement rather than an optimisation: everything
+// already fetched is recorded as in flight and may be sitting in the append
+// queue or already on the destination, so re-fetching it would copy it twice.
 func (s *Syncer) fetchChunk(
 	ctx context.Context,
 	pair folder.Pair,
@@ -659,35 +891,158 @@ func (s *Syncer) fetchChunk(
 	chunk []uint32,
 	pending chan<- *pendingAppend,
 	lv *live,
-) (err error) {
-	lease, err := s.src.Acquire(ctx, pair.Source)
+) error {
+	metas, err := s.chunkMeta(ctx, pair, p, chunk, lv)
 	if err != nil {
-		return fmt.Errorf("acquiring source connection: %w", err)
-	}
-	defer func() { lease.Release(err) }()
-
-	// A single long-lived connection can never see a mailbox renumbered,
-	// because it never selects it again. A pool selects on every lease, so it
-	// can — and every UID in this chunk was chosen against the old numbering,
-	// meaning each one now names a different message or none at all. Stopping
-	// the folder here costs a re-sync; carrying on would file real messages
-	// under keys that belong to other ones.
-	if got := lease.UIDValidity(); got != p.src.UIDValidity {
-		err = fmt.Errorf("source mailbox %q was renumbered mid-run (UIDVALIDITY %d is now %d); it will be resynced on the next run",
-			pair.Source, p.src.UIDValidity, got)
 		return err
 	}
 
-	metas, err := lease.Conn().FetchMeta(ctx, chunk, ident.Fields)
-	if err != nil {
-		return fmt.Errorf("fetching message metadata: %w", err)
-	}
-	for _, meta := range metas {
-		if err = s.fetchOne(ctx, p, lease.Conn(), meta, pending, lv); err != nil {
+	attempt := 0
+	for done := 0; done < len(metas); {
+		n, err := s.fetchRun(ctx, pair, p, metas[done:], pending, lv)
+		done += n
+		if n > 0 {
+			attempt = 0
+		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, errRenumbered) || done >= len(metas) {
 			return err
 		}
+		stuck := metas[done]
+
+		kind := retry.Classify(err)
+		lv.health.trouble(err)
+		if kind == retry.Stop {
+			return err
+		}
+		if attempt++; (kind == retry.Again || kind == retry.Slower) && attempt < s.opts.Retry.Attempts {
+			s.log.Warn("retrying message",
+				"folder", pair.Source, "uid", stuck.UID, "attempt", attempt, "action", kind.String(), "error", err)
+			if err := s.opts.Retry.Wait(ctx, kind, attempt-1); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Out of attempts, or nothing an attempt could fix. Recording the
+		// message and moving on keeps the rest of the folder copyable; a run
+		// that is failing systemically is stopped by the ceiling instead.
+		if err := s.fail(ctx, p.folderID, p.src.UIDValidity, stuck.UID, err.Error(), lv); err != nil {
+			return err
+		}
+		done++
+		attempt = 0
 	}
 	return nil
+}
+
+// chunkMeta reads the headers that open a chunk, retrying on a fresh
+// connection.
+//
+// A permanent failure here abandons the folder rather than the chunk. Without
+// headers there is no identity for any of these messages, so they could only be
+// recorded as failed en masse, and fifty identical failures say nothing the one
+// underlying error did not.
+func (s *Syncer) chunkMeta(
+	ctx context.Context,
+	pair folder.Pair,
+	p *prepared,
+	chunk []uint32,
+	lv *live,
+) ([]imapx.MessageMeta, error) {
+	for attempt := 0; ; attempt++ {
+		metas, err := s.metaOnce(ctx, pair, p, chunk)
+		if err == nil {
+			return metas, nil
+		}
+		if errors.Is(err, errRenumbered) {
+			return nil, err
+		}
+
+		kind := retry.Classify(err)
+		lv.health.trouble(err)
+		if kind != retry.Again && kind != retry.Slower {
+			return nil, err
+		}
+		if attempt+1 >= s.opts.Retry.Attempts {
+			return nil, err
+		}
+		s.log.Warn("retrying metadata fetch",
+			"folder", pair.Source, "messages", len(chunk), "attempt", attempt+1, "error", err)
+		if err := s.opts.Retry.Wait(ctx, kind, attempt); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (s *Syncer) metaOnce(
+	ctx context.Context,
+	pair folder.Pair,
+	p *prepared,
+	chunk []uint32,
+) (_ []imapx.MessageMeta, err error) {
+	lease, err := s.src.Acquire(ctx, pair.Source)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	if err = checkNumbering(lease, p, pair.Source); err != nil {
+		return nil, err
+	}
+	metas, err := lease.Conn().FetchMeta(ctx, chunk, ident.Fields)
+	if err != nil {
+		return nil, fmt.Errorf("fetching message metadata: %w", err)
+	}
+	return metas, nil
+}
+
+// fetchRun reads as many of metas as one connection manages, and reports how
+// many it finished. The message that stopped it is metas[n].
+func (s *Syncer) fetchRun(
+	ctx context.Context,
+	pair folder.Pair,
+	p *prepared,
+	metas []imapx.MessageMeta,
+	pending chan<- *pendingAppend,
+	lv *live,
+) (n int, err error) {
+	lease, err := s.src.Acquire(ctx, pair.Source)
+	if err != nil {
+		return 0, fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	if err = checkNumbering(lease, p, pair.Source); err != nil {
+		return 0, err
+	}
+
+	for i, meta := range metas {
+		if err = s.fetchOne(ctx, p, lease.Conn(), meta, pending, lv); err != nil {
+			return i, err
+		}
+	}
+	return len(metas), nil
+}
+
+// checkNumbering refuses to use a connection that is looking at a renumbered
+// mailbox.
+//
+// A single long-lived connection can never see a mailbox renumbered, because it
+// never selects it again. A pool selects on every lease, so it can — and every
+// UID chosen for this folder was chosen against the old numbering, meaning each
+// one now names a different message or none at all. Stopping here costs a
+// re-sync; carrying on would file real messages under keys belonging to other
+// ones, and mark them done.
+func checkNumbering(lease *pool.Lease, p *prepared, name string) error {
+	got := lease.UIDValidity()
+	if got == p.src.UIDValidity {
+		return nil
+	}
+	return fmt.Errorf("%w: %q had UIDVALIDITY %d and now has %d; it will be resynced on the next run",
+		errRenumbered, name, p.src.UIDValidity, got)
 }
 
 // fetchOne records a message as in flight and reads it, unless the destination
@@ -781,29 +1136,87 @@ func (s *Syncer) fetchOne(
 // deliver appends one fetched message to the destination and records where it
 // landed.
 func (s *Syncer) deliver(ctx context.Context, p *prepared, dstName string, item *pendingAppend, lv *live) error {
-	res, err := s.appendOne(ctx, dstName, item)
-	switch {
-	case errors.Is(err, imapx.ErrConnectionBroken):
-		return err
-	case err != nil:
-		// The server refused this message — oversized, rejected by policy, or
-		// malformed beyond what it will store. The connection is intact, so the
-		// rest of the folder can still be copied.
-		return s.fail(ctx, p.folderID, p.src.UIDValidity, item.uid, err.Error(), lv)
-	}
+	for attempt := 0; ; attempt++ {
+		res, err := s.appendOne(ctx, dstName, item)
+		if err == nil {
+			return s.settle(ctx, p, dstName, item, res, lv)
+		}
 
+		kind := retry.Classify(err)
+		lv.health.trouble(err)
+		if kind == retry.Stop {
+			return err
+		}
+		if kind == retry.Skip || attempt+1 >= s.opts.Retry.Attempts {
+			// The server refused this message — oversized, rejected by policy,
+			// or malformed beyond what it will store — or it has refused often
+			// enough. The rest of the folder can still be copied.
+			return s.fail(ctx, p.folderID, p.src.UIDValidity, item.uid, err.Error(), lv)
+		}
+
+		// A connection lost during an APPEND says nothing about whether the
+		// message arrived: the literal may have been complete on the wire when
+		// the response was lost. Appending again without looking is how one
+		// interruption becomes two copies, so the destination is asked first.
+		landed, lerr := s.locateOnDest(ctx, dstName, item.id, item.stamped)
+		if lerr != nil {
+			return lerr
+		}
+		if landed != 0 {
+			s.log.Info("append survived a lost connection", "folder", dstName, "uid", item.uid)
+			return s.record(ctx, p, item, p.dst.UIDValidity, landed, lv)
+		}
+
+		s.log.Warn("retrying append",
+			"folder", dstName, "uid", item.uid, "attempt", attempt+1, "action", kind.String(), "error", err)
+		if err := s.opts.Retry.Wait(ctx, kind, attempt); err != nil {
+			return err
+		}
+	}
+}
+
+// settle works out where an accepted message landed and records it.
+func (s *Syncer) settle(
+	ctx context.Context,
+	p *prepared,
+	dstName string,
+	item *pendingAppend,
+	res imapx.AppendResult,
+	lv *live,
+) error {
 	dstUIDValidity, dstUID := res.UIDValidity, res.UID
 	if !res.Assigned() {
 		// No UIDPLUS. The append succeeded — the tagged OK says so — but the
 		// destination UID has to be found, and may not be findable at all.
+		var err error
 		dstUIDValidity = p.dst.UIDValidity
 		dstUID, err = s.locateOnDest(ctx, dstName, item.id, item.stamped)
 		if err != nil {
 			return err
 		}
 	}
+	return s.record(ctx, p, item, dstUIDValidity, dstUID, lv)
+}
 
-	if err := s.db.CompleteAppend(ctx, p.folderID, p.src.UIDValidity, item.uid, dstUIDValidity, dstUID); err != nil {
+// record commits a copy as done.
+func (s *Syncer) record(
+	ctx context.Context,
+	p *prepared,
+	item *pendingAppend,
+	dstUIDValidity, dstUID uint32,
+	lv *live,
+) error {
+	// The message is on the destination by the time this runs, so the write
+	// that says so must not be abandoned because the run was interrupted.
+	// Cancellation here would leave the copy done and unrecorded — the next run
+	// would find it by searching the destination, which is slower, and for a
+	// message too weak to search for would copy it a second time. Detached from
+	// the caller's context and bounded on its own, so an interrupt cannot make
+	// it hang either.
+	settled, done := context.WithTimeout(context.WithoutCancel(ctx), stateWriteGrace)
+	defer done()
+
+	if err := s.db.CompleteAppend(settled, p.folderID, p.src.UIDValidity, item.uid, dstUIDValidity, dstUID); err != nil {
 		return fmt.Errorf("recording message %d as copied: %w", item.uid, err)
 	}
 	lv.copied()

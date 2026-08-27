@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
+
 	"github.com/hilli/imapsync-go/internal/budget"
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/syncer"
@@ -485,11 +487,15 @@ func TestCancellationStopsTheRunPromptly(t *testing.T) {
 	}
 }
 
-// brokenDest appends slowly and then breaks the connection, the way a server
-// does when it gives up mid-literal.
+// brokenDest appends slowly and then starts refusing, the way a server does
+// when the credentials it accepted an hour ago are withdrawn.
+//
+// The refusal has to be one that no retry can fix, because that is what makes a
+// folder give up rather than record a failed message and carry on. A dropped
+// connection no longer qualifies: it is retried on a fresh one.
 //
 // The slowness is what makes the failure interesting. Fetch workers run ahead
-// of append workers, so by the time the break comes the hand-off channel is
+// of append workers, so by the time the refusal comes the hand-off channel is
 // full of messages that have been read and charged against the byte budget and
 // will now never be appended.
 type brokenDest struct {
@@ -507,8 +513,11 @@ func (b brokenDest) Append(ctx context.Context, mailbox string, msg imapx.Append
 	if b.after.Add(-1) > 0 {
 		return b.Conn.Append(ctx, mailbox, msg)
 	}
-	_ = b.Close()
-	return imapx.AppendResult{}, imapx.ErrConnectionBroken
+	return imapx.AppendResult{}, &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeAuthenticationFailed,
+		Text: "credentials withdrawn",
+	}
 }
 
 // TestFailedFoldersDoNotStarveTheRunOfItsBudget is about what a folder takes

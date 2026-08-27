@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -245,5 +249,123 @@ func TestConnectionCountsMustBePositive(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s 0 was accepted:\n%s", flag, out)
 		}
+	}
+}
+
+// TestProgressCanBeSwitchedOff checks --progress-interval reaches the engine
+// in both directions.
+//
+// Zero is the value a user reaches for to mean "be quiet", and it is also what
+// an unset field looks like, so the flag has to tell those apart or asking for
+// silence would hand back the default.
+func TestProgressCanBeSwitchedOff(t *testing.T) {
+	srcAddr, srcUser, _ := startCountedAccount(t)
+	dstAddr, _, _ := startCountedAccount(t)
+
+	for i := range 40 {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	run := func(interval string) string {
+		return runCLILogs(t, []string{
+			"sync",
+			"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+			"--source-password-env", "TEST_IMAP_PASSWORD",
+			"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+			"--dest-password-env", "TEST_IMAP_PASSWORD",
+			"--state", filepath.Join(t.TempDir(), "state.db"),
+			"--source-connections", "1",
+			"--dest-connections", "1",
+			"--progress-interval", interval,
+			"--log-level", "info",
+		})
+	}
+
+	if logs := run("1ms"); !strings.Contains(logs, "still going") {
+		t.Fatalf("a run asked to report every millisecond said nothing:\n%s", logs)
+	}
+	if logs := run("0"); strings.Contains(logs, "still going") {
+		t.Fatalf("--progress-interval=0 reported progress anyway:\n%s", logs)
+	}
+}
+
+// runCLILogs runs the CLI and returns what it wrote to the log, which goes to
+// stderr rather than to the command's own output.
+func runCLILogs(t *testing.T, args []string) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), "logs")
+	if err != nil {
+		t.Fatalf("log file: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	saved := os.Stderr
+	os.Stderr = f
+	defer func() {
+		os.Stderr = saved
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+	}()
+
+	runCLI(t, args)
+
+	logs, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("reading logs: %v", err)
+	}
+	return string(logs)
+}
+
+// TestAnInterruptedRunStillSaysWhatItCopied.
+//
+// An interrupted run is not a failed run: it copied whatever it copied, that
+// work is recorded, and the next run will not repeat it. Printing only the
+// error throws away the one number worth having.
+func TestAnInterruptedRunStillSaysWhatItCopied(t *testing.T) {
+	srcAddr, srcUser, _ := startCountedAccount(t)
+	dstAddr, _, _ := startCountedAccount(t)
+
+	// Enough messages that no plausible machine finishes them inside the
+	// deadline below, on one connection: the in-process server copies a few
+	// thousand a second, so this is seconds of work cut off after a fraction
+	// of one.
+	for i := range 6000 {
+		body := cliMessage(fmt.Sprintf("subject-%04d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var out bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(t.TempDir(), "state.db"),
+		"--source-connections", "1",
+		"--dest-connections", "1",
+		"--progress-interval", "0",
+		"--log-level", "error",
+	})
+
+	if err := cmd.ExecuteContext(ctx); err == nil {
+		t.Fatalf("an interrupted run reported success:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "copied,") {
+		t.Fatalf("an interrupted run printed no report:\n%s", out.String())
 	}
 }
