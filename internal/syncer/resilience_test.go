@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -380,4 +382,205 @@ func (d failAfter) Append(ctx context.Context, mailbox string, msg imapx.AppendM
 	}
 	d.attempts.Add(1)
 	return imapx.AppendResult{}, imapx.ErrConnectionBroken
+}
+
+// sulkingSource refuses to open a mailbox until it has been asked often enough.
+type sulkingSource struct {
+	imapx.Conn
+	mailbox string
+	until   int32
+	count   *atomic.Int32
+}
+
+func (s sulkingSource) Select(ctx context.Context, mailbox string, opts imapx.SelectOptions) (imapx.Mailbox, error) {
+	if mailbox == s.mailbox && s.count.Add(1) <= s.until {
+		return imapx.Mailbox{}, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "mailbox is locked by another process"}
+	}
+	return s.Conn.Select(ctx, mailbox, opts)
+}
+
+// TestAFolderThatFailedIsTriedOnceMore is the second pass.
+//
+// A folder is usually abandoned for a reason that has stopped being true by the
+// time the rest of the run has finished: a server restarting, a mailbox locked
+// by another client, a burst of throttling. Trying again at the end costs one
+// attempt and saves scheduling the entire run a second time.
+func TestAFolderThatFailedIsTriedOnceMore(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps(), "Locked")
+	want := fill(t, h.src, "Locked", 10)
+	fill(t, h.src, "INBOX", 5)
+
+	// Exactly one refusal, which is all it takes: nothing retries the opening
+	// of a mailbox, so the folder is abandoned there and then. If the second
+	// pass did not exist, Locked would end the run uncopied.
+	count := &atomic.Int32{}
+	rep, err := syncFlaky(t, h, 2, 2, syncer.Options{}, func(c imapx.Conn) imapx.Conn {
+		return sulkingSource{Conn: c, mailbox: "Locked", until: 1, count: count}
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if got := folderReport(t, rep, "Locked"); got.Err != nil {
+		t.Fatalf("Locked still failed after a second attempt: %v", got.Err)
+	}
+	assertExactly(t, h.dst, "Locked", want)
+}
+
+// TestTheSecondPassDoesNotStartOver checks the retry is a retry and not a
+// second copy: the folders that already succeeded are not touched again.
+func TestTheSecondPassDoesNotStartOver(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps(), "Locked")
+	fill(t, h.src, "Locked", 4)
+	want := fill(t, h.src, "INBOX", 20)
+
+	count := &atomic.Int32{}
+	rep, err := syncFlaky(t, h, 2, 2, syncer.Options{}, func(c imapx.Conn) imapx.Conn {
+		return sulkingSource{Conn: c, mailbox: "Locked", until: 8, count: count}
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// INBOX succeeded the first time. If the second pass had re-run every
+	// folder rather than the failed ones, its report would have been replaced
+	// by one whose messages were all already done.
+	inbox := folderReport(t, rep, "INBOX")
+	if inbox.Copied != len(want) {
+		t.Fatalf("INBOX reports %d copied, want %d — the second pass re-ran a folder that had succeeded", inbox.Copied, len(want))
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+// TestGivingUpIsNotWorthASecondPass: when the run has been given up on, or
+// cancelled, every folder failed for the same reason and that reason is still
+// true. Trying again only produces the same errors more slowly.
+func TestGivingUpIsNotWorthASecondPass(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	fill(t, h.src, "INBOX", 40)
+
+	var appends atomic.Int32
+	_, err := syncFlaky(t, h, 1, 1, syncer.Options{GiveUpAfter: 5}, nil, func(c imapx.Conn) imapx.Conn {
+		return deadDest{Conn: c, attempts: &appends}
+	})
+	if err == nil {
+		t.Fatal("want the run to give up")
+	}
+
+	// Five failures at four attempts each is twenty appends, plus whatever was
+	// already in flight when the ceiling tripped. A second pass would double
+	// it.
+	if n := appends.Load(); n > 40 {
+		t.Fatalf("%d append attempts after giving up: the run tried the folder again", n)
+	}
+}
+
+// folderReport finds one folder in a report.
+func folderReport(t *testing.T, rep syncer.Report, name string) syncer.FolderReport {
+	t.Helper()
+	for _, fr := range rep.Folders {
+		if fr.Source == name {
+			return fr
+		}
+	}
+	t.Fatalf("no report for %q", name)
+	return syncer.FolderReport{}
+}
+
+// records captures log records so a test can read what a run said.
+type records struct {
+	mu  sync.Mutex
+	got []slog.Record
+}
+
+func (r *records) Enabled(context.Context, slog.Level) bool { return true }
+func (r *records) WithAttrs([]slog.Attr) slog.Handler       { return r }
+func (r *records) WithGroup(string) slog.Handler            { return r }
+
+func (r *records) Handle(_ context.Context, rec slog.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.got = append(r.got, rec.Clone())
+	return nil
+}
+
+// find returns the values of one attribute across every record with a message.
+func (r *records) find(msg, attr string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []string
+	for _, rec := range r.got {
+		if rec.Message != msg {
+			continue
+		}
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == attr {
+				out = append(out, a.Value.String())
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// TestALongRunSaysWhatItIsDoing.
+//
+// The account this is built for takes hours, and its largest folder holds half
+// of it, so a run that only speaks when a folder finishes can be silent for
+// most of its life. There is no way to tell that apart from a hang.
+func TestALongRunSaysWhatItIsDoing(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	fill(t, h.src, "INBOX", 60)
+
+	log := &records{}
+	_, err := syncFlaky(t, h, 1, 1, syncer.Options{
+		ProgressEvery: time.Millisecond,
+		Logger:        slog.New(log),
+	}, func(c imapx.Conn) imapx.Conn {
+		return slowSource{Conn: c, delay: 2 * time.Millisecond}
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	said := log.find("still going", "copied")
+	if len(said) == 0 {
+		t.Fatal("the run said nothing while it worked")
+	}
+
+	// The counts have to move, or the line is a heartbeat pretending to be
+	// progress: it would look identical against a server that had stopped.
+	if said[len(said)-1] == "0" {
+		t.Fatalf("progress reported %v: the count never moved", said)
+	}
+}
+
+// TestASilentRunCanBeAsked checks the reporting can be turned off, since a
+// short interactive sync does not want a running commentary.
+func TestASilentRunCanBeAsked(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	fill(t, h.src, "INBOX", 20)
+
+	log := &records{}
+	if _, err := syncFlaky(t, h, 1, 1, syncer.Options{
+		ProgressEvery: 0,
+		Logger:        slog.New(log),
+	}, nil, nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if said := log.find("still going", "copied"); len(said) > 0 {
+		t.Fatalf("progress was reported %d times with it switched off", len(said))
+	}
 }

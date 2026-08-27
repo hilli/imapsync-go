@@ -58,6 +58,8 @@ type syncFlags struct {
 	srcConns    int
 	dstConns    int
 	memoryLimit string
+
+	progressEvery time.Duration
 }
 
 func newSyncCmd() *cobra.Command {
@@ -119,6 +121,8 @@ watch for authentication failures.`,
 	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
 	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once")
+
+	cmd.Flags().DurationVar(&f.progressEvery, "progress-interval", 30*time.Second, "how often to report what the sync has done so far; 0 to keep quiet")
 
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
 	cmd.Flags().BoolVar(&f.insecureSrc, "source-insecure", false, "skip TLS certificate verification for the source (test use only)")
@@ -198,10 +202,11 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 
 	started := time.Now()
 	report, err := syncer.New(srcPool, dstPool, db, bytesInFlight, syncer.Options{
-		PairID:  pairName,
-		Folders: opts,
-		DryRun:  f.dryRun,
-		Logger:  slog.Default(),
+		PairID:        pairName,
+		Folders:       opts,
+		DryRun:        f.dryRun,
+		ProgressEvery: f.progressEvery,
+		Logger:        slog.Default(),
 	}).Run(ctx)
 	if err != nil {
 		return err

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -246,4 +248,72 @@ func TestConnectionCountsMustBePositive(t *testing.T) {
 			t.Errorf("%s 0 was accepted:\n%s", flag, out)
 		}
 	}
+}
+
+// TestProgressCanBeSwitchedOff checks --progress-interval reaches the engine
+// in both directions.
+//
+// Zero is the value a user reaches for to mean "be quiet", and it is also what
+// an unset field looks like, so the flag has to tell those apart or asking for
+// silence would hand back the default.
+func TestProgressCanBeSwitchedOff(t *testing.T) {
+	srcAddr, srcUser, _ := startCountedAccount(t)
+	dstAddr, _, _ := startCountedAccount(t)
+
+	for i := range 40 {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	run := func(interval string) string {
+		return runCLILogs(t, []string{
+			"sync",
+			"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+			"--source-password-env", "TEST_IMAP_PASSWORD",
+			"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+			"--dest-password-env", "TEST_IMAP_PASSWORD",
+			"--state", filepath.Join(t.TempDir(), "state.db"),
+			"--source-connections", "1",
+			"--dest-connections", "1",
+			"--progress-interval", interval,
+			"--log-level", "info",
+		})
+	}
+
+	if logs := run("1ms"); !strings.Contains(logs, "still going") {
+		t.Fatalf("a run asked to report every millisecond said nothing:\n%s", logs)
+	}
+	if logs := run("0"); strings.Contains(logs, "still going") {
+		t.Fatalf("--progress-interval=0 reported progress anyway:\n%s", logs)
+	}
+}
+
+// runCLILogs runs the CLI and returns what it wrote to the log, which goes to
+// stderr rather than to the command's own output.
+func runCLILogs(t *testing.T, args []string) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), "logs")
+	if err != nil {
+		t.Fatalf("log file: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	saved := os.Stderr
+	os.Stderr = f
+	defer func() {
+		os.Stderr = saved
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+	}()
+
+	runCLI(t, args)
+
+	logs, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("reading logs: %v", err)
+	}
+	return string(logs)
 }

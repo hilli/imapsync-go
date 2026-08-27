@@ -405,6 +405,74 @@ reconciliation pass. Never a silent re-copy.
   detection still needs a UID-range diff, and a periodic full UID reconcile runs
   via `--reconcile-every` (default: every 7th run).
 
+### 5.7 Surviving the network
+
+A sync of this account runs for hours against a server nobody controls, so the
+question is not whether connections will break but what happens when they do.
+Until M3 one dropped connection abandoned a folder. Nothing was lost — state is
+written as the copy proceeds — but the run stopped making progress, which over
+nine hours amounts to the same thing.
+
+**Failures are classified by what to do about them, not by whether to retry.**
+Four outcomes, in `internal/retry`:
+
+| | Meaning | Examples |
+| --- | --- | --- |
+| `Stop` | The run cannot continue | cancellation, `AUTHENTICATIONFAILED`, `EXPIRED`, DNS `NXDOMAIN` |
+| `Skip` | This message, never | `TOOBIG`, `OVERQUOTA`, `NOPERM`, any `BAD`, source message gone |
+| `Again` | Transient; reconnect | dropped connection, `EOF`, `ECONNRESET`, read timeout |
+| `Slower` | Transient; back off further | `LIMIT`, `INUSE`, `UNAVAILABLE`, `ECONNREFUSED`, "too many simultaneous" |
+
+**Cancellation is checked before anything else.** A cancelled context surfaces
+as a read error on whatever connection was in flight, so asking the network
+first would classify Ctrl-C as a blip and dutifully reconnect.
+
+**Anything unrecognised is `Skip`.** Guessing "transient" risks a loop that
+never ends. Guessing "permanent" costs one warning and a retry on the next run,
+because only messages recorded as done are skipped when a run repeats — a
+failed message is not a tombstone.
+
+**Backoff is full jitter**: a uniform draw from `[0, base << attempt]`, capped.
+A server that drops connections drops all of them at once, and fixed backoff
+would reassemble the herd it just scattered.
+
+**A fetch retry resumes at the message that failed**, not at the start of the
+chunk. This is correctness, not economy: everything already fetched is recorded
+as in flight and may be in the append queue or already on the destination, so
+restarting the chunk would copy it twice.
+
+**An append retry asks whether the append landed.** An `APPEND` is complete on
+the wire before its response comes back, so a connection lost in between leaves
+a message stored and a client that believes otherwise. The retry runs the same
+destination search the crash-recovery path uses (§5.2) and records what it
+finds instead of sending again. A message whose identity is too weak to search
+for is retried regardless: the duplication risk is identical to failing it,
+since the next run would re-copy it anyway, but the message actually arrives.
+
+**The ceiling is what makes retrying safe to have.** Retrying assumes something
+might still succeed; a destination that has stopped accepting mail fails every
+message identically at four attempts apiece, and a large folder would spend
+hours establishing that one message at a time. Fifty failures in a row across
+the whole run, with nothing copied in between, ends it. The count is
+*consecutive*, not cumulative, and the difference is not stylistic: at a fault
+rate of one in ten thousand this account would produce seventy-odd scattered
+failures, and a cumulative ceiling would kill a healthy run using the very
+durability it was given.
+
+**Failed folders get one more attempt at the end.** A folder is usually
+abandoned for a reason that has stopped being true by the time the rest of the
+run has finished — a server restarting, a mailbox locked by another client, a
+burst of throttling — and by then the pools have been rebuilt around fresh
+connections. It costs one attempt on the folders that failed, against
+rescheduling the entire run to catch them.
+
+**The run says what it is doing.** Not a progress bar: no total is known until
+the last folder has been diffed, and against a mailbox holding half the account
+the useful question during hour four is not "how far along" but "is it still
+moving". A periodic line of copied, adopted, folders finished and rate answers
+that, and the counts are the same ones the ceiling watches, so a line that
+repeats itself is a run that has stopped.
+
 ## 6. Folders
 
 - **`SPECIAL-USE` (RFC 6154) first.** Map by attribute — `\Sent`, `\Trash`,
@@ -589,11 +657,15 @@ Credentials are always *referenced* (env var or keychain), never stored inline.
 1. **Unit** — `imapserver/imapmemserver` in-process. Fast, hermetic.
 2. **Integration** — real **mox in Docker**. It is Go, starts in milliseconds,
    and is an actual target.
-3. **Fault injection** — a proxy in front of a real server that replays `BYE`,
-   mid-literal disconnects, `NO [OVERQUOTA]`, and stalled literals. This is how
-   the AIMD governor and `in_flight` recovery are *proven* rather than hoped
-   about; a resumability bug that cannot be reproduced on demand will never be
-   fixed.
+3. **Fault injection.** M3 does this with decorators wrapped around the
+   in-process server rather than a proxy in front of a real one: they inject
+   the same faults — a connection dropped mid-fetch, an append that succeeds on
+   the wire and fails on the way back, a server that refuses everything — and
+   they do it deterministically, on a chosen message, without a second process.
+   A proxy would add a class of fault a decorator cannot reach, the stalled
+   literal that is neither an error nor a completion, and it can be built when
+   something needs it. What must not happen is a resumability bug that cannot
+   be reproduced on demand, and the decorators reproduce these on demand.
 
 **Core property test:** *sync twice, assert the second run copies zero messages.*
 That single invariant is the tombstone for the duplication bug.
@@ -629,13 +701,43 @@ rendezvous that only completes once four are in flight at once. An earlier
 version asserted elapsed time instead and failed inside the full suite while
 passing alone: a wall-clock test measures the machine as much as the code.
 
+### 9.2 What M3's mutations found
+
+Fifteen mutations of the retry paths, of which two survived and both were
+informative.
+
+**The guard on the second pass survived.** Removing `ctx.Err() == nil` from the
+condition that decides whether to re-attempt failed folders changed nothing any
+test could see, because by the time a run is cancelled every folder's error
+wraps `context.Canceled` and is filtered out anyway, and because `pass` refuses
+to start work on a cancelled context. The clause is kept for the one thing it
+still does — stop the run announcing a retry it will not perform — and is
+recorded here as scaffolding rather than structure.
+
+**`--give-up-after` and `--attempts` were cut.** Removing their wiring survived,
+because no test could tell whether the flags reached the engine: the CLI tests
+run against a real in-process server with no way to make it fail on demand.
+Rather than build a seam for a knob nobody has asked for, the flags were
+removed. The engine's defaults are the ones §5.7 argues for, and a flag can be
+added when a real run shows it is needed — with a test, by then, of what it
+does.
+
+Of the thirteen caught, the one worth naming is removing the check that asks
+whether an append landed before retrying it. It produces silent duplicates, on
+exactly the failure the retry exists to survive, and only the exactly-once
+assertion catches it.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state. *Done.*
 - **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3);
   parallel folder `STATUS` remains outstanding (§6.3).
-- **M3** — AIMD governor + fault-injection suite.
+- **M3** — resilience: retry with backoff, a run-wide failure ceiling, a second
+  pass over failed folders, progress reporting (§5.7). *Done.* The AIMD governor
+  was deferred: the throttling it exists to answer has not been observed, and a
+  controller tuned against a server that is not pushing back is a controller
+  tuned against nothing.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6).
 - **M5** — `compat` shim, `--delete2` + safety valve, progress UI.

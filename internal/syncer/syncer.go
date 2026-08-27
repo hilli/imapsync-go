@@ -89,6 +89,11 @@ type Options struct {
 	// discovering that one message at a time.
 	GiveUpAfter int
 
+	// ProgressEvery is how often the run says what it has done so far. Zero
+	// silences it, which is the right default for a caller that has its own
+	// idea of what to report; the command line sets its own interval.
+	ProgressEvery time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -129,6 +134,21 @@ type Report struct {
 	Skips []folder.Skip
 	// Created are destination mailboxes this run brought into existence.
 	Created []string
+}
+
+// replace swaps in a later attempt at a folder already reported on.
+func (r *Report) replace(fr FolderReport) {
+	for i := range r.Folders {
+		if r.Folders[i].Source == fr.Source {
+			// The counts a folder accumulated before it failed are still true,
+			// and the second attempt starts from what the state database
+			// already records, so its own AlreadyDone covers them. Only the
+			// error is worth carrying over when it is still there.
+			r.Folders[i] = fr
+			return
+		}
+	}
+	r.Folders = append(r.Folders, fr)
 }
 
 // FolderReport is the outcome for one mailbox.
@@ -185,6 +205,14 @@ type health struct {
 	inARow  atomic.Int64
 	stop    context.CancelCauseFunc
 
+	// copied, adopted and folders are run-wide totals, for the progress the
+	// run prints as it goes. They live here because this is already the one
+	// object every folder shares and every success reports to, and because
+	// what has been copied lately is the same signal the ceiling watches.
+	copied  atomic.Int64
+	adopted atomic.Int64
+	folders atomic.Int64
+
 	mu     sync.Mutex
 	reason error
 }
@@ -192,7 +220,14 @@ type health struct {
 // progress notes that something worked, which is what makes the count
 // consecutive rather than cumulative. Scattered failures against a working
 // server never accumulate.
-func (h *health) progress() { h.inARow.Store(0) }
+func (h *health) progress(copied, adopted int) {
+	if copied == 0 && adopted == 0 {
+		return
+	}
+	h.copied.Add(int64(copied))
+	h.adopted.Add(int64(adopted))
+	h.inARow.Store(0)
+}
 
 // trouble notes a failure and ends the run if there have been too many with
 // nothing in between.
@@ -252,26 +287,22 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 	// folder's report, not in a cancellation that would abandon every other
 	// folder mid-copy. Cancellation comes from the caller's context, which
 	// every worker already watches.
-	var mu sync.Mutex
-	var g errgroup.Group
-	g.SetLimit(s.src.Cap())
-	for _, pair := range plan.Pairs {
-		if ctx.Err() != nil {
-			break
+	done := s.announce(ctx, hp, len(plan.Pairs))
+	report.Folders = s.pass(ctx, plan.Pairs, hp)
+
+	// One more go at whatever failed. A folder is abandoned for reasons that
+	// are usually gone by the time the rest of the run has finished — a server
+	// that was restarting, a mailbox that was locked, a burst of throttling —
+	// and by now the pools have been rebuilt around fresh connections and the
+	// load that provoked it has stopped. It costs one attempt on the folders
+	// that failed, and saves running the whole thing again to catch them.
+	if again := retryable(report.Folders); len(again) > 0 && ctx.Err() == nil {
+		s.log.Info("retrying folders that failed", "folders", len(again))
+		for _, fr := range s.pass(ctx, again, hp) {
+			report.replace(fr)
 		}
-		g.Go(func() error {
-			fr, err := s.syncFolder(ctx, pair, hp)
-			if err != nil {
-				fr.Err = err
-				s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
-			}
-			mu.Lock()
-			report.Folders = append(report.Folders, fr)
-			mu.Unlock()
-			return nil
-		})
 	}
-	_ = g.Wait()
+	done()
 
 	// Folders finish in whatever order their sizes dictate. Sorting restores
 	// the plan's order so that a report reads the same way twice.
@@ -285,6 +316,100 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 		return report, err
 	}
 	return report, ctx.Err()
+}
+
+// announce reports what the run has done so far, at intervals, and returns the
+// function that stops it.
+//
+// A sync of this size runs for hours, and without this it says nothing between
+// folders — and the largest folder in the account holds half of it, so that
+// silence can last most of the run. This is not a progress bar and does not try
+// to be one: no total is known until the last folder is diffed, and the useful
+// question during a long run is not "how far along" but "is it still moving".
+func (s *Syncer) announce(ctx context.Context, hp *health, folders int) func() {
+	if s.opts.ProgressEvery <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	start := time.Now()
+
+	go func() {
+		defer close(done)
+		t := time.NewTicker(s.opts.ProgressEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				elapsed := time.Since(start)
+				copied := hp.copied.Load()
+				s.log.Info("still going",
+					"folders", fmt.Sprintf("%d/%d", hp.folders.Load(), folders),
+					"copied", copied,
+					"adopted", hp.adopted.Load(),
+					"rate", fmt.Sprintf("%.1f msg/s", float64(copied)/elapsed.Seconds()),
+					"elapsed", elapsed.Round(time.Second))
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+// pass copies a set of folders, as many at once as the source pool is wide.
+//
+// The group carries no errors of its own: a folder failure belongs in that
+// folder's report, not in a cancellation that would abandon every other folder
+// mid-copy. Cancellation comes from the context, which every worker watches.
+func (s *Syncer) pass(ctx context.Context, pairs []folder.Pair, hp *health) []FolderReport {
+	var mu sync.Mutex
+	out := make([]FolderReport, 0, len(pairs))
+
+	var g errgroup.Group
+	g.SetLimit(s.src.Cap())
+	for _, pair := range pairs {
+		if ctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			fr, err := s.syncFolder(ctx, pair, hp)
+			if err != nil {
+				fr.Err = err
+				s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
+			}
+			mu.Lock()
+			out = append(out, fr)
+			mu.Unlock()
+			hp.folders.Add(1)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return out
+}
+
+// retryable is the folders worth a second attempt.
+//
+// A folder that was cut short by the run being cancelled or given up on is not
+// among them: whatever stopped it is still true, and asking again would only
+// produce the same error more slowly.
+func retryable(reports []FolderReport) []folder.Pair {
+	var out []folder.Pair
+	for _, fr := range reports {
+		if fr.Err == nil || errors.Is(fr.Err, context.Canceled) || errors.Is(fr.Err, context.DeadlineExceeded) {
+			continue
+		}
+		out = append(out, folder.Pair{Source: fr.Source, Dest: fr.Dest})
+	}
+	return out
 }
 
 // createFolders brings the missing destination mailboxes into existence.
@@ -482,16 +607,14 @@ func (l *live) copied() {
 	l.mu.Lock()
 	l.report.Copied++
 	l.mu.Unlock()
-	l.health.progress()
+	l.health.progress(1, 0)
 }
 
 func (l *live) adopted(n int) {
 	l.mu.Lock()
 	l.report.Adopted += n
 	l.mu.Unlock()
-	if n > 0 {
-		l.health.progress()
-	}
+	l.health.progress(0, n)
 }
 
 // failed records an abandoned message. Only the first few reasons are kept:
