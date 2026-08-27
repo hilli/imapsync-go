@@ -245,6 +245,28 @@ duplication seen with stock imapsync on iCloud→mox, which needed `--useuid` pl
 `--verify` adds a post-append re-fetch asserting size/digest before recording
 success. Off by default.
 
+#### 5.2.1 Measured: what the digest must survive
+
+Implemented in `internal/ident`. Three things were established by running Go's
+`net/textproto` rather than by reasoning about RFC 5322:
+
+- **Folding is already normalised for us.** Every fold variant — tab
+  continuation, space continuation, trailing space at the fold — parses to the
+  same value. What is *not* normalised is an interior whitespace run or a tab
+  inside a value, so the digest normalises those itself.
+- **A malformed line truncates the header.** `ReadMIMEHeader` stops at the first
+  line with no colon and discards every field after it, while still returning
+  what it read. Using the partial result is deliberate: a message identified from
+  less still gets copied, whereas refusing to identify it makes it uncopyable
+  forever. A missing terminating blank line, by contrast, loses nothing.
+- **Field framing needs one mechanism, not two.** Values are written in the fixed
+  order of `Fields`, each terminated by a byte RFC 5322 forbids in a value, so a
+  field is identified by position. Writing the field name as well was redundant
+  — each mechanism masked the other's removal under mutation — and was dropped.
+
+`StampHeader` is deliberately *not* in `Fields`: if stamping changed the digest,
+the value written would never match the value later searched for.
+
 ### 5.3 Schema
 
 ```sql
