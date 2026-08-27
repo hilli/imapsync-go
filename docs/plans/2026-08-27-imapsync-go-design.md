@@ -272,9 +272,54 @@ reconciliation pass. Never a silent re-copy.
   `\Drafts`, `\Junk`, `\Archive` — read straight off `LIST`. This is strictly
   more reliable than imapsync's name heuristics and solves iCloud's
   `Sent Messages` / `Deleted Messages` versus mox's `Sent` / `Trash` directly.
+- **Name heuristics remain necessary**, contrary to the assumption above.
+  Measured against iCloud (§6.1): it returns `\Sent` and `\Trash` while leaving
+  `Drafts`, `Junk`, `Archive` and `Notes` unmarked. Attribute mapping therefore
+  covers part of an account, and the remainder falls back to names. Note that
+  the attributes arrive even though iCloud never advertises SPECIAL-USE, so
+  attributes must be read off every `LIST` response regardless of capability.
 - **`NAMESPACE` (RFC 2342) next** for hierarchy delimiter (`/` versus `.`) and
   prefix translation. Translate, never assume.
 - **User `--map` rules last**, as an explicit override.
+
+### 6.1 Measured: iCloud, 2026-08-27
+
+`probe` against a real account, 144 folders and 776,747 messages. This replaces
+several guesses the design rested on.
+
+| Capability | iCloud | Consequence |
+|---|---|---|
+| IMAP4rev1 | yes | no rev2; nothing may be assumed implied |
+| CONDSTORE | **yes** | the §5.6 fast path is available on the throttled side |
+| QRESYNC | **yes** | supported by the server, unimplemented by go-imap/v2 |
+| UIDPLUS | yes | `APPENDUID` works, so identity tier 2 is exact |
+| LIST-STATUS | advertised | **unusable**: no LIST-EXTENDED, so no return options |
+| LIST-EXTENDED | no | plain `LIST` only |
+| SPECIAL-USE | no | yet `\Sent` and `\Trash` still appear in `LIST` |
+| MOVE | no | no cheap moves |
+| LITERAL+ | no | has `XAPPLELITERAL`; a round trip per append |
+| MULTIAPPEND | no | one `APPEND` per message |
+
+Three things follow:
+
+**QRESYNC is worth implementing ourselves.** It was deferred post-v1 on the
+grounds that go-imap lacks it. iCloud supporting it changes the calculus: the
+slow, throttled, 414,022-message side is exactly where resync cost is felt.
+
+**Folder enumeration costs 144 round trips.** LIST-STATUS being unusable means a
+`STATUS` per folder, 60–200 ms each, which is most of the 35.7 s probe. This is
+a natural first consumer of the destination pool: the calls are independent and
+parallelise across connections. Note that `imapx` deliberately does *not* try
+`RETURN (STATUS)` on the strength of the LIST-STATUS claim alone — on the one
+server known to advertise it that way it is guaranteed to fail, so the retry
+would be a wasted round trip and a spurious warning on every run.
+
+**INBOX holds 414,022 messages, 53% of the account.** Per-folder parallelism
+alone would leave the run bounded by one folder on one connection. Intra-folder
+UID-range chunking is not an optimisation for this account; it is the whole job.
+
+Connection ceiling: at least 8, the configured cap; iCloud did not refuse. The
+real limit is still unmeasured.
 
 ## 7. Safety
 
@@ -328,15 +373,22 @@ That single invariant is the tombstone for the duplication bug.
 
 ## 10. Milestones
 
-- **M0** — skeleton, config, `probe`, capability negotiation.
+- **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state.
-- **M2** — pools, staged pipeline, byte-budget spooling.
+- **M2** — pools, staged pipeline, byte-budget spooling. Parallel folder
+  `STATUS` is the first easy win here (§6.1).
 - **M3** — AIMD governor + fault-injection suite.
-- **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping.
+- **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
+  fallback (§6).
 - **M5** — `compat` shim, `--delete2` + safety valve, progress UI.
-- **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed unmerged),
-  MULTIAPPEND batching, COMPRESS, and broader server support: Dovecot, Gmail,
-  Microsoft 365, Cyrus.
+- **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
+  unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:
+  Dovecot, Gmail, Microsoft 365, Cyrus.
+
+QRESYNC's position is now the least settled part of this plan. It was placed
+post-v1 because go-imap lacks it, before we knew iCloud advertises it (§6.1).
+Reconsider once M1 shows what a resync actually costs on a 414,022-message
+folder.
 
 M1 precedes M2 deliberately. Concurrency bugs layered on an unproven diff are
 undebuggable.

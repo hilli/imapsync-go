@@ -241,6 +241,16 @@ func writeReport(p *printer, label string, r *probe.Report) {
 
 	p.println("\nCapabilities that matter:")
 	caps, flush := p.table()
+
+	listStatusNote := "folder counts without a round trip each"
+	if r.Caps.ListStatus && !r.Caps.ListExtended {
+		// LIST-STATUS is defined as a LIST return option, so it is unreachable
+		// without the extension that permits return options. iCloud advertises
+		// exactly this combination; reporting it as available would suggest a
+		// saving that cannot be had.
+		listStatusNote = "advertised but unusable without LIST-EXTENDED"
+	}
+
 	for _, row := range []struct {
 		name    string
 		present bool
@@ -254,7 +264,7 @@ func writeReport(p *printer, label string, r *probe.Report) {
 		{"LIST-EXTENDED", r.Caps.ListExtended, "LIST return options; without it, plain RFC 3501 LIST"},
 		{"MOVE", r.Caps.Move, "cheap moves"},
 		{"MULTIAPPEND", r.Caps.MultiAppend, "not yet used: unimplemented in go-imap/v2"},
-		{"LIST-STATUS", r.Caps.ListStatus, "folder counts without a round trip each"},
+		{"LIST-STATUS", r.Caps.ListStatus, listStatusNote},
 		{"LITERAL+", r.Caps.LiteralPlus, "saves a round trip per append"},
 	} {
 		mark := "no"
@@ -295,6 +305,14 @@ func writeReport(p *printer, label string, r *probe.Report) {
 			su.printf("  %s\t%s\n", a, r.SpecialUse[a])
 		}
 		flushSU()
+
+		if !r.Caps.SpecialUse {
+			// iCloud tags \Sent and \Trash but not Drafts, Junk or Archive, and
+			// never advertises the extension. Attributes seen this way are a
+			// bonus, not a complete mapping, so folder matching cannot rely on
+			// them alone.
+			p.println("  (server does not advertise SPECIAL-USE: this mapping may be incomplete)")
+		}
 	}
 
 	p.printf("\nFolders: %d", len(r.Folders))
