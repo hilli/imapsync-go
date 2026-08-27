@@ -1,0 +1,383 @@
+package syncer_test
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/emersion/go-imap/v2"
+
+	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/retry"
+	"github.com/hilli/imapsync-go/internal/syncer"
+)
+
+// brisk is the retry policy these tests use: the same shape as the real one,
+// with the waiting taken out. What is under test is which failures are retried
+// and what happens in between, not how long the pauses are, which the retry
+// package measures on its own.
+func brisk() retry.Policy {
+	return retry.Policy{Attempts: 4, Base: time.Millisecond, Slow: time.Millisecond, Max: 5 * time.Millisecond}
+}
+
+// syncFlaky runs a sync against decorated connections with a given retry
+// policy.
+func syncFlaky(
+	t *testing.T,
+	h *harness,
+	srcCap, dstCap int,
+	opts syncer.Options,
+	wrapSrc, wrapDst func(imapx.Conn) imapx.Conn,
+) (syncer.Report, error) {
+	t.Helper()
+
+	if opts.PairID == "" {
+		opts.PairID = "test"
+	}
+	if opts.Retry.Attempts == 0 {
+		opts.Retry = brisk()
+	}
+	s := syncer.New(
+		pooled(t, srcCap, readOnly, h.src.dialFunc(t, wrapSrc)),
+		pooled(t, dstCap, imapx.SelectOptions{}, h.dst.dialFunc(t, wrapDst)),
+		h.db, nil, opts,
+	)
+	return s.Run(context.Background())
+}
+
+// droppingSource breaks the connection on selected body fetches.
+type droppingSource struct {
+	imapx.Conn
+	// drop reports whether the nth fetch of this run should fail.
+	drop  func(n int32) bool
+	count *atomic.Int32
+}
+
+func (d droppingSource) FetchBody(ctx context.Context, uid uint32, w io.Writer) (int64, error) {
+	if d.drop(d.count.Add(1)) {
+		_ = d.Close()
+		return 0, imapx.ErrConnectionBroken
+	}
+	return d.Conn.FetchBody(ctx, uid, w)
+}
+
+// TestADroppedSourceConnectionIsRetried is the headline of this milestone.
+//
+// Before it, one dropped connection abandoned the whole folder. On a mailbox of
+// four hundred thousand messages against a server nobody controls, that made
+// the difference between starting a sync and walking away, and nursing it.
+func TestADroppedSourceConnectionIsRetried(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 120)
+
+	count := &atomic.Int32{}
+	report, err := syncFlaky(t, h, 3, 4, syncer.Options{}, func(c imapx.Conn) imapx.Conn {
+		// Every seventeenth read, on every connection, for the whole run.
+		return droppingSource{Conn: c, count: count, drop: func(n int32) bool { return n%17 == 0 }}
+	}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	copied, _, failed := report.Totals()
+	if copied != len(want) || failed != 0 {
+		t.Errorf("copied %d and failed %d, want %d copied and none failed", copied, failed, len(want))
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+// TestARetryResumesAtTheMessageThatFailed is the correctness half of the same
+// feature, and the reason the retry is not simply "run the chunk again".
+//
+// Messages fetched before the failure are already recorded as in flight and may
+// be sitting in the hand-off queue or already on the destination. Restarting
+// the chunk would fetch and append every one of them a second time. The
+// duplicate count below is what says the difference.
+func TestARetryResumesAtTheMessageThatFailed(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	// Two and a bit chunks, so a failure lands mid-chunk with a substantial
+	// run of messages already fetched behind it.
+	want := fill(t, h.src, "INBOX", 120)
+
+	count := &atomic.Int32{}
+	report, err := syncFlaky(t, h, 1, 2, syncer.Options{}, func(c imapx.Conn) imapx.Conn {
+		return droppingSource{Conn: c, count: count, drop: func(n int32) bool { return n == 30 || n == 31 }}
+	}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if copied, _, _ := report.Totals(); copied != len(want) {
+		t.Errorf("copied %d, want %d", copied, len(want))
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+// lyingDest stores the message and then says the connection broke.
+//
+// This is the failure that makes retrying an append dangerous, and it is not
+// exotic: an APPEND is complete on the wire before its response comes back, so
+// any connection lost in between leaves a message stored and a client that
+// believes it was not.
+type lyingDest struct {
+	imapx.Conn
+	lies *atomic.Int32
+}
+
+func (d lyingDest) Append(ctx context.Context, mailbox string, msg imapx.AppendMessage) (imapx.AppendResult, error) {
+	res, err := d.Conn.Append(ctx, mailbox, msg)
+	if err != nil || d.lies.Add(-1) < 0 {
+		return res, err
+	}
+	return imapx.AppendResult{}, imapx.ErrConnectionBroken
+}
+
+// TestAnAppendThatSurvivedALostConnectionIsNotSentTwice is the one test here
+// that would be missed by any amount of care about connections.
+//
+// The retry is correct, the message is stored, and appending it again would
+// still be wrong. The only way to tell is to ask the destination whether it
+// already has it, which is what the retry does before trying again.
+func TestAnAppendThatSurvivedALostConnectionIsNotSentTwice(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 40)
+
+	lies := &atomic.Int32{}
+	lies.Store(12)
+	report, err := syncFlaky(t, h, 2, 3, syncer.Options{}, nil, func(c imapx.Conn) imapx.Conn {
+		return lyingDest{Conn: c, lies: lies}
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Every message is on the destination exactly once, including the twelve
+	// whose appends were reported as failures.
+	assertExactly(t, h.dst, "INBOX", want)
+
+	copied, _, failed := report.Totals()
+	if copied != len(want) || failed != 0 {
+		t.Errorf("copied %d and failed %d, want %d copied and none failed", copied, failed, len(want))
+	}
+}
+
+// refusingDest rejects one message for good, and accepts everything else.
+type refusingDest struct {
+	imapx.Conn
+	subject string
+	tries   *atomic.Int32
+}
+
+func (d refusingDest) Append(ctx context.Context, mailbox string, msg imapx.AppendMessage) (imapx.AppendResult, error) {
+	body, err := io.ReadAll(msg.Body)
+	if err != nil {
+		return imapx.AppendResult{}, err
+	}
+	if strings.Contains(string(body), d.subject) {
+		d.tries.Add(1)
+		return imapx.AppendResult{}, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeTooBig,
+			Text: "message too large",
+		}
+	}
+	msg.Body = bytes.NewReader(body)
+	return d.Conn.Append(ctx, mailbox, msg)
+}
+
+// TestAMessageTheServerWillNeverTakeIsNotRetried checks the other half of the
+// classification: a refusal that is final should cost one attempt, not four,
+// and should take one message down rather than the folder.
+func TestAMessageTheServerWillNeverTakeIsNotRetried(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 30)
+
+	tries := &atomic.Int32{}
+	report, err := syncFlaky(t, h, 2, 2, syncer.Options{}, nil, func(c imapx.Conn) imapx.Conn {
+		return refusingDest{Conn: c, subject: want[7], tries: tries}
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	copied, _, failed := report.Totals()
+	if copied != len(want)-1 || failed != 1 {
+		t.Errorf("copied %d and failed %d, want %d copied and 1 failed", copied, failed, len(want)-1)
+	}
+	if got := tries.Load(); got != 1 {
+		t.Errorf("the server was asked to take the same rejected message %d times; a final refusal is not worth repeating", got)
+	}
+
+	// Everything else arrived, so one bad message did not take the folder down.
+	assertExactly(t, h.dst, "INBOX", slices.Concat(want[:7], want[8:]))
+}
+
+// TestAFailedMessageIsTriedAgainOnTheNextRun keeps the failure above from being
+// permanent. Only messages recorded as done are skipped when a run is repeated,
+// which is what makes it safe to give up on one message rather than the folder.
+func TestAFailedMessageIsTriedAgainOnTheNextRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 10)
+
+	tries := &atomic.Int32{}
+	if _, err := syncFlaky(t, h, 1, 1, syncer.Options{}, nil, func(c imapx.Conn) imapx.Conn {
+		return refusingDest{Conn: c, subject: want[3], tries: tries}
+	}); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+
+	report, err := syncFlaky(t, h, 1, 1, syncer.Options{}, nil, nil)
+	if err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+	if copied, _, _ := report.Totals(); copied != 1 {
+		t.Errorf("the second run copied %d messages, want the 1 that failed in the first", copied)
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+// deadDest refuses everything, in a way that looks worth retrying.
+type deadDest struct {
+	imapx.Conn
+	attempts *atomic.Int32
+}
+
+func (d deadDest) Append(context.Context, string, imapx.AppendMessage) (imapx.AppendResult, error) {
+	d.attempts.Add(1)
+	return imapx.AppendResult{}, imapx.ErrConnectionBroken
+}
+
+// TestARunAgainstADeadServerGivesUp is the bound on everything above.
+//
+// Retrying assumes something might still succeed. A destination that has
+// stopped accepting mail fails every message identically, and each failure
+// costs a full allowance of attempts and pauses. Without a ceiling a large
+// folder would spend hours establishing, one message at a time, a fact the
+// first fifty already established.
+func TestARunAgainstADeadServerGivesUp(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	fill(t, h.src, "INBOX", 400)
+
+	attempts := &atomic.Int32{}
+	opts := syncer.Options{GiveUpAfter: 10}
+	_, err := syncFlaky(t, h, 2, 2, opts, nil, func(c imapx.Conn) imapx.Conn {
+		return deadDest{Conn: c, attempts: attempts}
+	})
+
+	if err == nil {
+		t.Fatal("Run() returned no error against a destination that refused every message")
+	}
+	if !strings.Contains(err.Error(), "in a row") {
+		t.Errorf("Run() error = %v, want it to say the run was given up on", err)
+	}
+
+	// Ten failures, each costing four attempts, is forty appends. The bound is
+	// loose because workers in flight when the ceiling trips finish what they
+	// were doing; what matters is that it is nothing like four hundred.
+	if got := attempts.Load(); got > 200 {
+		t.Errorf("the destination was asked %d times before the run gave up, out of 400 messages", got)
+	}
+}
+
+// TestSteadyTroubleDoesNotEndAHealthyRun is the other side of the ceiling, and
+// the reason it counts failures in a row rather than failures.
+//
+// A flaky link produces a steady trickle of failures over hours without ever
+// meaning the server is unreachable. Counting them cumulatively would abandon
+// an account of three quarters of a million messages over a fault rate of a
+// hundredth of a per cent — the run would be killed by the very durability it
+// was given.
+func TestSteadyTroubleDoesNotEndAHealthyRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 200)
+
+	// Forty failures over the run, twenty times the ceiling, but never two in
+	// a row for the same message.
+	count := &atomic.Int32{}
+	report, err := syncFlaky(t, h, 1, 2, syncer.Options{GiveUpAfter: 10}, func(c imapx.Conn) imapx.Conn {
+		return droppingSource{Conn: c, count: count, drop: func(n int32) bool { return n%5 == 0 }}
+	}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want a run that survives intermittent trouble", err)
+	}
+
+	if copied, _, failed := report.Totals(); copied != len(want) || failed != 0 {
+		t.Errorf("copied %d and failed %d, want %d copied and none failed", copied, failed, len(want))
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+// TestGivingUpDoesNotLoseWhatWasAlreadyCopied checks that the ceiling stops the
+// run without spoiling it. Giving up is only tolerable if the work already done
+// survives, so that running again resumes rather than starts over — and, more
+// importantly, does not copy anything twice.
+func TestGivingUpDoesNotLoseWhatWasAlreadyCopied(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 200)
+
+	// Accept the first thirty messages, then refuse everything.
+	remaining := &atomic.Int32{}
+	remaining.Store(30)
+	attempts := &atomic.Int32{}
+	first, err := syncFlaky(t, h, 1, 1, syncer.Options{GiveUpAfter: 5}, nil, func(c imapx.Conn) imapx.Conn {
+		return failAfter{Conn: c, remaining: remaining, attempts: attempts}
+	})
+	if err == nil {
+		t.Fatal("Run() returned no error against a destination that stopped accepting")
+	}
+	copied, _, _ := first.Totals()
+	if copied < 25 {
+		t.Fatalf("the abandoned run recorded %d messages copied, want about the 30 the destination accepted", copied)
+	}
+
+	// The same accounts again, with the destination working.
+	second, err := syncFlaky(t, h, 2, 2, syncer.Options{}, nil, nil)
+	if err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+
+	var already int
+	for _, fr := range second.Folders {
+		already += fr.AlreadyDone
+	}
+	if already != copied {
+		t.Errorf("the second run treated %d messages as already copied, want the %d the first one recorded",
+			already, copied)
+	}
+	assertExactly(t, h.dst, "INBOX", want)
+}
+
+type failAfter struct {
+	imapx.Conn
+	remaining *atomic.Int32
+	attempts  *atomic.Int32
+}
+
+func (d failAfter) Append(ctx context.Context, mailbox string, msg imapx.AppendMessage) (imapx.AppendResult, error) {
+	if d.remaining.Add(-1) >= 0 {
+		return d.Conn.Append(ctx, mailbox, msg)
+	}
+	d.attempts.Add(1)
+	return imapx.AppendResult{}, imapx.ErrConnectionBroken
+}
