@@ -44,6 +44,10 @@ import (
 // their metadata in one command would be neither.
 const metaBatch = 500
 
+// stateWriteGrace bounds a write that records work already done on the server,
+// which has to run even when the run itself has been cancelled.
+const stateWriteGrace = 10 * time.Second
+
 // copyChunk is how many messages one fetch worker claims at a time.
 //
 // Work is handed out in chunks rather than split up front because message sizes
@@ -353,7 +357,10 @@ func (s *Syncer) announce(ctx context.Context, hp *health, folders int) func() {
 					"copied", copied,
 					"adopted", hp.adopted.Load(),
 					"rate", fmt.Sprintf("%.1f msg/s", float64(copied)/elapsed.Seconds()),
-					"elapsed", elapsed.Round(time.Second))
+					// A duration is rendered as a bare nanosecond count by
+					// the JSON handler, which is unreadable in exactly the
+					// place this line is meant to be read.
+					"elapsed", elapsed.Round(time.Second).String())
 			}
 		}
 	}()
@@ -1199,7 +1206,17 @@ func (s *Syncer) record(
 	dstUIDValidity, dstUID uint32,
 	lv *live,
 ) error {
-	if err := s.db.CompleteAppend(ctx, p.folderID, p.src.UIDValidity, item.uid, dstUIDValidity, dstUID); err != nil {
+	// The message is on the destination by the time this runs, so the write
+	// that says so must not be abandoned because the run was interrupted.
+	// Cancellation here would leave the copy done and unrecorded — the next run
+	// would find it by searching the destination, which is slower, and for a
+	// message too weak to search for would copy it a second time. Detached from
+	// the caller's context and bounded on its own, so an interrupt cannot make
+	// it hang either.
+	settled, done := context.WithTimeout(context.WithoutCancel(ctx), stateWriteGrace)
+	defer done()
+
+	if err := s.db.CompleteAppend(settled, p.folderID, p.src.UIDValidity, item.uid, dstUIDValidity, dstUID); err != nil {
 		return fmt.Errorf("recording message %d as copied: %w", item.uid, err)
 	}
 	lv.copied()

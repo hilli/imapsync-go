@@ -208,13 +208,18 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		ProgressEvery: f.progressEvery,
 		Logger:        slog.Default(),
 	}).Run(ctx)
+
+	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun)
+
+	// A run that ended badly still copied something, and after an interruption
+	// or a run the engine gave up on, what was copied is the thing worth
+	// knowing: it is what the next run will not have to do again. So the
+	// report is written first and the error returned after it.
 	if err != nil {
 		return err
 	}
 
-	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun)
-
-	// The report is written before any of these are returned: knowing which
+	// The report is written before any of these are returned too: knowing which
 	// folders failed is more useful than the error itself.
 	if _, _, failed := report.Totals(); failed > 0 {
 		return fmt.Errorf("%d messages could not be copied", failed)

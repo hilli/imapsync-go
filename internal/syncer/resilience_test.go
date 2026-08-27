@@ -37,6 +37,19 @@ func syncFlaky(
 	wrapSrc, wrapDst func(imapx.Conn) imapx.Conn,
 ) (syncer.Report, error) {
 	t.Helper()
+	return syncFlakyCtx(t, context.Background(), h, srcCap, dstCap, opts, wrapSrc, wrapDst)
+}
+
+// syncFlakyCtx is syncFlaky under a context the caller can cancel.
+func syncFlakyCtx(
+	t *testing.T,
+	ctx context.Context,
+	h *harness,
+	srcCap, dstCap int,
+	opts syncer.Options,
+	wrapSrc, wrapDst func(imapx.Conn) imapx.Conn,
+) (syncer.Report, error) {
+	t.Helper()
 
 	if opts.PairID == "" {
 		opts.PairID = "test"
@@ -49,7 +62,7 @@ func syncFlaky(
 		pooled(t, dstCap, imapx.SelectOptions{}, h.dst.dialFunc(t, wrapDst)),
 		h.db, nil, opts,
 	)
-	return s.Run(context.Background())
+	return s.Run(ctx)
 }
 
 // droppingSource breaks the connection on selected body fetches.
@@ -583,4 +596,60 @@ func TestASilentRunCanBeAsked(t *testing.T) {
 	if said := log.find("still going", "copied"); len(said) > 0 {
 		t.Fatalf("progress was reported %d times with it switched off", len(said))
 	}
+}
+
+// interruptingDest cancels the run once it has stored a message, which is the
+// one instant where an abandoned state write costs something.
+type interruptingDest struct {
+	imapx.Conn
+	after  int32
+	n      *atomic.Int32
+	cancel context.CancelFunc
+}
+
+func (d interruptingDest) Append(ctx context.Context, mailbox string, msg imapx.AppendMessage) (imapx.AppendResult, error) {
+	res, err := d.Conn.Append(ctx, mailbox, msg)
+	if err == nil && d.n.Add(1) == d.after {
+		d.cancel()
+	}
+	return res, err
+}
+
+// TestAnInterruptedRunRecordsWhatItCopied.
+//
+// An append is finished on the server before the database hears about it, and
+// an interrupt lands wherever it lands. If the write that records the copy is
+// abandoned because the run was cancelled, the message is on the destination
+// and the state database does not know: the next run has to rediscover it by
+// searching, which is slower, and a message too weak to search for would be
+// copied twice.
+//
+// The signature of the bug is adoption. A second run that has to adopt anything
+// is a run recovering from a write that should have happened.
+func TestAnInterruptedRunRecordsWhatItCopied(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	want := fill(t, h.src, "INBOX", 60)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := &atomic.Int32{}
+	if _, err := syncFlakyCtx(t, ctx, h, 1, 1, syncer.Options{}, nil, func(c imapx.Conn) imapx.Conn {
+		return interruptingDest{Conn: c, after: 20, n: n, cancel: cancel}
+	}); err == nil {
+		t.Fatal("an interrupted run reported success")
+	}
+
+	rep, err := syncFlaky(t, h, 1, 1, syncer.Options{}, nil, nil)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	if got := folderReport(t, rep, "INBOX"); got.Adopted > 0 {
+		t.Fatalf("the second run adopted %d messages: the first left them on the destination unrecorded",
+			got.Adopted)
+	}
+	assertExactly(t, h.dst, "INBOX", want)
 }

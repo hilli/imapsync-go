@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -316,4 +318,54 @@ func runCLILogs(t *testing.T, args []string) string {
 		t.Fatalf("reading logs: %v", err)
 	}
 	return string(logs)
+}
+
+// TestAnInterruptedRunStillSaysWhatItCopied.
+//
+// An interrupted run is not a failed run: it copied whatever it copied, that
+// work is recorded, and the next run will not repeat it. Printing only the
+// error throws away the one number worth having.
+func TestAnInterruptedRunStillSaysWhatItCopied(t *testing.T) {
+	srcAddr, srcUser, _ := startCountedAccount(t)
+	dstAddr, _, _ := startCountedAccount(t)
+
+	// Enough messages that no plausible machine finishes them inside the
+	// deadline below, on one connection: the in-process server copies a few
+	// thousand a second, so this is seconds of work cut off after a fraction
+	// of one.
+	for i := range 6000 {
+		body := cliMessage(fmt.Sprintf("subject-%04d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var out bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(t.TempDir(), "state.db"),
+		"--source-connections", "1",
+		"--dest-connections", "1",
+		"--progress-interval", "0",
+		"--log-level", "error",
+	})
+
+	if err := cmd.ExecuteContext(ctx); err == nil {
+		t.Fatalf("an interrupted run reported success:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "copied,") {
+		t.Fatalf("an interrupted run printed no report:\n%s", out.String())
+	}
 }

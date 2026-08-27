@@ -179,6 +179,11 @@ already there:
 Deleting the state database costs a pass over the destination's headers, not a
 duplicated account.
 
+Interrupting a run prints what it managed to copy before it stopped, which is
+what the next run will not have to do again. Press Ctrl-C once and the run winds
+down: in-flight appends are recorded before it exits, so an interrupt costs a
+few seconds rather than a folder.
+
 ### Choosing folders
 
 | Flag | Effect |

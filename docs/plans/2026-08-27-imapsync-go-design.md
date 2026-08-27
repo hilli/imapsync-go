@@ -466,6 +466,16 @@ burst of throttling — and by then the pools have been rebuilt around fresh
 connections. It costs one attempt on the folders that failed, against
 rescheduling the entire run to catch them.
 
+**A write that records work already done is not cancellable.** An `APPEND`
+finishes on the server before the database hears about it, and an interrupt
+lands wherever it lands. Cancelling the write in between leaves the message
+copied and unrecorded: the next run rediscovers it by searching the destination,
+which is slower, and a message too weak to search for would be copied twice.
+That write therefore runs on a context detached from the run's, bounded by its
+own ten-second grace so an interrupt cannot make it hang either. Found by
+interrupting a real run, which reported `recording message 18 as copied:
+context canceled` for a message already sitting on the destination.
+
 **The run says what it is doing.** Not a progress bar: no total is known until
 the last folder has been diffed, and against a mailbox holding half the account
 the useful question during hour four is not "how far along" but "is it still
@@ -721,6 +731,24 @@ Rather than build a seam for a knob nobody has asked for, the flags were
 removed. The engine's defaults are the ones §5.7 argues for, and a flag can be
 added when a real run shows it is needed — with a test, by then, of what it
 does.
+
+### 9.3 What the real servers found that the tests did not
+
+Two defects survived a green suite and appeared within minutes of interrupting a
+run against iCloud and mox:
+
+1. **A cancelled context abandoned the write that records a completed copy**,
+   which is the exact opposite of write-ahead state (§5.7). Both the fix and a
+   test now exist; the test asserts that a second run adopts nothing, since
+   adoption is the signature of a copy the database failed to hear about.
+2. **An interrupted run printed no report at all.** It had copied 47 of 127
+   messages and said only that the context was cancelled. The report is now
+   written before the error is returned, because what a stopped run managed to
+   copy is the thing worth knowing: it is what the next run will not repeat.
+
+Neither is exotic, and neither would have been found by more unit tests. The
+first needs an interrupt to arrive inside a window a few hundred microseconds
+wide, which a real network makes routine and a loopback server makes rare.
 
 Of the thirteen caught, the one worth naming is removing the check that asks
 whether an append landed before retrying it. It produces silent duplicates, on
