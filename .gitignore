@@ -1,0 +1,22 @@
+# Build artifacts
+/imapsync-go
+/dist/
+/bin/
+
+# Local state and spool
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local configuration that may reference real accounts
+/imapsync.yaml
+/imapsync.local.yaml
+
+# Worktrees, if adopted later
+/.worktrees/
+/worktrees/
+
+# Editor / OS noise
+.DS_Store
+*.swp

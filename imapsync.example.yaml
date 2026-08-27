@@ -1,0 +1,44 @@
+# Example imapsync-go configuration.
+#
+# Credentials are always referenced indirectly. Passwords are never written
+# here: use an environment variable, a file, or the macOS keychain.
+#
+#   imapsync-go probe --config imapsync.example.yaml --pair icloud-to-mox --side both
+
+pairs:
+  - name: icloud-to-mox
+
+    source:
+      # iCloud requires an app-specific password, not the account password.
+      url: "imaps://you%40icloud.com@imap.mail.me.com:993"
+      password:
+        env: ICLOUD_APP_PW
+
+    dest:
+      url: "imaps://you@mox.example.net:993"
+      password:
+        keychain: mox-imap
+
+    concurrency:
+      # "auto" lets the adaptive governor find the working limit. iCloud
+      # throttles aggressively and typically settles low; mox tolerates far more.
+      source: auto
+      dest: auto
+      # Total bytes of in-flight message data. Backpressure is measured in
+      # bytes rather than message count so a handful of large attachments
+      # cannot exhaust memory.
+      max_inflight: 512MiB
+
+    folders:
+      # Resolve Sent/Trash/Drafts/Junk/Archive by their SPECIAL-USE attribute
+      # rather than by name, so iCloud's "Sent Messages" maps onto mox's "Sent"
+      # without hand-written rules.
+      map: special-use
+      exclude:
+        - "Notes"
+      # Explicit overrides, applied last.
+      rules: []
+
+    # Destructive operations are opt-in. Even when enabled, a run that would
+    # delete an unusually large share of a folder aborts unless forced.
+    delete2: false
