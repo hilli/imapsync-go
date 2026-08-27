@@ -206,11 +206,26 @@ because iCloud throttles aggressively and unpredictably.
 
 A **byte-budget semaphore**, not a count semaphore. A worker acquires
 `min(RFC822.SIZE, cap)` bytes before fetching and releases on append completion.
-Messages under ~1 MiB stay in RAM; larger ones spool to `os.CreateTemp`.
 
 With a count semaphore, 500 concurrent 30 MB fetches is 15 GB of RSS. With a byte
 budget, 200 tiny messages and 3 large ones cost proportionally to their actual
 size.
+
+The connection pool already bounds concurrency, so it already bounds memory at
+`Cap × largest-message`. That is fine at Cap 8 and unacceptable at Cap 100. The
+budget exists because a count of connections is the wrong unit for a limit on
+memory: messages differ in size by four orders of magnitude.
+
+**Spooling large messages to `os.CreateTemp` is cut.** The design originally
+called for messages over about a megabyte to go to disk. With the budget charged
+in bytes, total memory is already bounded by the budget; spooling would lower
+peak RSS below the budget without changing the guarantee, and would buy that
+with temporary-file lifecycle, cleanup after a crash, and disk-full as a new
+failure mode. The honest bound is therefore `max(budget, largest single
+message)`: a message bigger than the whole budget is charged the whole budget
+and read into memory anyway, because refusing to copy it would be worse and
+blocking for ever would be worse still. If a mailbox of very large attachments
+ever justifies spooling, adding it inside `internal/budget` is contained.
 
 ## 5. Correctness
 
