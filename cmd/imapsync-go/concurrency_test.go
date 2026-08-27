@@ -1,0 +1,249 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"net"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
+)
+
+func TestParseBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		in   string
+		want int64
+	}{
+		{"512", 512},
+		{"1B", 1},
+		{"64KiB", 64 << 10},
+		{"256MiB", 256 << 20},
+		{"2GiB", 2 << 30},
+		{"100MB", 100e6},
+		{"8M", 8 << 20},
+		{" 32MiB ", 32 << 20},
+	} {
+		got, err := parseBytes(tc.in)
+		if err != nil {
+			t.Errorf("parseBytes(%q) error = %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseBytes(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+
+	// A limit that is not a size, or is not a limit, has to be refused rather
+	// than silently become something else. Zero would deadlock the run and a
+	// negative number would panic the semaphore underneath it.
+	for _, in := range []string{"", "lots", "0", "-1", "0MiB", "-4GiB", "1.5MiB", "MiB"} {
+		if got, err := parseBytes(in); err == nil {
+			t.Errorf("parseBytes(%q) = %d, want an error", in, got)
+		}
+	}
+}
+
+// TestReadingTheSourceDoesNotMarkMessagesSeen is a whole-command test of the
+// one property a migration must never break: it must not alter the account it
+// is reading.
+//
+// What actually protects this is BODY.PEEK — removing the peek fails this test.
+// Opening the source with EXAMINE rather than SELECT is a second layer, and one
+// this test cannot demonstrate, because with PEEK the two are indistinguishable
+// from outside. It is asserted at the call in the engine's own tests instead.
+//
+// The message count is high enough to need several connections, so the pool
+// does most of the selecting rather than the engine doing it once per folder.
+func TestReadingTheSourceDoesNotMarkMessagesSeen(t *testing.T) {
+	srcAddr, srcUser := startAccount(t, "Work")
+	dstAddr, _ := startAccount(t)
+
+	// Enough messages to need more than one connection, so the pool's own
+	// selects are exercised and not just the engine's.
+	for i := range 120 {
+		mailbox := "INBOX"
+		if i%2 == 0 {
+			mailbox = "Work"
+		}
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append(mailbox, bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding %q: %v", mailbox, err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	out := runCLI(t, []string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(t.TempDir(), "state.db"),
+		"--source-connections", "4",
+		"--dest-connections", "6",
+		"--log-level", "error",
+	})
+	if !strings.Contains(out, "120 copied") {
+		t.Fatalf("did not copy everything:\n%s", out)
+	}
+
+	for _, mailbox := range []string{"INBOX", "Work"} {
+		status, err := srcUser.Status(mailbox, &imap.StatusOptions{NumUnseen: true})
+		if err != nil {
+			t.Fatalf("reading %q status: %v", mailbox, err)
+		}
+		if status.NumUnseen == nil {
+			t.Fatalf("server did not report unseen counts for %q", mailbox)
+		}
+		if *status.NumUnseen != 60 {
+			t.Errorf("%s: only %d of 60 messages are still unread; reading the source marked them seen",
+				mailbox, *status.NumUnseen)
+		}
+	}
+}
+
+// countingListener records how many connections a server accepts.
+type countingListener struct {
+	net.Listener
+	n atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.n.Add(1)
+	}
+	return c, err
+}
+
+// startCountedAccount is startAccount with a listener that counts connections.
+func startCountedAccount(t *testing.T, mailboxes ...string) (addr string, user *imapmemserver.User, conns *countingListener) {
+	t.Helper()
+
+	user = imapmemserver.NewUser(cliUser, cliPassword)
+	for _, name := range append([]string{"INBOX"}, mailboxes...) {
+		if err := user.Create(name, nil); err != nil {
+			t.Fatalf("creating %q: %v", name, err)
+		}
+	}
+
+	mem := imapmemserver.New()
+	mem.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return mem.NewSession(), nil, nil
+		},
+		InsecureAuth: true,
+		Caps:         imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapIMAP4rev2: {}},
+		Logger:       cliDiscardLogger{},
+	})
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	conns = &countingListener{Listener: raw}
+	go func() { _ = srv.Serve(conns) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	return raw.Addr().String(), user, conns
+}
+
+// TestConnectionFlagsAreTheCeilingTheyClaimToBe checks the number that matters
+// most to the person running this.
+//
+// iCloud counts connections against an account-wide ceiling and answers with
+// authentication failures once it is passed — not to the connection that
+// crossed the line, but to whatever the account is doing anywhere else, mail
+// clients included. A flag that says four and opens more is worse than no flag
+// at all, and one that says four and opens one turns a five-day migration back
+// into a twenty-day one.
+func TestConnectionFlagsAreTheCeilingTheyClaimToBe(t *testing.T) {
+	const (
+		srcCap   = 3
+		dstCap   = 5
+		messages = 400
+	)
+
+	srcAddr, srcUser, srcConns := startCountedAccount(t, "Work")
+	dstAddr, _, dstConns := startCountedAccount(t)
+
+	for i := range messages {
+		mailbox := "INBOX"
+		if i%2 == 0 {
+			mailbox = "Work"
+		}
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append(mailbox, bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding %q: %v", mailbox, err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	out := runCLI(t, []string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(t.TempDir(), "state.db"),
+		"--source-connections", fmt.Sprint(srcCap),
+		"--dest-connections", fmt.Sprint(dstCap),
+		"--log-level", "error",
+	})
+	if !strings.Contains(out, fmt.Sprintf("%d copied", messages)) {
+		t.Fatalf("did not copy everything:\n%s", out)
+	}
+
+	for _, side := range []struct {
+		name string
+		got  int
+		cap  int
+	}{
+		{"source", int(srcConns.n.Load()), srcCap},
+		{"destination", int(dstConns.n.Load()), dstCap},
+	} {
+		if side.got > side.cap {
+			t.Errorf("%s opened %d connections, more than the %d it was allowed", side.name, side.got, side.cap)
+		}
+		// There is plenty of work here for every connection. Opening one would
+		// mean the flag never reached the pool.
+		if side.got < 2 {
+			t.Errorf("%s opened %d connections with %d messages to move; the limit is not being used",
+				side.name, side.got, messages)
+		}
+	}
+}
+
+// TestConnectionCountsMustBePositive checks that the flags are validated rather
+// than quietly turned into something else. A cap of zero would be a pool that
+// can never hand out a connection: a run that hangs on its first folder.
+func TestConnectionCountsMustBePositive(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	srcAddr, _ := startAccount(t)
+	dstAddr, _ := startAccount(t)
+
+	for _, flag := range []string{"--source-connections", "--dest-connections"} {
+		out, err := runCLIErr(t, []string{
+			"sync",
+			"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+			"--source-password-env", "TEST_IMAP_PASSWORD",
+			"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+			"--dest-password-env", "TEST_IMAP_PASSWORD",
+			"--state", filepath.Join(t.TempDir(), "state.db"),
+			flag, "0",
+			"--log-level", "error",
+		})
+		if err == nil {
+			t.Errorf("%s 0 was accepted:\n%s", flag, out)
+		}
+	}
+}

@@ -87,6 +87,10 @@ type Pool struct {
 type conn struct {
 	c        imapx.Conn
 	selected string
+	// uidValidity is what the server reported for selected. It is carried so
+	// that a caller can tell whether the mailbox it is working on is still the
+	// one it planned against; see Lease.UIDValidity.
+	uidValidity uint32
 }
 
 // New creates a pool. It dials nothing; the first Acquire does that.
@@ -124,6 +128,21 @@ type Lease struct {
 // Conn returns the leased connection. It must not be used after Release, and
 // must not be handed to another goroutine that outlives the lease.
 func (l *Lease) Conn() imapx.Conn { return l.c.c }
+
+// UIDValidity reports what the server said when this connection selected the
+// mailbox, or 0 if the lease named none.
+//
+// A server may renumber a mailbox at any time, and announces it by changing
+// this value on the next SELECT. One long-lived connection never sees that
+// happen, because it never selects again; a pool that re-selects on every lease
+// sees it immediately. Callers that planned work against a UID list compare
+// this to the value they planned with, and abandon the folder when it differs,
+// because every UID they hold now means something else or nothing.
+//
+// The value may be stale in the sense that it is from whenever this connection
+// last selected. That is the strongest claim any IMAP client can make: nothing
+// tells you a mailbox has been renumbered except selecting it again.
+func (l *Lease) UIDValidity() uint32 { return l.c.uidValidity }
 
 // Release returns the connection to the pool.
 //
@@ -186,11 +205,13 @@ func (p *Pool) ready(ctx context.Context, mailbox string) (*conn, error) {
 	if mailbox == "" || c.selected == mailbox {
 		return c, nil
 	}
-	if _, err := c.c.Select(ctx, mailbox, p.sel); err != nil {
+	mbox, err := c.c.Select(ctx, mailbox, p.sel)
+	if err != nil {
 		_ = c.c.Close()
 		return nil, fmt.Errorf("selecting %q: %w", mailbox, err)
 	}
 	c.selected = mailbox
+	c.uidValidity = mbox.UIDValidity
 	return c, nil
 }
 

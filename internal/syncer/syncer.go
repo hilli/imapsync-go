@@ -1,10 +1,17 @@
 // Package syncer copies messages from one IMAP account to another.
 //
-// This is the M1 engine: one connection per side, folders in sequence, messages
-// in sequence. It is deliberately not concurrent. Correctness here — what counts
-// as already copied, what a crash leaves behind, what a UIDVALIDITY change
-// means — is what the concurrent engine will be built on, and none of it gets
-// easier to reason about with a hundred connections in flight.
+// Correctness is decided the same way whether one connection is in flight or a
+// hundred: what counts as already copied, what a crash leaves behind, and what
+// a UIDVALIDITY change means are all properties of the state database, not of
+// the connection that happened to observe them.
+//
+// The concurrency is shaped to keep it that way. Work moves through two stages
+// that never overlap in what they hold: fetch workers lease a source
+// connection and nothing else, append workers lease a destination connection
+// and nothing else, and a channel of fetched bodies joins them. Because no
+// goroutine ever holds a connection to both accounts at once, the two pools
+// cannot deadlock against each other however they are sized — which matters,
+// because they are deliberately sized very differently (§4.1).
 package syncer
 
 import (
@@ -13,12 +20,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
+	"github.com/hilli/imapsync-go/internal/budget"
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/ident"
 	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/state"
 )
 
@@ -28,6 +41,24 @@ import (
 // trips against footprint. iCloud's INBOX holds 414k messages (§6.3); fetching
 // their metadata in one command would be neither.
 const metaBatch = 500
+
+// copyChunk is how many messages one fetch worker claims at a time.
+//
+// Work is handed out in chunks rather than split up front because message sizes
+// vary by orders of magnitude: a static partition gives one worker a run of
+// 50 MiB attachments and leaves everyone waiting for it. A worker that draws a
+// heavy chunk simply draws fewer chunks.
+//
+// The size is a compromise between two costs that pull in opposite directions.
+// Large chunks amortise the one metadata FETCH that opens each chunk over more
+// bodies. Small chunks divide the folder more finely, and the number of workers
+// that can share a folder is the number of chunks in it — at a thousand a
+// folder of nine hundred messages would be copied by exactly one connection.
+//
+// Fifty puts the metadata FETCH at one round trip in fifty-one, and a few per
+// cent of the bytes, while letting a folder of a few hundred messages spread
+// across every connection there is.
+const copyChunk = 50
 
 // Options configures a run.
 type Options struct {
@@ -48,14 +79,18 @@ type Options struct {
 
 // Syncer copies one account onto another.
 type Syncer struct {
-	src, dst imapx.Conn
+	src, dst *pool.Pool
+	bytes    *budget.Budget
 	db       *state.DB
 	opts     Options
 	log      *slog.Logger
 }
 
-// New returns a syncer over two established connections.
-func New(src, dst imapx.Conn, db *state.DB, opts Options) *Syncer {
+// New returns a syncer over two connection pools.
+//
+// bytes bounds how much message data may be in memory at once and may be nil
+// for no limit, in which case the pool sizes are the only bound.
+func New(src, dst *pool.Pool, db *state.DB, bytes *budget.Budget, opts Options) *Syncer {
 	log := opts.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -63,7 +98,7 @@ func New(src, dst imapx.Conn, db *state.DB, opts Options) *Syncer {
 	if opts.PairID == "" {
 		opts.PairID = "default"
 	}
-	return &Syncer{src: src, dst: dst, db: db, opts: opts, log: log}
+	return &Syncer{src: src, dst: dst, bytes: bytes, db: db, opts: opts, log: log}
 }
 
 // Report is the outcome of a run.
@@ -114,7 +149,7 @@ func (r Report) Totals() (copied, adopted, failed int) {
 //
 // A folder that fails is recorded and the run continues: one unreadable mailbox
 // should not strand the rest of an account. Only a failure to plan the run at
-// all returns an error.
+// all, or cancellation, returns an error.
 func (s *Syncer) Run(ctx context.Context) (Report, error) {
 	plan, err := s.plan(ctx)
 	if err != nil {
@@ -122,50 +157,99 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 	}
 
 	report := Report{Skips: plan.Skips}
-	for _, name := range plan.Creates {
-		if s.opts.DryRun {
-			report.Created = append(report.Created, name)
-			continue
+	if err := s.createFolders(ctx, plan.Creates, &report); err != nil {
+		return report, err
+	}
+
+	// As many folders at once as there are source connections, which is as many
+	// as can make progress: a folder beyond that would only queue for one.
+	//
+	// Both levels of concurrency are needed and neither substitutes for the
+	// other. iCloud's INBOX holds 53% of that account (§6.3), so splitting the
+	// work only by folder leaves one worker with half the job, while splitting
+	// it only within a folder leaves 143 smaller mailboxes to trickle through
+	// one at a time.
+	//
+	// The group carries no errors of its own: a folder failure belongs in that
+	// folder's report, not in a cancellation that would abandon every other
+	// folder mid-copy. Cancellation comes from the caller's context, which
+	// every worker already watches.
+	var mu sync.Mutex
+	var g errgroup.Group
+	g.SetLimit(s.src.Cap())
+	for _, pair := range plan.Pairs {
+		if ctx.Err() != nil {
+			break
 		}
-		if err := s.dst.CreateFolder(ctx, name); err != nil {
-			return report, fmt.Errorf("creating destination folder %q: %w", name, err)
+		g.Go(func() error {
+			fr, err := s.syncFolder(ctx, pair)
+			if err != nil {
+				fr.Err = err
+				s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
+			}
+			mu.Lock()
+			report.Folders = append(report.Folders, fr)
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// Folders finish in whatever order their sizes dictate. Sorting restores
+	// the plan's order so that a report reads the same way twice.
+	slices.SortFunc(report.Folders, func(a, b FolderReport) int {
+		return strings.Compare(a.Source, b.Source)
+	})
+	return report, ctx.Err()
+}
+
+// createFolders brings the missing destination mailboxes into existence.
+//
+// This runs before any copying and on one connection: the mailboxes are created
+// in hierarchy order, and a server that must materialise a parent before its
+// child will not do so reliably if asked for both at once.
+func (s *Syncer) createFolders(ctx context.Context, names []string, report *Report) error {
+	if len(names) == 0 {
+		return nil
+	}
+	if s.opts.DryRun {
+		report.Created = append(report.Created, names...)
+		return nil
+	}
+
+	lease, err := s.dst.Acquire(ctx, "")
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	for _, name := range names {
+		if err = lease.Conn().CreateFolder(ctx, name); err != nil {
+			return fmt.Errorf("creating destination folder %q: %w", name, err)
 		}
 		report.Created = append(report.Created, name)
 		s.log.Info("created destination folder", "folder", name)
 	}
-
-	for _, pair := range plan.Pairs {
-		if err := ctx.Err(); err != nil {
-			return report, err
-		}
-
-		fr, err := s.syncFolder(ctx, pair)
-		if err != nil {
-			fr.Err = err
-			s.log.Error("folder failed", "source", pair.Source, "dest", pair.Dest, "error", err)
-		}
-		report.Folders = append(report.Folders, fr)
-	}
-	return report, nil
+	return nil
 }
 
 // plan lists both sides and maps them onto each other.
 func (s *Syncer) plan(ctx context.Context) (folder.Plan, error) {
-	srcFolders, err := s.src.ListFolders(ctx, imapx.ListOptions{})
+	srcFolders, srcDelim, err := s.list(ctx, s.src)
 	if err != nil {
 		return folder.Plan{}, fmt.Errorf("listing source folders: %w", err)
 	}
-	dstFolders, err := s.dst.ListFolders(ctx, imapx.ListOptions{})
+	dstFolders, dstDelim, err := s.list(ctx, s.dst)
 	if err != nil {
 		return folder.Plan{}, fmt.Errorf("listing destination folders: %w", err)
 	}
 
 	opts := s.opts.Folders
 	if opts.SourceDelim == "" {
-		opts.SourceDelim = s.delim(ctx, s.src, srcFolders)
+		opts.SourceDelim = srcDelim
 	}
 	if opts.DestDelim == "" {
-		opts.DestDelim = s.delim(ctx, s.dst, dstFolders)
+		opts.DestDelim = dstDelim
 	}
 
 	plan, err := folder.Build(srcFolders, dstFolders, opts)
@@ -175,6 +259,21 @@ func (s *Syncer) plan(ctx context.Context) (folder.Plan, error) {
 	s.log.Info("planned run",
 		"folders", len(plan.Pairs), "skipped", len(plan.Skips), "to_create", len(plan.Creates))
 	return plan, nil
+}
+
+// list enumerates one account's mailboxes and settles its hierarchy delimiter.
+func (s *Syncer) list(ctx context.Context, p *pool.Pool) (folders []imapx.Folder, delim string, err error) {
+	lease, err := p.Acquire(ctx, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("acquiring connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	folders, err = lease.Conn().ListFolders(ctx, imapx.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	return folders, s.delim(ctx, lease.Conn(), folders), nil
 }
 
 // delim finds a server's hierarchy delimiter, preferring what LIST reported.
@@ -225,8 +324,8 @@ func (a adoption) take(id ident.Identity) (uint32, bool) {
 // A stamped copy digests the same as its unstamped source, because the stamp
 // header is deliberately not part of the digest, so one index covers both
 // stamped and unstamped messages.
-func (s *Syncer) indexDestination(ctx context.Context, folderID int64, dst imapx.Mailbox) (adoption, error) {
-	uids, err := s.dst.AllUIDs(ctx)
+func (s *Syncer) indexDestination(ctx context.Context, dst imapx.Conn, folderID int64, box imapx.Mailbox) (adoption, error) {
+	uids, err := dst.AllUIDs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("enumerating destination messages: %w", err)
 	}
@@ -234,7 +333,7 @@ func (s *Syncer) indexDestination(ctx context.Context, folderID int64, dst imapx
 		return nil, nil
 	}
 
-	claimed, err := s.db.ClaimedDestUIDs(ctx, folderID, dst.UIDValidity)
+	claimed, err := s.db.ClaimedDestUIDs(ctx, folderID, box.UIDValidity)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +346,7 @@ func (s *Syncer) indexDestination(ctx context.Context, folderID int64, dst imapx
 		}
 		end := min(start+metaBatch, len(uids))
 
-		metas, err := s.dst.FetchMeta(ctx, uids[start:end], ident.Fields)
+		metas, err := dst.FetchMeta(ctx, uids[start:end], ident.Fields)
 		if err != nil {
 			return nil, fmt.Errorf("reading destination headers: %w", err)
 		}
@@ -270,80 +369,176 @@ func (s *Syncer) indexDestination(ctx context.Context, folderID int64, dst imapx
 	}
 
 	s.log.Info("indexed destination folder for adoption",
-		"folder", dst.Name, "messages", len(uids), "indexed", indexed, "already_claimed", len(claimed))
+		"folder", box.Name, "messages", len(uids), "indexed", indexed, "already_claimed", len(claimed))
 	return index, nil
+}
+
+// live is the mutable state a folder's workers share.
+//
+// One lock covers both the adoption index and the counters because they are
+// touched together and neither is held for longer than a map operation. The
+// contended work — fetching and appending — happens outside it.
+type live struct {
+	mu     sync.Mutex
+	report FolderReport
+	index  adoption
+}
+
+// adopt claims a destination message for a source identity, if one is free.
+func (l *live) adopt(id ident.Identity) (uint32, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.index.take(id)
+}
+
+func (l *live) copied() {
+	l.mu.Lock()
+	l.report.Copied++
+	l.mu.Unlock()
+}
+
+func (l *live) adopted(n int) {
+	l.mu.Lock()
+	l.report.Adopted += n
+	l.mu.Unlock()
+}
+
+// failed records an abandoned message. Only the first few reasons are kept:
+// a folder that fails ten thousand times has one problem, not ten thousand.
+func (l *live) failed(uid uint32, reason string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.report.Failed++
+	if len(l.report.Errors) < 10 {
+		l.report.Errors = append(l.report.Errors, fmt.Sprintf("uid %d: %s", uid, reason))
+	}
+}
+
+// snapshot copies the report out, safe to read once the workers have stopped
+// and while they are still running.
+func (l *live) snapshot() FolderReport {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fr := l.report
+	fr.Errors = slices.Clone(fr.Errors)
+	return fr
+}
+
+// prepared is everything the copy stage needs that the setup stage worked out.
+type prepared struct {
+	folderID int64
+	src, dst imapx.Mailbox
+	// todo is the source UIDs still to copy, in the order the server gave them.
+	todo []uint32
 }
 
 // syncFolder copies one mailbox.
 func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair) (FolderReport, error) {
-	fr := FolderReport{Source: pair.Source, Dest: pair.Dest}
-
-	src, err := s.src.Select(ctx, pair.Source, imapx.SelectOptions{ReadOnly: true})
-	if err != nil {
-		return fr, fmt.Errorf("selecting source mailbox: %w", err)
-	}
-	fr.Messages = int(src.NumMessages)
-
 	if s.opts.DryRun {
-		return s.dryRunFolder(ctx, pair, src, fr)
+		return s.dryRunFolder(ctx, pair)
 	}
 
-	dst, err := s.dst.Select(ctx, pair.Dest, imapx.SelectOptions{})
+	lv := &live{report: FolderReport{Source: pair.Source, Dest: pair.Dest}}
+	p, err := s.prepareFolder(ctx, pair, lv)
 	if err != nil {
-		return fr, fmt.Errorf("selecting destination mailbox: %w", err)
+		return lv.snapshot(), err
 	}
-	if dst.ReadOnly {
-		return fr, fmt.Errorf("destination mailbox %q is read-only", pair.Dest)
+	if err := s.copyFolder(ctx, pair, p, lv); err != nil {
+		return lv.snapshot(), err
+	}
+	if err := s.db.MarkSynced(ctx, p.folderID, p.src.HighestModSeq, time.Now()); err != nil {
+		return lv.snapshot(), fmt.Errorf("recording folder completion: %w", err)
+	}
+	return lv.snapshot(), nil
+}
+
+// prepareFolder works out what has to be copied, on one connection per side.
+//
+// This is the only place that holds a lease on both accounts at once, and it
+// takes the source first. Nothing anywhere takes a source connection while
+// holding a destination one, so the two pools cannot deadlock against each
+// other no matter how differently they are sized.
+func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) (_ *prepared, err error) {
+	srcLease, err := s.src.Acquire(ctx, pair.Source)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { srcLease.Release(err) }()
+	src := srcLease.Conn()
+
+	srcBox, err := src.Select(ctx, pair.Source, imapx.SelectOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("selecting source mailbox: %w", err)
+	}
+	lv.report.Messages = int(srcBox.NumMessages)
+
+	dstLease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { dstLease.Release(err) }()
+	dst := dstLease.Conn()
+
+	dstBox, err := dst.Select(ctx, pair.Dest, imapx.SelectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+	if dstBox.ReadOnly {
+		return nil, fmt.Errorf("destination mailbox %q is read-only", pair.Dest)
 	}
 
 	row, err := s.db.EnsureFolder(ctx, s.opts.PairID, pair.Source, pair.Dest)
 	if err != nil {
-		return fr, fmt.Errorf("recording folder: %w", err)
+		return nil, fmt.Errorf("recording folder: %w", err)
 	}
 
-	kept, err := s.db.FenceUIDValidity(ctx, row.ID, src.UIDValidity, dst.UIDValidity)
+	kept, err := s.db.FenceUIDValidity(ctx, row.ID, srcBox.UIDValidity, dstBox.UIDValidity)
 	if err != nil {
-		return fr, fmt.Errorf("fencing UIDVALIDITY: %w", err)
+		return nil, fmt.Errorf("fencing UIDVALIDITY: %w", err)
 	}
 	if !kept {
 		// Not an error: the server renumbered the mailbox, which it is entitled
 		// to do. Every UID we hold now refers to a different message or to
 		// none, so the run falls back to identity matching for this folder.
 		s.log.Warn("UIDVALIDITY changed; falling back to identity matching",
-			"source", pair.Source, "src_uidvalidity", src.UIDValidity, "dst_uidvalidity", dst.UIDValidity)
+			"source", pair.Source, "src_uidvalidity", srcBox.UIDValidity, "dst_uidvalidity", dstBox.UIDValidity)
 	}
 
 	// Suspects first. An in-flight row may already exist on the destination,
 	// and copying it again is exactly the duplication this tool exists to
 	// avoid.
-	adopted, err := s.recover(ctx, row.ID, src, dst)
+	adopted, err := s.recover(ctx, src, dst, row.ID, srcBox, dstBox)
 	if err != nil {
-		return fr, fmt.Errorf("recovering in-flight messages: %w", err)
+		return nil, fmt.Errorf("recovering in-flight messages: %w", err)
 	}
-	fr.Adopted += adopted
+	lv.report.Adopted += adopted
 
-	known, err := s.db.SyncedUIDs(ctx, row.ID, src.UIDValidity)
+	known, err := s.db.SyncedUIDs(ctx, row.ID, srcBox.UIDValidity)
 	if err != nil {
-		return fr, fmt.Errorf("reading recorded messages: %w", err)
-	}
-
-	uids, err := s.src.AllUIDs(ctx)
-	if err != nil {
-		return fr, fmt.Errorf("enumerating source messages: %w", err)
+		return nil, fmt.Errorf("reading recorded messages: %w", err)
 	}
 
-	var todo []uint32
+	uids, err := src.AllUIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("enumerating source messages: %w", err)
+	}
+
+	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox}
 	for _, uid := range uids {
 		if known[uid] == state.StateDone {
-			fr.AlreadyDone++
+			lv.report.AlreadyDone++
 			continue
 		}
-		todo = append(todo, uid)
+		p.todo = append(p.todo, uid)
 	}
+
+	// Nothing below reads the source, and indexing a large destination can take
+	// a while. Handing the connection back now lets another folder use it.
+	srcLease.Release(nil)
 
 	s.log.Info("folder diffed",
 		"source", pair.Source, "dest", pair.Dest,
-		"messages", len(uids), "to_copy", len(todo), "already_done", fr.AlreadyDone)
+		"messages", len(uids), "to_copy", len(p.todo), "already_done", lv.report.AlreadyDone)
 
 	// Tier 3 in bulk, and only when tier 1 has nothing to say about the folder
 	// as a whole: a first sync onto a destination that is not empty, a sync
@@ -354,89 +549,167 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair) (FolderReport
 	// everything except the in-flight suspects, and those were settled above by
 	// a handful of targeted searches. Indexing then would mean reading every
 	// header in a 400k-message folder (§6.3) to learn nothing.
-	var index adoption
-	if len(todo) > 0 && dst.NumMessages > 0 && (row.LastSync.IsZero() || !kept) {
-		index, err = s.indexDestination(ctx, row.ID, dst)
+	if len(p.todo) > 0 && dstBox.NumMessages > 0 && (row.LastSync.IsZero() || !kept) {
+		lv.index, err = s.indexDestination(ctx, dst, row.ID, dstBox)
 		if err != nil {
-			return fr, err
+			return nil, err
 		}
 	}
+	return p, nil
+}
 
-	for start := 0; start < len(todo); start += metaBatch {
-		if err := ctx.Err(); err != nil {
-			return fr, err
-		}
-		end := min(start+metaBatch, len(todo))
+// pendingAppend is a message that has been read from the source and is waiting
+// for a destination connection.
+type pendingAppend struct {
+	uid          uint32
+	id           ident.Identity
+	stamped      bool
+	flags        []string
+	internalDate time.Time
+	// body is the message as it will be appended, stamp included. Its length is
+	// the literal size: it is what was actually read, never RFC822.SIZE (§3.7).
+	body []byte
+	// release returns this message's share of the byte budget. It is idempotent.
+	release func()
+}
 
-		metas, err := s.src.FetchMeta(ctx, todo[start:end], ident.Fields)
-		if err != nil {
-			return fr, fmt.Errorf("fetching message metadata: %w", err)
-		}
-		for _, meta := range metas {
-			if err := s.copyOne(ctx, row.ID, pair.Dest, src, dst, meta, index, &fr); err != nil {
-				return fr, err
+// copyFolder copies every message the setup stage listed.
+//
+// Fetching and appending are separate stages joined by a channel, which is what
+// lets the two accounts run at their own speeds: a source that answers slowly
+// does not idle thirty destination connections, and a destination that commits
+// slowly does not stop the source being read. It also means no goroutine here
+// holds a connection to both accounts, so the pools cannot deadlock.
+func (s *Syncer) copyFolder(ctx context.Context, pair folder.Pair, p *prepared, lv *live) error {
+	if len(p.todo) == 0 {
+		return nil
+	}
+
+	chunks := make(chan []uint32)
+	pending := make(chan *pendingAppend, s.dst.Cap())
+
+	chunkCount := (len(p.todo) + copyChunk - 1) / copyChunk
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Chunks are handed out rather than dealt out, so a worker that draws a run
+	// of huge messages simply takes fewer of them instead of becoming the
+	// straggler the folder waits on.
+	g.Go(func() error {
+		defer close(chunks)
+		for chunk := range slices.Chunk(p.todo, copyChunk) {
+			select {
+			case chunks <- chunk:
+			case <-gctx.Done():
+				return gctx.Err()
 			}
 		}
+		return nil
+	})
+
+	var fetchers errgroup.Group
+	for range min(s.src.Cap(), chunkCount) {
+		fetchers.Go(func() error {
+			for chunk := range chunks {
+				if err := s.fetchChunk(gctx, pair, p, chunk, pending, lv); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	g.Go(func() error {
+		err := fetchers.Wait()
+		// Closing this is what stops the append workers. It has to happen once
+		// every fetcher has finished, whether they finished the folder or gave
+		// up on it, or the appenders would wait for messages nobody is coming
+		// to fetch.
+		close(pending)
+		return err
+	})
+
+	for range min(s.dst.Cap(), len(p.todo)) {
+		g.Go(func() error {
+			for item := range pending {
+				err := s.deliver(gctx, p, pair.Dest, item, lv)
+				item.release()
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}
 
-	if err := s.db.MarkSynced(ctx, row.ID, src.HighestModSeq, time.Now()); err != nil {
-		return fr, fmt.Errorf("recording folder completion: %w", err)
+	err := g.Wait()
+
+	// An append worker that stopped early leaves fetched messages behind, each
+	// still holding its share of the byte budget. Nothing will append them now,
+	// but the bytes have to come back or the next folder starts short.
+	for item := range pending {
+		item.release()
 	}
-	return fr, nil
+	return err
 }
 
-// dryRunFolder reports what a real run would copy, without writing anything.
-func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair, src imapx.Mailbox, fr FolderReport) (FolderReport, error) {
-	if pair.CreateDest {
-		// The mailbox does not exist yet, so everything in the source is new
-		// and there is no state to consult.
-		fr.Copied = fr.Messages
-		return fr, nil
+// fetchChunk reads one run of messages from the source.
+func (s *Syncer) fetchChunk(
+	ctx context.Context,
+	pair folder.Pair,
+	p *prepared,
+	chunk []uint32,
+	pending chan<- *pendingAppend,
+	lv *live,
+) (err error) {
+	lease, err := s.src.Acquire(ctx, pair.Source)
+	if err != nil {
+		return fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	// A single long-lived connection can never see a mailbox renumbered,
+	// because it never selects it again. A pool selects on every lease, so it
+	// can — and every UID in this chunk was chosen against the old numbering,
+	// meaning each one now names a different message or none at all. Stopping
+	// the folder here costs a re-sync; carrying on would file real messages
+	// under keys that belong to other ones.
+	if got := lease.UIDValidity(); got != p.src.UIDValidity {
+		err = fmt.Errorf("source mailbox %q was renumbered mid-run (UIDVALIDITY %d is now %d); it will be resynced on the next run",
+			pair.Source, p.src.UIDValidity, got)
+		return err
 	}
 
-	row, err := s.db.EnsureFolder(ctx, s.opts.PairID, pair.Source, pair.Dest)
+	metas, err := lease.Conn().FetchMeta(ctx, chunk, ident.Fields)
 	if err != nil {
-		return fr, fmt.Errorf("reading folder state: %w", err)
+		return fmt.Errorf("fetching message metadata: %w", err)
 	}
-	known, err := s.db.SyncedUIDs(ctx, row.ID, src.UIDValidity)
-	if err != nil {
-		return fr, fmt.Errorf("reading recorded messages: %w", err)
-	}
-
-	uids, err := s.src.AllUIDs(ctx)
-	if err != nil {
-		return fr, fmt.Errorf("enumerating source messages: %w", err)
-	}
-	for _, uid := range uids {
-		if known[uid] == state.StateDone {
-			fr.AlreadyDone++
-		} else {
-			fr.Copied++
+	for _, meta := range metas {
+		if err = s.fetchOne(ctx, p, lease.Conn(), meta, pending, lv); err != nil {
+			return err
 		}
 	}
-	return fr, nil
+	return nil
 }
 
-// copyOne copies a single message, recording its progress before it is made.
+// fetchOne records a message as in flight and reads it, unless the destination
+// already has it.
 //
 // The ordering is the whole point: the state row is committed as in-flight
 // *before* the APPEND is issued, so a crash at any instant leaves a row that
 // says "this may or may not have landed" rather than no evidence at all.
-func (s *Syncer) copyOne(
+func (s *Syncer) fetchOne(
 	ctx context.Context,
-	folderID int64,
-	dstName string,
-	src, dst imapx.Mailbox,
+	p *prepared,
+	src imapx.Conn,
 	meta imapx.MessageMeta,
-	index adoption,
-	fr *FolderReport,
+	pending chan<- *pendingAppend,
+	lv *live,
 ) error {
 	id := ident.Parse(meta.Header)
 	flags := copyableFlags(meta.Flags)
 
 	row := state.Message{
-		FolderID:       folderID,
-		SrcUIDValidity: src.UIDValidity,
+		FolderID:       p.folderID,
+		SrcUIDValidity: p.src.UIDValidity,
 		SrcUID:         meta.UID,
 		IdentHash:      id.Digest,
 		Size:           meta.Size,
@@ -453,77 +726,185 @@ func (s *Syncer) copyOne(
 
 	// Already there — from an earlier run whose database was lost, or from a
 	// destination that was not empty to begin with. Record the mapping instead
-	// of making a second copy.
-	if dstUID, ok := index.take(id); ok {
-		if err := s.db.CompleteAppend(ctx, folderID, src.UIDValidity, meta.UID, dst.UIDValidity, dstUID); err != nil {
+	// of making a second copy. This happens before the body is fetched, not
+	// after: on a 400k-message folder the difference is hours of transfer.
+	if dstUID, ok := lv.adopt(id); ok {
+		if err := s.db.CompleteAppend(ctx, p.folderID, p.src.UIDValidity, meta.UID, p.dst.UIDValidity, dstUID); err != nil {
 			return fmt.Errorf("recording message %d as adopted: %w", meta.UID, err)
 		}
-		fr.Adopted++
+		lv.adopted(1)
 		return nil
 	}
 
-	// Spooled to memory. That is defensible at one connection and one message
-	// at a time; the concurrent engine needs the byte-budget semaphore of §4.3
-	// before it can do the same across hundreds.
+	// Charged before the body is read and refunded once it has been appended,
+	// so what bounds the memory in flight is this budget rather than however
+	// far ahead the fetchers happen to have run (§4.3).
+	release, err := s.bytes.Acquire(ctx, meta.Size)
+	if err != nil {
+		return err
+	}
+
 	var buf bytes.Buffer
 	if row.StampID != "" {
 		buf.Write(ident.StampBytes(row.StampID))
 	}
-	stampLen := int64(buf.Len())
 
-	n, err := s.src.FetchBody(ctx, meta.UID, &buf)
-	switch {
-	case errors.Is(err, imapx.ErrMessageGone):
-		// Expunged between enumeration and fetch. Nothing was appended, and
-		// nothing can be: record it so the next run does not retry forever.
-		return s.fail(ctx, folderID, src.UIDValidity, meta.UID, "source message expunged before it could be read", fr)
-	case err != nil:
+	if _, err := src.FetchBody(ctx, meta.UID, &buf); err != nil {
+		release()
+		if errors.Is(err, imapx.ErrMessageGone) {
+			// Expunged between enumeration and fetch. Nothing was appended, and
+			// nothing can be: record it so the next run does not retry forever.
+			return s.fail(ctx, p.folderID, p.src.UIDValidity, meta.UID,
+				"source message expunged before it could be read", lv)
+		}
 		return fmt.Errorf("fetching message %d: %w", meta.UID, err)
 	}
 
-	// The APPEND literal is sized from what was actually read, never from
-	// RFC822.SIZE: a short literal cannot be retracted and desynchronises the
-	// connection (§3.7).
-	res, err := s.dst.Append(ctx, dstName, imapx.AppendMessage{
-		Size:         n + stampLen,
-		Flags:        flags,
-		InternalDate: meta.InternalDate,
-		Body:         bytes.NewReader(buf.Bytes()),
-	})
+	item := &pendingAppend{
+		uid:          meta.UID,
+		id:           id,
+		stamped:      row.StampID != "",
+		flags:        flags,
+		internalDate: meta.InternalDate,
+		body:         buf.Bytes(),
+		release:      release,
+	}
+	select {
+	case pending <- item:
+		return nil
+	case <-ctx.Done():
+		release()
+		return ctx.Err()
+	}
+}
+
+// deliver appends one fetched message to the destination and records where it
+// landed.
+func (s *Syncer) deliver(ctx context.Context, p *prepared, dstName string, item *pendingAppend, lv *live) error {
+	res, err := s.appendOne(ctx, dstName, item)
 	switch {
 	case errors.Is(err, imapx.ErrConnectionBroken):
-		return fmt.Errorf("appending message %d: %w", meta.UID, err)
+		return err
 	case err != nil:
 		// The server refused this message — oversized, rejected by policy, or
 		// malformed beyond what it will store. The connection is intact, so the
 		// rest of the folder can still be copied.
-		return s.fail(ctx, folderID, src.UIDValidity, meta.UID, err.Error(), fr)
+		return s.fail(ctx, p.folderID, p.src.UIDValidity, item.uid, err.Error(), lv)
 	}
 
 	dstUIDValidity, dstUID := res.UIDValidity, res.UID
 	if !res.Assigned() {
 		// No UIDPLUS. The append succeeded — the tagged OK says so — but the
 		// destination UID has to be found, and may not be findable at all.
-		dstUIDValidity = dst.UIDValidity
-		dstUID = s.locate(ctx, id, row.StampID != "")
+		dstUIDValidity = p.dst.UIDValidity
+		dstUID, err = s.locateOnDest(ctx, dstName, item.id, item.stamped)
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := s.db.CompleteAppend(ctx, folderID, src.UIDValidity, meta.UID, dstUIDValidity, dstUID); err != nil {
-		return fmt.Errorf("recording message %d as copied: %w", meta.UID, err)
+	if err := s.db.CompleteAppend(ctx, p.folderID, p.src.UIDValidity, item.uid, dstUIDValidity, dstUID); err != nil {
+		return fmt.Errorf("recording message %d as copied: %w", item.uid, err)
 	}
-	fr.Copied++
+	lv.copied()
 	return nil
 }
 
+// appendOne holds a destination connection for exactly one APPEND.
+//
+// The lease names no mailbox: APPEND carries its own target, so a connection
+// can serve any folder without a SELECT, which is what lets a single
+// destination pool be shared by every folder in flight.
+func (s *Syncer) appendOne(ctx context.Context, dstName string, item *pendingAppend) (res imapx.AppendResult, err error) {
+	lease, err := s.dst.Acquire(ctx, "")
+	if err != nil {
+		return res, fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	res, err = lease.Conn().Append(ctx, dstName, imapx.AppendMessage{
+		Size:         int64(len(item.body)),
+		Flags:        item.flags,
+		InternalDate: item.internalDate,
+		Body:         bytes.NewReader(item.body),
+	})
+	if errors.Is(err, imapx.ErrConnectionBroken) {
+		err = fmt.Errorf("appending message %d: %w", item.uid, err)
+	}
+	return res, err
+}
+
+// locateOnDest searches the destination folder for a message just appended.
+//
+// It takes a second, separate lease rather than reusing the one that did the
+// APPEND: SEARCH answers for the selected mailbox, and an APPEND lease names
+// none. Holding both at once would be a destination connection waiting on the
+// destination pool, which on a small pool is a deadlock.
+func (s *Syncer) locateOnDest(ctx context.Context, dstName string, id ident.Identity, stamped bool) (_ uint32, err error) {
+	if !searchable(id, stamped) {
+		return 0, nil
+	}
+	lease, err := s.dst.Acquire(ctx, dstName)
+	if err != nil {
+		return 0, fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	return s.locate(ctx, lease.Conn(), id, stamped), nil
+}
+
+// dryRunFolder reports what a real run would copy, without writing anything.
+func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderReport, err error) {
+	fr := FolderReport{Source: pair.Source, Dest: pair.Dest}
+
+	lease, err := s.src.Acquire(ctx, pair.Source)
+	if err != nil {
+		return fr, fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	src := lease.Conn()
+
+	srcBox, err := src.Select(ctx, pair.Source, imapx.SelectOptions{ReadOnly: true})
+	if err != nil {
+		return fr, fmt.Errorf("selecting source mailbox: %w", err)
+	}
+	fr.Messages = int(srcBox.NumMessages)
+
+	if pair.CreateDest {
+		// The mailbox does not exist yet, so everything in the source is new
+		// and there is no state to consult.
+		fr.Copied = fr.Messages
+		return fr, nil
+	}
+
+	row, err := s.db.EnsureFolder(ctx, s.opts.PairID, pair.Source, pair.Dest)
+	if err != nil {
+		return fr, fmt.Errorf("reading folder state: %w", err)
+	}
+	known, err := s.db.SyncedUIDs(ctx, row.ID, srcBox.UIDValidity)
+	if err != nil {
+		return fr, fmt.Errorf("reading recorded messages: %w", err)
+	}
+
+	uids, err := src.AllUIDs(ctx)
+	if err != nil {
+		return fr, fmt.Errorf("enumerating source messages: %w", err)
+	}
+	for _, uid := range uids {
+		if known[uid] == state.StateDone {
+			fr.AlreadyDone++
+		} else {
+			fr.Copied++
+		}
+	}
+	return fr, nil
+}
+
 // fail records an abandoned copy and keeps the run going.
-func (s *Syncer) fail(ctx context.Context, folderID int64, uidValidity, uid uint32, reason string, fr *FolderReport) error {
+func (s *Syncer) fail(ctx context.Context, folderID int64, uidValidity, uid uint32, reason string, lv *live) error {
 	if err := s.db.FailAppend(ctx, folderID, uidValidity, uid, reason); err != nil {
 		return fmt.Errorf("recording message %d as failed: %w", uid, err)
 	}
-	fr.Failed++
-	if len(fr.Errors) < 10 {
-		fr.Errors = append(fr.Errors, fmt.Sprintf("uid %d: %s", uid, reason))
-	}
+	lv.failed(uid, reason)
 	s.log.Warn("message not copied", "uid", uid, "reason", reason)
 	return nil
 }
@@ -535,7 +916,10 @@ func (s *Syncer) fail(ctx context.Context, folderID int64, uidValidity, uid uint
 // only way to tell is to look. Anything not settled here stays in flight and is
 // retried by the ordinary diff, which is safe because a suspect that is not on
 // the destination has to be copied anyway.
-func (s *Syncer) recover(ctx context.Context, folderID int64, src, dst imapx.Mailbox) (int, error) {
+//
+// It runs before any of the folder's workers start, on the caller's two leases,
+// so nothing else is appending to this folder while it looks.
+func (s *Syncer) recover(ctx context.Context, src, dst imapx.Conn, folderID int64, srcBox, dstBox imapx.Mailbox) (int, error) {
 	suspects, err := s.db.InFlight(ctx, folderID)
 	if err != nil {
 		return 0, err
@@ -543,7 +927,7 @@ func (s *Syncer) recover(ctx context.Context, folderID int64, src, dst imapx.Mai
 	if len(suspects) == 0 {
 		return 0, nil
 	}
-	s.log.Info("settling messages left in flight", "count", len(suspects), "folder", src.Name)
+	s.log.Info("settling messages left in flight", "count", len(suspects), "folder", srcBox.Name)
 
 	var adopted int
 	for _, m := range suspects {
@@ -551,7 +935,7 @@ func (s *Syncer) recover(ctx context.Context, folderID int64, src, dst imapx.Mai
 			return adopted, err
 		}
 
-		id, ok, err := s.identify(ctx, m)
+		id, ok, err := s.identify(ctx, src, m)
 		if err != nil {
 			return adopted, err
 		}
@@ -566,11 +950,11 @@ func (s *Syncer) recover(ctx context.Context, folderID int64, src, dst imapx.Mai
 			continue
 		}
 
-		uid := s.locate(ctx, id, m.StampID != "")
+		uid := s.locate(ctx, dst, id, m.StampID != "")
 		if uid == 0 {
 			continue // never landed, or cannot be searched for: retry the copy
 		}
-		if err := s.db.CompleteAppend(ctx, folderID, m.SrcUIDValidity, m.SrcUID, dst.UIDValidity, uid); err != nil {
+		if err := s.db.CompleteAppend(ctx, folderID, m.SrcUIDValidity, m.SrcUID, dstBox.UIDValidity, uid); err != nil {
 			return adopted, err
 		}
 		adopted++
@@ -586,8 +970,8 @@ func (s *Syncer) recover(ctx context.Context, folderID int64, src, dst imapx.Mai
 // by, and re-reading one header is cheaper than carrying a column that only
 // recovery would ever read. The set is bounded by how many appends were in
 // flight when the process died.
-func (s *Syncer) identify(ctx context.Context, m state.Message) (ident.Identity, bool, error) {
-	metas, err := s.src.FetchMeta(ctx, []uint32{m.SrcUID}, ident.Fields)
+func (s *Syncer) identify(ctx context.Context, src imapx.Conn, m state.Message) (ident.Identity, bool, error) {
+	metas, err := src.FetchMeta(ctx, []uint32{m.SrcUID}, ident.Fields)
 	if err != nil {
 		if errors.Is(err, imapx.ErrMessageGone) {
 			return ident.Identity{}, false, nil
@@ -600,24 +984,34 @@ func (s *Syncer) identify(ctx context.Context, m state.Message) (ident.Identity,
 	return ident.Parse(metas[0].Header), true, nil
 }
 
+// searchable reports whether a message can be looked for on the destination.
+//
+// Weak identities are never acted on, stamp or no stamp: the stamp is the
+// digest, so a digest too thin to distinguish two messages makes a stamp that
+// is too thin as well.
+func searchable(id ident.Identity, stamped bool) bool {
+	if id.Weak {
+		return false
+	}
+	_, _, ok := ident.SearchTerms(id, stamped)
+	return ok
+}
+
 // locate finds a message on the destination, returning 0 when it cannot.
+//
+// The connection must already have the destination folder selected, because
+// SEARCH answers only for the selected mailbox.
 //
 // A failure to find is not an error: the commonest reason is that the message
 // genuinely is not there. Nor is a search failure, which costs a re-copy rather
 // than a lost message.
-func (s *Syncer) locate(ctx context.Context, id ident.Identity, stamped bool) uint32 {
-	// Weak identities are never acted on, stamp or no stamp: the stamp is the
-	// digest, so a digest too thin to distinguish two messages makes a stamp
-	// that is too thin as well.
-	if id.Weak {
+func (s *Syncer) locate(ctx context.Context, dst imapx.Conn, id ident.Identity, stamped bool) uint32 {
+	if !searchable(id, stamped) {
 		return 0
 	}
-	field, value, ok := ident.SearchTerms(id, stamped)
-	if !ok {
-		return 0
-	}
+	field, value, _ := ident.SearchTerms(id, stamped)
 
-	uids, err := s.dst.SearchHeader(ctx, field, value)
+	uids, err := dst.SearchHeader(ctx, field, value)
 	if err != nil {
 		s.log.Warn("destination search failed", "field", field, "error", err)
 		return 0

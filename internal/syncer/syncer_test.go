@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/ident"
 	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/state"
 	"github.com/hilli/imapsync-go/internal/syncer"
 )
@@ -207,6 +209,39 @@ func (h *harness) openDB(t *testing.T) *state.DB {
 	return db
 }
 
+// dialFunc opens connections to this account the way a pool wants them.
+func (a account) dialFunc(t *testing.T, wrap func(imapx.Conn) imapx.Conn) pool.DialFunc {
+	t.Helper()
+	return func(context.Context) (imapx.Conn, error) {
+		c := a.dial(t)
+		if wrap != nil {
+			c = wrap(c)
+		}
+		return c, nil
+	}
+}
+
+// pooled builds a pool over an account.
+//
+// The caps are deliberately above one. The whole point of these tests is that
+// the correctness M1 established survives being run concurrently, and a pool of
+// one connection would quietly turn every one of them back into a sequential
+// test that proves nothing about the engine as it now works.
+func pooled(t *testing.T, cap int, sel imapx.SelectOptions, dial pool.DialFunc) *pool.Pool {
+	t.Helper()
+
+	p, err := pool.New(pool.Options{Cap: cap, Dial: dial, Select: sel})
+	if err != nil {
+		t.Fatalf("pool.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+	return p
+}
+
+// readOnly is how a source pool must open mailboxes: EXAMINE, never SELECT, so
+// that reading a message does not mark it \Seen on the account being migrated.
+var readOnly = imapx.SelectOptions{ReadOnly: true}
+
 // run performs one complete sync, on fresh connections, as a real invocation
 // would. Reconnecting each time keeps a run from inheriting selected-mailbox
 // state that a restarted process would not have.
@@ -218,7 +253,11 @@ func (h *harness) run(t *testing.T, opts ...func(*syncer.Options)) syncer.Report
 		f(&o)
 	}
 
-	s := syncer.New(h.src.dial(t), h.dst.dial(t), h.db, o)
+	s := syncer.New(
+		pooled(t, 3, readOnly, h.src.dialFunc(t, nil)),
+		pooled(t, 5, imapx.SelectOptions{}, h.dst.dialFunc(t, nil)),
+		h.db, nil, o,
+	)
 	report, err := s.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -797,10 +836,11 @@ func TestTheAppendSizeComesFromTheBytesReadNotTheServersClaim(t *testing.T) {
 	h.src.stuff(t, "INBOX", body)
 
 	s := syncer.New(
-		lyingSource{Conn: h.src.dial(t), inflate: 4096},
-		h.dst.dial(t),
-		h.db,
-		syncer.Options{PairID: "test"},
+		pooled(t, 3, readOnly, h.src.dialFunc(t, func(c imapx.Conn) imapx.Conn {
+			return lyingSource{Conn: c, inflate: 4096}
+		})),
+		pooled(t, 5, imapx.SelectOptions{}, h.dst.dialFunc(t, nil)),
+		h.db, nil, syncer.Options{PairID: "test"},
 	)
 	report, err := s.Run(context.Background())
 	if err != nil {
@@ -821,14 +861,30 @@ func TestTheAppendSizeComesFromTheBytesReadNotTheServersClaim(t *testing.T) {
 	}
 }
 
-// recordingSource remembers how the source mailboxes were opened.
-type recordingSource struct {
-	imapx.Conn
-	opened []imapx.SelectOptions
+// openLog remembers how source mailboxes were opened, across every connection
+// in a pool.
+type openLog struct {
+	mu     sync.Mutex
+	opened map[string][]imapx.SelectOptions
 }
 
-func (r *recordingSource) Select(ctx context.Context, mailbox string, opts imapx.SelectOptions) (imapx.Mailbox, error) {
-	r.opened = append(r.opened, opts)
+func (l *openLog) record(mailbox string, opts imapx.SelectOptions) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.opened == nil {
+		l.opened = make(map[string][]imapx.SelectOptions)
+	}
+	l.opened[mailbox] = append(l.opened[mailbox], opts)
+}
+
+// recordingSource reports every SELECT to a log shared by the whole pool.
+type recordingSource struct {
+	imapx.Conn
+	log *openLog
+}
+
+func (r recordingSource) Select(ctx context.Context, mailbox string, opts imapx.SelectOptions) (imapx.Mailbox, error) {
+	r.log.record(mailbox, opts)
 	return r.Conn.Select(ctx, mailbox, opts)
 }
 
@@ -843,18 +899,30 @@ func TestTheSourceIsOpenedReadOnly(t *testing.T) {
 	h.src.stuff(t, "INBOX", testMessage("first", "a@example.test"))
 	h.src.stuff(t, "Work", testMessage("second", "b@example.test"))
 
-	src := &recordingSource{Conn: h.src.dial(t)}
-	s := syncer.New(src, h.dst.dial(t), h.db, syncer.Options{PairID: "test"})
+	log := &openLog{}
+	s := syncer.New(
+		pooled(t, 3, readOnly, h.src.dialFunc(t, func(c imapx.Conn) imapx.Conn {
+			return recordingSource{Conn: c, log: log}
+		})),
+		pooled(t, 5, imapx.SelectOptions{}, h.dst.dialFunc(t, nil)),
+		h.db, nil, syncer.Options{PairID: "test"},
+	)
 	if _, err := s.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	if len(src.opened) != 2 {
-		t.Fatalf("opened %d source mailboxes, want 2", len(src.opened))
-	}
-	for i, opts := range src.opened {
-		if !opts.ReadOnly {
-			t.Errorf("source mailbox %d was opened for writing", i)
+	// How many times each mailbox is opened is an implementation detail — a
+	// pool re-selects whenever a lease lands on a connection that was
+	// elsewhere. That every one of those opens is read-only is not.
+	for _, name := range []string{"INBOX", "Work"} {
+		opens := log.opened[name]
+		if len(opens) == 0 {
+			t.Errorf("source mailbox %q was never opened", name)
+		}
+		for i, opts := range opens {
+			if !opts.ReadOnly {
+				t.Errorf("source mailbox %q open %d was for writing", name, i)
+			}
 		}
 	}
 }

@@ -97,12 +97,43 @@ SOURCE  DESTINATION  MESSAGES  COPIED  ADOPTED  ALREADY  FAILED
 INBOX   INBOX        2         2       0        0        0
 Work    Work         1         1       0        0        0
 
-2 folders, 3 copied, 0 adopted, 0 failed, in 5ms
+2 folders, 3 copied, 0 adopted, 0 failed, in 5ms (600.0 messages/second)
 ```
 
 Use `--dry-run` first: it reports the folders it would create and the messages
 it would copy, and writes nothing to either the destination or the state
 database.
+
+### Going faster
+
+IMAP does not multiplex: one connection carries one command at a time, and a
+single connection to a distant server spends nearly all of it waiting. Speed
+therefore comes from opening more connections, and `sync` uses them two ways at
+once — several folders in flight, and several connections sharing one folder.
+Both are needed. Where a single mailbox holds half an account, dividing the work
+only by folder leaves one connection with half the job; dividing it only within
+a folder leaves the remaining mailboxes to trickle through one at a time.
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--source-connections` | 4 | Connections to the source, and the number of folders in flight |
+| `--dest-connections` | 8 | Connections to the destination |
+| `--memory-limit` | 256MiB | Ceiling on message bodies held in memory at once |
+
+The destination gets more connections than the source because appending is the
+slower half: the server has to accept, store and index a whole message where the
+source only has to read one back.
+
+Raise the counts gradually. Servers impose connection limits, and exceeding them
+is not always reported as such — iCloud in particular will refuse, throttle or
+simply stall rather than say plainly that you have opened too many. If a run
+starts failing or stalling after a change, lower the number rather than
+retrying: state is written as the copy proceeds, so a re-run resumes.
+
+Bodies are held in memory between the fetch and the append, never spooled to
+disk. `--memory-limit` bounds that. A message larger than the whole limit is
+still copied, alone, so no message is too big to sync. Accepts `512MiB`, `2GB`,
+`1G` or a plain byte count.
 
 ### It is safe to interrupt
 

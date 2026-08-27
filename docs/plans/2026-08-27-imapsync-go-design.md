@@ -190,6 +190,46 @@ Flag updates and expunges on the destination *do* need a `SELECT`, so those run
 in a separate reconcile stage that leases destination connections in folder-bound
 mode. Keeping that out of the append hot path is deliberate.
 
+One qualification found in M2: a server that answers `APPEND` without
+`APPENDUID` forces a `SEARCH` to find where the message landed, and `SEARCH`
+answers only for the selected mailbox. That fallback therefore takes a *second*,
+folder-bound lease after releasing the append lease. Holding both at once would
+be a destination connection waiting on the destination pool, which deadlocks at
+small pool sizes.
+
+### 4.1.1 The folder pipeline
+
+Within a folder the work is a two-stage pipeline joined by a channel:
+
+```
+            slices.Chunk(todo, 50)
+                     │
+        chunks ──────┴──────────────────►  fetch workers   (source lease only)
+                                                 │
+                                          pending channel
+                                                 │
+                                           append workers  (destination lease only)
+```
+
+`min(srcCap, chunks)` fetchers and `min(dstCap, messages)` appenders, with as
+many folders in flight as the source pool is wide — beyond that a folder could
+only queue for a connection it cannot have.
+
+**The ordering rule: no goroutine ever holds connections to both accounts, and
+where one must be taken while the other is held, the source is taken first.**
+Only `prepareFolder` does so, to read the source mailbox before indexing the
+destination. Because nothing anywhere acquires a source connection while holding
+a destination one, the two pools cannot deadlock against each other however
+differently they are sized — including one connection each. That case is a test,
+because it is the one a user reaches for when a server starts refusing.
+
+Chunking at 50 sets how finely a folder divides: the number of workers that can
+share a folder is the number of chunks in it. It also amortises the one metadata
+`FETCH` per chunk over 50 messages, so metadata is one round trip in 51.
+
+A folder that fails does not cancel its siblings; the error is recorded against
+that folder and the run continues. Only the caller's context cancels.
+
 ### 4.2 Governor (AIMD)
 
 Per-side, per-host adaptive concurrency:
@@ -226,6 +266,12 @@ message)`: a message bigger than the whole budget is charged the whole budget
 and read into memory anyway, because refusing to copy it would be worse and
 blocking for ever would be worse still. If a mailbox of very large attachments
 ever justifies spooling, adding it inside `internal/budget` is contained.
+
+The budget is charged *after* the check for a message already at the destination,
+not before. Ordering it the other way would make a run that lost its state
+database queue and pay for bodies it is about to discard; with the check first,
+re-indexing a 414,022-message folder costs a pass over its headers rather than a
+pass over its bodies.
 
 ## 5. Correctness
 
@@ -526,12 +572,43 @@ Credentials are always *referenced* (env var or keychain), never stored inline.
 **Core property test:** *sync twice, assert the second run copies zero messages.*
 That single invariant is the tombstone for the duplication bug.
 
+### 9.1 Mutation testing, and what it found in M2
+
+Every component is checked by breaking it deliberately and confirming a test
+fails. Three M2 mutations survived, and each was a test that was weaker than it
+looked rather than a mutation that did not matter:
+
+1. **An unlocked adoption index survived** an end-to-end test of 240 concurrent
+   adoptions, five times over, with no race report. Each adoption brackets a
+   map access of some tens of nanoseconds between two SQLite writes of about a
+   millisecond, so the window is real but vanishingly narrow. Covered instead by
+   a test that calls the index directly from eight goroutines and asserts each
+   destination message is handed out exactly once.
+2. **Deleting the loop that reclaims budget from a failed folder survived.**
+   Instrumentation showed exactly two messages stranded per failure: the
+   surviving append workers drain most of the channel themselves. Two messages
+   will not starve a run, so the invariant is now asserted directly — after the
+   run, the whole budget must be acquirable.
+3. **A test named the wrong mechanism.** It claimed to prove the source is
+   opened read-only, but fetches use `BODY.PEEK`, so they never set `\Seen`
+   whichever way the mailbox was opened. Renamed to state what it actually
+   proves, with the `PEEK` flag as the mutation target.
+
+A fourth mutation — making the fetch-to-append channel unbuffered — survives and
+is left alone: the buffer smooths jitter and its absence is only slower.
+
+Two tests assert concurrency itself, since every other test here would pass on a
+strictly sequential engine. They hold body fetches, and separately appends, at a
+rendezvous that only completes once four are in flight at once. An earlier
+version asserted elapsed time instead and failed inside the full suite while
+passing alone: a wall-clock test measures the machine as much as the code.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state. *Done.*
-- **M2** — pools, staged pipeline, byte-budget spooling. Parallel folder
-  `STATUS` is the first easy win here (§6.3).
+- **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3);
+  parallel folder `STATUS` remains outstanding (§6.3).
 - **M3** — AIMD governor + fault-injection suite.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6).
