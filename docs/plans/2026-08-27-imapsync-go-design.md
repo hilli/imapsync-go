@@ -295,7 +295,7 @@ reconciliation pass. Never a silent re-copy.
   more reliable than imapsync's name heuristics and solves iCloud's
   `Sent Messages` / `Deleted Messages` versus mox's `Sent` / `Trash` directly.
 - **Name heuristics remain necessary**, contrary to the assumption above.
-  Measured against iCloud (§6.1): it returns `\Sent` and `\Trash` while leaving
+  Measured against iCloud (§6.3): it returns `\Sent` and `\Trash` while leaving
   `Drafts`, `Junk`, `Archive` and `Notes` unmarked. Attribute mapping therefore
   covers part of an account, and the remainder falls back to names. Note that
   the attributes arrive even though iCloud never advertises SPECIAL-USE, so
@@ -304,7 +304,30 @@ reconciliation pass. Never a silent re-copy.
   prefix translation. Translate, never assume.
 - **User `--map` rules last**, as an explicit override.
 
-### 6.1 Measured: iCloud, 2026-08-27
+### 6.2 Divergences from imapsync
+
+Two deliberate departures, both because imapsync's behaviour is a trap:
+
+**Virtual mailboxes are skipped by default.** imapsync's `possible_special`
+table treats `\All` and `\Flagged` like any other special folder, so Gmail's
+"All Mail" — which lists every message in the account — gets copied alongside
+the real folders it duplicates. `folder.Role.Virtual` marks `\All`, `\Flagged`
+and `\Important`; they are skipped with a reason, and `--include-virtual`
+restores imapsync's behaviour for anyone who wants it.
+
+**Two source folders resolving to one destination is a hard error.** Merging is
+not recoverable and not detectable afterwards: the destination simply has more
+messages, and every subsequent run's diff looks like an ordinary first sync. A
+source with both `Sent` and a stale `Sent Messages` hits this against any
+destination with a `\Sent` folder. `folder.Build` refuses the whole plan and
+names the colliding folders.
+
+A third, smaller one: a folder whose *name* contains the destination's hierarchy
+delimiter is skipped rather than written out, since writing it splits one
+mailbox into two levels of a tree nobody asked for. No encoding avoids this, so
+the choice is between skipping loudly and restructuring silently.
+
+### 6.3 Measured: iCloud, 2026-08-27
 
 `probe` against a real account, 144 folders and 776,747 messages. This replaces
 several guesses the design rested on.
@@ -398,7 +421,7 @@ That single invariant is the tombstone for the duplication bug.
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state.
 - **M2** — pools, staged pipeline, byte-budget spooling. Parallel folder
-  `STATUS` is the first easy win here (§6.1).
+  `STATUS` is the first easy win here (§6.3).
 - **M3** — AIMD governor + fault-injection suite.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6).
@@ -408,7 +431,7 @@ That single invariant is the tombstone for the duplication bug.
   Dovecot, Gmail, Microsoft 365, Cyrus.
 
 QRESYNC's position is now the least settled part of this plan. It was placed
-post-v1 because go-imap lacks it, before we knew iCloud advertises it (§6.1).
+post-v1 because go-imap lacks it, before we knew iCloud advertises it (§6.3).
 Reconsider once M1 shows what a resync actually costs on a 414,022-message
 folder.
 
