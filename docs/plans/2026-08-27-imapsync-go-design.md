@@ -109,6 +109,40 @@ risk. The `internal/imapx` façade is therefore load-bearing rather than
 ceremonial: everything the rest of the codebase knows about IMAP passes through
 it, so forking, extending or replacing the library stays a contained change.
 
+### 3.5 Capabilities are claims, not guarantees
+
+Two rules, both learned the hard way against iCloud during M0:
+
+**Never send syntax the server did not advertise.** iCloud does not offer
+LIST-EXTENDED, and answers `BAD Parse Error` to any `LIST` carrying return
+options — including `RETURN (SUBSCRIBED)`, which the library will happily emit
+for a non-nil options value. The failure is total: no folder list, no sync. Each
+extension's *syntax* must be gated on that extension's own capability, not on a
+related one. SPECIAL-USE does not imply LIST-EXTENDED; nor does LIST-STATUS.
+
+**Degrade rather than abort when a claim proves false.** A server that
+advertises an extension and then rejects it must not end the run. Where a
+cheaper path exists only as an optimisation, falling back to the plain form
+costs round trips and nothing else, so `imapx` retries once on a `BAD`/`NO` and
+logs a warning. This applies only to optimisations: a rejection on a
+correctness-critical command must still fail loudly.
+
+Corollary for the whole project: `--trace` exists because inferring which
+command a server disliked from a wrapped error is guesswork. It redacts
+credentials so it can be used against real accounts and pasted into bug reports.
+
+### 3.6 Establishment must be bounded by the caller
+
+go-imap runs its own read loop and resets any deadline set on the socket, so
+`SetDeadline` cannot bound a login. Worse, `Login().Wait()` ignores
+`context.Context` entirely. A server that accepts a connection and then goes
+quiet therefore hangs the caller indefinitely — unacceptable for a tool whose
+whole premise is hundreds of connections to a throttling server.
+
+`imapx.Dial` races the whole post-connect handshake against the context and
+closes the socket on expiry. Any future blocking call added to the façade needs
+the same treatment.
+
 ## 4. Architecture
 
 ```

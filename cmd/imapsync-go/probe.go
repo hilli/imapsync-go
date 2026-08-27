@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ type probeFlags struct {
 	dialTimeout    time.Duration
 	insecure       bool
 	asJSON         bool
+	trace          bool
 }
 
 func newProbeCmd() *cobra.Command {
@@ -78,6 +80,7 @@ refuses. It is off by default because it is intrusive; enable it with
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
 	cmd.Flags().BoolVar(&f.insecure, "insecure", false, "skip TLS certificate verification (test use only)")
 	cmd.Flags().BoolVar(&f.asJSON, "json", false, "emit the report as JSON")
+	cmd.Flags().BoolVar(&f.trace, "trace", false, "print the raw IMAP conversation to stderr, with credentials redacted")
 
 	cmd.MarkFlagsMutuallyExclusive("config", "url")
 	cmd.MarkFlagsMutuallyExclusive("password-env", "password-file", "password-keychain")
@@ -99,6 +102,11 @@ func runProbe(ctx context.Context, out io.Writer, f probeFlags) error {
 	reports := make(map[string]*probe.Report, len(targets))
 	order := make([]string, 0, len(targets))
 
+	var trace io.Writer
+	if f.trace {
+		trace = os.Stderr
+	}
+
 	for _, t := range targets {
 		report, err := probe.Run(ctx, probe.Options{
 			Endpoint:           t.endpoint,
@@ -106,6 +114,7 @@ func runProbe(ctx context.Context, out io.Writer, f probeFlags) error {
 			WithStatus:         f.withStatus,
 			DialTimeout:        f.dialTimeout,
 			InsecureSkipVerify: f.insecure,
+			Trace:              trace,
 		})
 		if err != nil {
 			return fmt.Errorf("probing %s: %w", t.label, err)
@@ -242,6 +251,7 @@ func writeReport(p *printer, label string, r *probe.Report) {
 		{"CONDSTORE", r.Caps.CondStore, "incremental flag sync, skip unchanged folders"},
 		{"QRESYNC", r.Caps.QResync, "not yet used: unimplemented in go-imap/v2"},
 		{"SPECIAL-USE", r.Caps.SpecialUse, "map folders by attribute, not by name"},
+		{"LIST-EXTENDED", r.Caps.ListExtended, "LIST return options; without it, plain RFC 3501 LIST"},
 		{"MOVE", r.Caps.Move, "cheap moves"},
 		{"MULTIAPPEND", r.Caps.MultiAppend, "not yet used: unimplemented in go-imap/v2"},
 		{"LIST-STATUS", r.Caps.ListStatus, "folder counts without a round trip each"},

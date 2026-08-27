@@ -52,6 +52,19 @@ default because it is intrusive; iCloud in particular throttles aggressively.
 
 Add `--json` for machine-readable output.
 
+### Diagnosing server quirks
+
+IMAP servers disagree about which extensions they honour, and some advertise
+capabilities they then refuse to use. `--trace` prints the raw conversation to
+stderr so a rejection is visible rather than inferred:
+
+```sh
+go run ./cmd/imapsync-go probe --url '...' --password-env ICLOUD_APP_PW --trace
+```
+
+Credentials are redacted before anything is written, so a trace is safe to save
+and share.
+
 ### URL format
 
 | Scheme | Transport | Default port |

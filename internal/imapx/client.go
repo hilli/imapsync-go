@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sort"
 	"time"
@@ -32,20 +33,21 @@ const DefaultDialTimeout = 30 * time.Second
 // Caps is the subset of server capabilities that affects synchronisation
 // strategy, plus the raw list for diagnostics.
 type Caps struct {
-	IMAP4rev2   bool `json:"imap4rev2"`
-	CondStore   bool `json:"condstore"`
-	QResync     bool `json:"qresync"`
-	UIDPlus     bool `json:"uidplus"`
-	MultiAppend bool `json:"multiappend"`
-	SpecialUse  bool `json:"special_use"`
-	Move        bool `json:"move"`
-	ESearch     bool `json:"esearch"`
-	Idle        bool `json:"idle"`
-	Unselect    bool `json:"unselect"`
-	Namespace   bool `json:"namespace"`
-	ListStatus  bool `json:"list_status"`
-	LiteralPlus bool `json:"literal_plus"`
-	ObjectID    bool `json:"objectid"`
+	IMAP4rev2    bool `json:"imap4rev2"`
+	CondStore    bool `json:"condstore"`
+	QResync      bool `json:"qresync"`
+	UIDPlus      bool `json:"uidplus"`
+	MultiAppend  bool `json:"multiappend"`
+	SpecialUse   bool `json:"special_use"`
+	Move         bool `json:"move"`
+	ESearch      bool `json:"esearch"`
+	Idle         bool `json:"idle"`
+	Unselect     bool `json:"unselect"`
+	Namespace    bool `json:"namespace"`
+	ListExtended bool `json:"list_extended"`
+	ListStatus   bool `json:"list_status"`
+	LiteralPlus  bool `json:"literal_plus"`
+	ObjectID     bool `json:"objectid"`
 
 	AuthMechanisms []string `json:"auth_mechanisms,omitempty"`
 	AppendLimit    *uint32  `json:"append_limit,omitempty"`
@@ -95,8 +97,9 @@ type DialOptions struct {
 	Addr     config.Address
 	Password string
 
-	// DebugWriter receives raw protocol traffic, including credentials. Nil
-	// disables protocol tracing.
+	// DebugWriter receives the raw protocol conversation for diagnosing server
+	// quirks. Credentials are redacted before they reach it. Nil disables
+	// tracing.
 	DebugWriter io.Writer
 
 	// Timeout bounds connection establishment. Zero uses DefaultDialTimeout.
@@ -129,54 +132,99 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 	}
 	clientOpts := &imapclient.Options{
 		TLSConfig:   tlsConfig,
-		DebugWriter: opts.DebugWriter,
+		DebugWriter: newTraceWriter(opts.DebugWriter),
 	}
 
-	netDialer := &net.Dialer{Timeout: timeout}
 	addr := opts.Addr.HostPort()
+	raw, err := dialRaw(dialCtx, opts.Addr, tlsConfig, timeout)
+	if err != nil {
+		return nil, err
+	}
 
-	var (
+	// Everything past the TCP connect is raced against the context rather than
+	// bounded by a socket deadline: go-imap runs its own read loop and resets
+	// any deadline we set. Without this, a server that accepts a connection and
+	// then goes quiet, or acknowledges STARTTLS without negotiating TLS, stalls
+	// the caller for as long as it likes. Racing the context also makes Dial
+	// answer to cancellation, which Login().Wait() does not.
+	type result struct {
 		client *imapclient.Client
 		err    error
-	)
-	switch opts.Addr.TLS {
+	}
+	done := make(chan result, 1)
+	go func() {
+		client, err := authenticate(raw, clientOpts, opts)
+		done <- result{client, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			_ = raw.Close()
+			return nil, r.err
+		}
+		return &conn{c: r.client}, nil
+
+	case <-dialCtx.Done():
+		// Closing the socket unblocks the goroutine; collect whatever it
+		// produces so neither the client nor its read loop is left running.
+		_ = raw.Close()
+		go func() {
+			if r := <-done; r.client != nil {
+				_ = r.client.Close()
+			}
+		}()
+		return nil, fmt.Errorf("establishing session with %s: %w", addr, dialCtx.Err())
+	}
+}
+
+// dialRaw opens the transport, honouring the context for both the TCP connect
+// and, for implicit TLS, the handshake.
+func dialRaw(ctx context.Context, endpoint config.Address, tlsConfig *tls.Config, timeout time.Duration) (net.Conn, error) {
+	netDialer := &net.Dialer{Timeout: timeout}
+	addr := endpoint.HostPort()
+
+	switch endpoint.TLS {
 	case config.TLSImplicit:
-		var raw net.Conn
-		raw, err = (&tls.Dialer{NetDialer: netDialer, Config: tlsConfig}).DialContext(dialCtx, "tcp", addr)
+		raw, err := (&tls.Dialer{NetDialer: netDialer, Config: tlsConfig}).DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, fmt.Errorf("dialling %s over TLS: %w", addr, err)
 		}
-		client = imapclient.New(raw, clientOpts)
+		return raw, nil
 
-	case config.TLSStartTLS:
-		var raw net.Conn
-		raw, err = netDialer.DialContext(dialCtx, "tcp", addr)
+	case config.TLSStartTLS, config.TLSNone:
+		raw, err := netDialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, fmt.Errorf("dialling %s: %w", addr, err)
 		}
+		return raw, nil
+
+	default:
+		return nil, fmt.Errorf("unknown TLS mode %q", endpoint.TLS)
+	}
+}
+
+// authenticate upgrades the transport if needed and logs in. It blocks until
+// the server answers, so Dial runs it under a context race.
+func authenticate(raw net.Conn, clientOpts *imapclient.Options, opts DialOptions) (*imapclient.Client, error) {
+	addr := opts.Addr.HostPort()
+
+	var client *imapclient.Client
+	if opts.Addr.TLS == config.TLSStartTLS {
+		var err error
 		client, err = imapclient.NewStartTLS(raw, clientOpts)
 		if err != nil {
 			return nil, fmt.Errorf("negotiating STARTTLS with %s: %w", addr, err)
 		}
-
-	case config.TLSNone:
-		var raw net.Conn
-		raw, err = netDialer.DialContext(dialCtx, "tcp", addr)
-		if err != nil {
-			return nil, fmt.Errorf("dialling %s: %w", addr, err)
-		}
+	} else {
 		client = imapclient.New(raw, clientOpts)
-
-	default:
-		return nil, fmt.Errorf("unknown TLS mode %q", opts.Addr.TLS)
 	}
 
 	if err := client.Login(opts.Addr.User, opts.Password).Wait(); err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("authenticating as %s: %w", opts.Addr.User, err)
 	}
-
-	return &conn{c: client}, nil
+	return client, nil
 }
 
 func (c *conn) Caps() Caps {
@@ -200,6 +248,7 @@ func (c *conn) Caps() Caps {
 		Idle:           set.Has(imap.CapIdle),
 		Unselect:       set.Has(imap.CapUnselect),
 		Namespace:      set.Has(imap.CapNamespace),
+		ListExtended:   set.Has(imap.CapListExtended),
 		ListStatus:     set.Has(imap.CapListStatus),
 		LiteralPlus:    set.Has(imap.CapLiteralPlus),
 		ObjectID:       set.Has(imap.CapObjectID),
@@ -210,14 +259,10 @@ func (c *conn) Caps() Caps {
 		caps.AppendLimit = limit
 	}
 
-	// IMAP4rev2 subsumes several extensions without advertising them separately.
+	// go-imap's CapSet.Has already resolves the extensions IMAP4rev2 subsumes,
+	// but SPECIAL-USE is missing from its table even though RFC 9051 folds the
+	// attributes into the base LIST response.
 	if caps.IMAP4rev2 {
-		caps.UIDPlus = true
-		caps.Move = true
-		caps.ESearch = true
-		caps.Unselect = true
-		caps.Namespace = true
-		caps.ListStatus = true
 		caps.SpecialUse = true
 	}
 
@@ -248,22 +293,25 @@ func (c *conn) Namespaces(ctx context.Context) (Namespaces, error) {
 func (c *conn) ListFolders(ctx context.Context, opts ListOptions) ([]Folder, error) {
 	caps := c.Caps()
 
-	listOpts := &imap.ListOptions{ReturnSubscribed: true}
-	if caps.SpecialUse {
-		listOpts.ReturnSpecialUse = true
+	listOpts := listOptions(caps, opts)
+	entries, err := c.c.List("", "*", listOpts).Collect()
+	if err != nil && listOpts != nil && isProtocolRejection(err) {
+		// The server advertised LIST-EXTENDED but rejected the return options
+		// anyway. Retry with the plain RFC 3501 form rather than failing: the
+		// data is still reachable, just at the cost of a STATUS round trip per
+		// folder.
+		slog.Warn("server rejected extended LIST, retrying without return options",
+			"error", err, "server_advertised_list_extended", caps.ListExtended)
+		listOpts = nil
+		entries, err = c.c.List("", "*", nil).Collect()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing folders: %w", err)
 	}
 
 	// LIST-STATUS folds STATUS into the LIST response. Without it we fall back
 	// to a STATUS round trip per folder below.
-	inlineStatus := opts.WithStatus && caps.ListStatus
-	if inlineStatus {
-		listOpts.ReturnStatus = statusOptions(caps)
-	}
-
-	entries, err := c.c.List("", "*", listOpts).Collect()
-	if err != nil {
-		return nil, fmt.Errorf("listing folders: %w", err)
-	}
+	inlineStatus := listOpts != nil && listOpts.ReturnStatus != nil
 
 	folders := make([]Folder, 0, len(entries))
 	for _, e := range entries {
@@ -273,6 +321,12 @@ func (c *conn) ListFolders(ctx context.Context, opts ListOptions) ([]Folder, err
 			if err != nil {
 				return nil, fmt.Errorf("querying status of %q: %w", e.Mailbox, err)
 			}
+			if st == nil {
+				// The server completed the command without sending the untagged
+				// STATUS it promised. Reporting a folder with no UIDVALIDITY as
+				// though it were fine is how a sync silently loses track of it.
+				return nil, fmt.Errorf("querying status of %q: server returned no STATUS data", e.Mailbox)
+			}
 			applyStatus(&f, st)
 		}
 		folders = append(folders, f)
@@ -280,6 +334,35 @@ func (c *conn) ListFolders(ctx context.Context, opts ListOptions) ([]Folder, err
 
 	sort.Slice(folders, func(i, j int) bool { return folders[i].Name < folders[j].Name })
 	return folders, nil
+}
+
+// listOptions decides what may be appended to a LIST command. Return options
+// are LIST-EXTENDED syntax (RFC 5258); a server without that extension answers
+// BAD to the whole command, so a nil result meaning "plain RFC 3501 LIST" is
+// the only safe request to make of it.
+func listOptions(caps Caps, opts ListOptions) *imap.ListOptions {
+	if !caps.ListExtended {
+		return nil
+	}
+	listOpts := &imap.ListOptions{
+		ReturnSubscribed: true,
+		ReturnSpecialUse: caps.SpecialUse,
+	}
+	if opts.WithStatus && caps.ListStatus {
+		listOpts.ReturnStatus = statusOptions(caps)
+	}
+	return listOpts
+}
+
+// isProtocolRejection reports whether the server refused a command outright, as
+// opposed to the connection failing. Only a refusal is worth retrying
+// differently.
+func isProtocolRejection(err error) bool {
+	var imapErr *imap.Error
+	if !errors.As(err, &imapErr) {
+		return false
+	}
+	return imapErr.Type == imap.StatusResponseTypeBad || imapErr.Type == imap.StatusResponseTypeNo
 }
 
 func statusOptions(caps Caps) *imap.StatusOptions {

@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/hilli/imapsync-go/internal/config"
@@ -31,6 +32,10 @@ type Options struct {
 
 	DialTimeout        time.Duration
 	InsecureSkipVerify bool
+
+	// Trace receives the raw protocol conversation, with credentials redacted.
+	// Nil disables tracing.
+	Trace io.Writer
 }
 
 // Report is the result of probing one endpoint.
@@ -100,6 +105,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		Password:           password,
 		Timeout:            opts.DialTimeout,
 		InsecureSkipVerify: opts.InsecureSkipVerify,
+		DebugWriter:        opts.Trace,
 	}
 
 	conn, err := imapx.Dial(ctx, dialOpts)
@@ -143,6 +149,10 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 // server refuses or the cap is reached. It returns the highest count that
 // succeeded, including the connection the caller already holds.
 func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (int, string) {
+	// The ceiling search is the same login repeated; tracing it would bury the
+	// interesting conversation in noise.
+	dialOpts.DebugWriter = nil
+
 	held := make([]imapx.Conn, 0, max)
 	defer func() {
 		for _, c := range held {
