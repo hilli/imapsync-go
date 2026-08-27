@@ -522,6 +522,32 @@ rather than one flag: reaching a self-signed destination on your own network
 must not also stop verifying a public source over the internet. Certificate
 pinning would be better than either and is not built.
 
+### 6.5 Measured: concurrency, iCloud → mox, 2026-08-27
+
+Same accounts and same code path as §6.4, with the M2 engine.
+
+| Run | Folders | Messages | Source × dest conns | Elapsed | Rate |
+|---|---|---|---|---|---|
+| M1 baseline | 2 | 135 | 1 × 1 | 1m17s | 1.7/s |
+| M2 | 2 | 135 | 4 × 8 | 26.7s | 5.1/s |
+| M2 | 2 | 135 | 8 × 16 | 24.2s | 5.6/s |
+| M2 | 14 | 10,730 | 8 × 16 | 7m55s | **22.6/s** |
+
+**13× the baseline**, and no failures at eight concurrent iCloud connections.
+Extrapolated over the 776,747-message account, 5.3 days becomes about 9.5 hours.
+
+The two-folder runs are the more interesting measurement, because doubling the
+pools bought almost nothing. Both folders were small — 127 messages and 8 — and
+at a chunk size of 50 a 127-message folder splits into three chunks, so at most
+three connections can ever share it. Pool size cannot help past that.
+
+That ceiling was left in place rather than fixed. Dividing each folder by the
+pool width instead of by a fixed 50 would lift it, but the 14-folder run shows
+folder-level concurrency already takes up the slack whenever there are folders to
+spare, and the target account has 144 of them. The case where it would bite —
+few folders left, all of them small — is by construction the cheap part of a run.
+Worth revisiting only if a measurement, rather than an argument, calls for it.
+
 ## 7. Safety
 
 Destructive operations (`--delete2`, `--delete1`, expunge) require explicit
