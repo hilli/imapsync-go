@@ -267,6 +267,40 @@ Implemented in `internal/ident`. Three things were established by running Go's
 `StampHeader` is deliberately *not* in `Fields`: if stamping changed the digest,
 the value written would never match the value later searched for.
 
+#### 5.2.2 Bulk adoption versus targeted recovery
+
+Tier 3 has two callers with opposite cost profiles, and conflating them is a
+performance bug that only shows up on a real account.
+
+- **Targeted recovery** settles the handful of `in_flight` rows a crash left
+  behind: one `SEARCH` each, by stamp or `Message-ID`. Bounded by how many
+  appends were in flight when the process died.
+- **Bulk adoption** recognises messages already at the destination when the UID
+  map cannot help at all. It reads every destination header in the folder once
+  and indexes them by digest, so each source message is an in-memory lookup
+  rather than a round trip. `SEARCH`-per-message would be 414k round trips on
+  iCloud's INBOX (§6.3).
+
+The index is built **only when the folder has never completed a sync, or its
+UIDVALIDITY has just changed** — a first sync onto a non-empty destination, a
+resumed first sync, or a lost database. Once a folder has completed a sync, the
+UID map answers for everything except the suspects, and indexing would read
+every header in the folder to learn nothing. Getting this condition wrong is
+invisible in tests and ruinous in production.
+
+Two further rules, both of which prevent *losing* mail rather than duplicating
+it:
+
+- A digest maps to a **list** of destination UIDs, and adopting consumes one.
+  Two identical messages in the source are two messages.
+- Destination UIDs already recorded against some other source message are
+  excluded from the index. Otherwise a resumed first sync hands one destination
+  copy to two source messages and the second is never copied.
+
+Weak identities are never adopted, by either caller. A digest too thin to
+distinguish two messages makes a stamp that is too thin as well, so tier 4 does
+not rescue them; they are copied, and the duplicate is the accepted cost.
+
 ### 5.3 Schema
 
 ```sql

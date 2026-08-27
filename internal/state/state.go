@@ -228,6 +228,37 @@ func (d *DB) MarkSynced(ctx context.Context, folderID int64, highestModSeq uint6
 	return nil
 }
 
+// ClaimedDestUIDs returns the destination UIDs this folder has already mapped a
+// source message onto.
+//
+// Adoption needs it. A destination message that some other source message is
+// already recorded against must not be offered to a second one: two identical
+// messages in the source and one copy at the destination is a real state, and
+// collapsing them onto each other silently drops mail rather than copying it.
+func (d *DB) ClaimedDestUIDs(ctx context.Context, folderID int64, dstUIDValidity uint32) (map[uint32]struct{}, error) {
+	const query = `SELECT dst_uid FROM messages
+	               WHERE folder_id = ? AND dst_uidvalidity = ? AND dst_uid IS NOT NULL AND dst_uid != 0`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, dstUIDValidity)
+	if err != nil {
+		return nil, fmt.Errorf("reading claimed destination UIDs for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[uint32]struct{})
+	for rows.Next() {
+		var uid uint32
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("reading claimed destination UIDs for folder %d: %w", folderID, err)
+		}
+		out[uid] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading claimed destination UIDs for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
 // SyncedUIDs returns the state of every recorded message in a folder, keyed by
 // source UID. It is the left-hand side of the folder diff.
 func (d *DB) SyncedUIDs(ctx context.Context, folderID int64, srcUIDValidity uint32) (map[uint32]State, error) {
