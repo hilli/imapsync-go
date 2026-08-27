@@ -529,3 +529,48 @@ func TestDestinationRoleChoiceIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// A run narrowed to two folders out of 144 produces 142 skips the caller asked
+// for and, in the same list, the handful imapsync-go decided on its own. A
+// report that cannot tell them apart buries the second kind, so Build marks
+// which is which.
+func TestSkipsRecordWhoAskedForThem(t *testing.T) {
+	t.Parallel()
+
+	source := []imapx.Folder{
+		mailbox("INBOX"),
+		mailbox("Keep"),
+		mailbox("Other"),
+		mailbox("[Gmail]", `\Noselect`),
+		mailbox("[Gmail]/All Mail", `\All`),
+	}
+
+	plan, err := Build(source, moxFolders(), Options{
+		SourceDelim: "/",
+		DestDelim:   "/",
+		Automap:     true,
+		Only:        []string{"INBOX", "Keep"},
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	got := make(map[string]bool, len(plan.Skips))
+	for _, s := range plan.Skips {
+		got[s.Source] = s.ByRequest
+	}
+
+	want := map[string]bool{
+		"Other":            true,  // --folder: the caller asked
+		"[Gmail]/All Mail": false, // virtual: our decision
+		"[Gmail]":          false, // \Noselect: likewise
+	}
+	if len(got) != len(want) {
+		t.Fatalf("skipped %v, want exactly %v", got, want)
+	}
+	for name, byRequest := range want {
+		if got[name] != byRequest {
+			t.Errorf("%q: ByRequest = %v, want %v", name, got[name], byRequest)
+		}
+	}
+}

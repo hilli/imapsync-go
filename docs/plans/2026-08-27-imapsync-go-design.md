@@ -422,6 +422,45 @@ UID-range chunking is not an optimisation for this account; it is the whole job.
 Connection ceiling: at least 8, the configured cap; iCloud did not refuse. The
 real limit is still unmeasured.
 
+### 6.4 Measured: iCloud → mox, first real sync, 2026-08-27
+
+135 messages across two folders (`AU`, 8; `Laust`, 127), iCloud to mox over one
+connection per side.
+
+| Run | Result | Wall clock |
+| --- | --- | --- |
+| First | 135 copied | **1 m 17 s** |
+| Second, state intact | 0 copied, 135 already | 0.9 s |
+| Third, state database deleted | **0 copied, 135 adopted** | 4.2 s |
+
+Three things this settles.
+
+**Throughput is 1.7 messages/second.** Extrapolated to the measured 776,747
+messages, a single-connection run of this account takes **5.3 days**. M2 is not
+a refinement; without it the tool does not work at this size. The number also
+gives M3's governor something to beat.
+
+**mox does not rewrite messages on APPEND.** The third run recomputed a digest
+from what mox had stored and matched all 135 against the source. Had mox added
+or reordered headers, adoption would have silently failed and a lost state
+database would re-copy the whole account. The identity ladder (§5.2) survives at
+least one real destination; Dovecot and Gmail are still unproven.
+
+**Bulk adoption costs a folder scan, not a re-copy.** 135 headers took 2 s. At
+414,022 that is a real cost but a survivable one, and it is paid only in the
+cases §5.2.2 lists.
+
+Two things this did *not* settle: no message in the sample produced a weak
+identity (135 of 135 indexed), so tier 4 stamping is still only proven in
+tests, and no run has been interrupted mid-append against a real server.
+
+**mox's certificate is self-signed with a ten-year validity**, which macOS
+rejects outright as `not standards compliant` — keychain trust does not help.
+This is why TLS verification is per side (`--source-insecure`, `--dest-insecure`)
+rather than one flag: reaching a self-signed destination on your own network
+must not also stop verifying a public source over the internet. Certificate
+pinning would be better than either and is not built.
+
 ## 7. Safety
 
 Destructive operations (`--delete2`, `--delete1`, expunge) require explicit

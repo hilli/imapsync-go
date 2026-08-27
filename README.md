@@ -135,6 +135,17 @@ Virtual mailboxes are **skipped by default**, which differs from imapsync.
 Gmail's All Mail is a view over every other folder, so copying it duplicates the
 account.
 
+### Self-signed servers
+
+TLS verification is controlled **per side**: `--source-insecure` and
+`--dest-insecure`. A self-signed destination on your own network is a
+reasonable thing to accept; accepting it must not also stop verifying a public
+source reached over the internet, so there is no single flag that does both.
+
+macOS rejects a self-signed certificate whose validity exceeds 398 days with
+`certificate is not standards compliant`, and adding it to the keychain does not
+help. Either reissue it with a shorter lifetime or pass `--dest-insecure`.
+
 ## Configuration
 
 For recurring syncs, use a config file instead of a long flag line. See

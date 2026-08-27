@@ -167,6 +167,10 @@ type Pair struct {
 type Skip struct {
 	Source string
 	Reason string
+	// ByRequest marks a skip the caller asked for with --folder, --include or
+	// --exclude. Those are expected and a report can summarise them; a skip
+	// with ByRequest false is imapsync-go's own decision and worth reading.
+	ByRequest bool
 }
 
 // Plan is the full mapping for one run.
@@ -198,8 +202,8 @@ func Build(source, dest []imapx.Folder, opts Options) (Plan, error) {
 		rel := stripPrefix(f.Name, opts.SourcePrefix)
 		role := detectRole(f, rel)
 
-		if reason := filterReason(f, role, opts); reason != "" {
-			plan.Skips = append(plan.Skips, Skip{Source: f.Name, Reason: reason})
+		if reason, byRequest := filterReason(f, role, opts); reason != "" {
+			plan.Skips = append(plan.Skips, Skip{Source: f.Name, Reason: reason, ByRequest: byRequest})
 			continue
 		}
 
@@ -237,26 +241,29 @@ func Build(source, dest []imapx.Folder, opts Options) (Plan, error) {
 }
 
 // filterReason returns why a source mailbox is left out, or "" to keep it.
-func filterReason(f imapx.Folder, role Role, opts Options) string {
+// The bool reports whether the skip is the direct consequence of a filter the
+// caller asked for. Those are expected and can be summarised; the rest are
+// decisions imapsync-go made on its own and are worth reading individually.
+func filterReason(f imapx.Folder, role Role, opts Options) (string, bool) {
 	if !f.Selectable {
 		// A \Noselect mailbox holds no messages. Its children are listed
 		// separately and mapped on their own merits, so nothing is lost by
 		// skipping the node itself.
-		return "not selectable"
+		return "not selectable", false
 	}
 	if role.Virtual() && !opts.IncludeVirtual {
-		return fmt.Sprintf("%s is a view over other mailboxes; copying it would duplicate them (use --include-virtual to override)", role)
+		return fmt.Sprintf("%s is a view over other mailboxes; copying it would duplicate them (use --include-virtual to override)", role), false
 	}
 	if len(opts.Only) > 0 && !slices.Contains(opts.Only, f.Name) {
-		return "not in --folder"
+		return "not in --folder", true
 	}
 	if len(opts.Include) > 0 && !matchesAny(opts.Include, f.Name) {
-		return "does not match --include"
+		return "does not match --include", true
 	}
 	if matchesAny(opts.Exclude, f.Name) {
-		return "matches --exclude"
+		return "matches --exclude", true
 	}
-	return ""
+	return "", false
 }
 
 // destinationFor resolves one source mailbox's destination name.

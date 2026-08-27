@@ -3,11 +3,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"github.com/hilli/imapsync-go/internal/folder"
+	"github.com/hilli/imapsync-go/internal/syncer"
+	"math/big"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -148,16 +158,24 @@ func TestSyncCommandDryRunWritesNothing(t *testing.T) {
 func runCLI(t *testing.T, args []string) string {
 	t.Helper()
 
+	out, err := runCLIErr(t, args)
+	if err != nil {
+		t.Fatalf("running %v: %v\n%s", args, err, out)
+	}
+	return out
+}
+
+func runCLIErr(t *testing.T, args []string) (string, error) {
+	t.Helper()
+
 	var out bytes.Buffer
 	cmd := newRootCmd()
 	cmd.SetArgs(args)
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 
-	if err := cmd.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("running %v: %v\n%s", args, err, out.String())
-	}
-	return out.String()
+	err := cmd.ExecuteContext(context.Background())
+	return out.String(), err
 }
 
 func TestFolderOptionsRejectsBadInput(t *testing.T) {
@@ -264,5 +282,172 @@ func TestSyncEndpointsRequiresBothSides(t *testing.T) {
 	_, _, _, _, err := syncEndpoints(syncFlags{sourceURL: "imaps://a@src.example", sourcePasswordEnv: "X"})
 	if err == nil || !strings.Contains(err.Error(), "--dest-url") {
 		t.Errorf("error = %v, want one asking for the destination", err)
+	}
+}
+
+// startTLSAccount is startAccount over TLS with a self-signed certificate, so
+// a connection succeeds only if that side's verification was disabled.
+func startTLSAccount(t *testing.T, mailboxes ...string) (addr string, user *imapmemserver.User) {
+	t.Helper()
+
+	user = imapmemserver.NewUser(cliUser, cliPassword)
+	for _, name := range append([]string{"INBOX"}, mailboxes...) {
+		if err := user.Create(name, nil); err != nil {
+			t.Fatalf("creating %q: %v", name, err)
+		}
+	}
+	mem := imapmemserver.New()
+	mem.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return mem.NewSession(), nil, nil
+		},
+		InsecureAuth: true,
+		Caps:         imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapIMAP4rev2: {}},
+		Logger:       cliDiscardLogger{},
+	})
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{selfSigned(t)}}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	go func() { _ = srv.Serve(tls.NewListener(ln, tlsCfg)) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	return ln.Addr().String(), user
+}
+
+func selfSigned(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("creating certificate: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// A self-signed destination on your own network is a reasonable thing to
+// accept. Accepting it must not also stop verifying the source, which is
+// typically a public server reached over the internet. The two flags are
+// therefore independent, and this proves they are not wired to the same bool
+// and not wired to each other's side.
+func TestInsecureIsPerSide(t *testing.T) {
+	srcAddr, _ := startTLSAccount(t)
+	dstAddr, _ := startTLSAccount(t)
+
+	args := func(extra ...string) []string {
+		return append([]string{
+			"sync",
+			"--source-url", "imaps://" + cliUser + "@" + srcAddr,
+			"--source-password-env", "CLI_SRC_PW",
+			"--dest-url", "imaps://" + cliUser + "@" + dstAddr,
+			"--dest-password-env", "CLI_DST_PW",
+			"--state", filepath.Join(t.TempDir(), "state.db"),
+		}, extra...)
+	}
+
+	t.Setenv("CLI_SRC_PW", cliPassword)
+	t.Setenv("CLI_DST_PW", cliPassword)
+
+	for _, tc := range []struct {
+		name  string
+		flags []string
+		stuck string
+	}{
+		{"neither", nil, "source"},
+		{"source only", []string{"--source-insecure"}, "destination"},
+		{"destination only", []string{"--dest-insecure"}, "source"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runCLIErr(t, args(tc.flags...))
+			if err == nil {
+				t.Fatalf("want a certificate failure on the %s, got success", tc.stuck)
+			}
+			if !strings.Contains(err.Error(), tc.stuck) {
+				t.Fatalf("want the %s to fail, got: %v", tc.stuck, err)
+			}
+			if !strings.Contains(err.Error(), "certificate") {
+				t.Fatalf("want a certificate failure, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("both", func(t *testing.T) {
+		if _, err := runCLIErr(t, args("--source-insecure", "--dest-insecure")); err != nil {
+			t.Fatalf("with both sides insecure the sync should run: %v", err)
+		}
+	})
+}
+
+// Narrowing a large account with --folder makes almost every folder a skip.
+// Listing all of them buries the ones imapsync-go chose to skip by itself,
+// which are the only ones the caller has not already seen.
+func TestReportSeparatesRequestedSkipsFromOurOwn(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{{Source: "AU", Dest: "AU", Messages: 8, Copied: 8}},
+		Skips: []folder.Skip{
+			{Source: "Junk", Reason: "not in --folder", ByRequest: true},
+			{Source: "Later", Reason: "not in --folder", ByRequest: true},
+			{Source: "Starred", Reason: `\Flagged is a view over other mailboxes`, ByRequest: false},
+		},
+	}
+
+	var out bytes.Buffer
+	if err := writeSyncReport(&out, report, time.Second, false); err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "Skipped 1 folder:") {
+		t.Errorf("want a single listed skip, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Starred") {
+		t.Errorf("our own skip must be named, got:\n%s", got)
+	}
+	if strings.Contains(got, "Junk") || strings.Contains(got, "Later") {
+		t.Errorf("requested skips must not be listed one by one, got:\n%s", got)
+	}
+	if !strings.Contains(got, "2 further folders left out by --folder") {
+		t.Errorf("requested skips must still be counted, got:\n%s", got)
+	}
+}
+
+// A dry run reports what it would do, so its totals must not claim it did it.
+func TestDryRunReportDoesNotClaimToHaveCopied(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{{Source: "AU", Dest: "AU", Messages: 8, Copied: 8}},
+	}
+
+	var out bytes.Buffer
+	if err := writeSyncReport(&out, report, time.Second, true); err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "8 to copy") {
+		t.Errorf("want \"8 to copy\", got:\n%s", got)
+	}
+	if strings.Contains(got, "8 copied") {
+		t.Errorf("a dry run must not say it copied anything, got:\n%s", got)
 	}
 }

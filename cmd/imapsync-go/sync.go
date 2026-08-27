@@ -47,7 +47,8 @@ type syncFlags struct {
 	includeVirtual bool
 
 	dialTimeout time.Duration
-	insecure    bool
+	insecureSrc bool
+	insecureDst bool
 	trace       bool
 }
 
@@ -106,7 +107,8 @@ sequence. Concurrency arrives in a later release.`,
 	cmd.Flags().BoolVar(&f.includeVirtual, "include-virtual", false, "copy virtual mailboxes such as Gmail's All Mail, which duplicate the account")
 
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
-	cmd.Flags().BoolVar(&f.insecure, "insecure", false, "skip TLS certificate verification (test use only)")
+	cmd.Flags().BoolVar(&f.insecureSrc, "source-insecure", false, "skip TLS certificate verification for the source (test use only)")
+	cmd.Flags().BoolVar(&f.insecureDst, "dest-insecure", false, "skip TLS certificate verification for the destination, for example a self-signed server on your own network")
 	cmd.Flags().BoolVar(&f.trace, "trace", false, "print the raw IMAP conversation to stderr, with credentials redacted")
 
 	cmd.MarkFlagsMutuallyExclusive("config", "source-url")
@@ -143,13 +145,13 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		trace = os.Stderr
 	}
 
-	src, err := connect(ctx, source, f, trace)
+	src, err := connect(ctx, source, f, f.insecureSrc, trace)
 	if err != nil {
 		return fmt.Errorf("connecting to source: %w", err)
 	}
 	defer closeConn(ctx, src, "source")
 
-	dst, err := connect(ctx, dest, f, trace)
+	dst, err := connect(ctx, dest, f, f.insecureDst, trace)
 	if err != nil {
 		return fmt.Errorf("connecting to destination: %w", err)
 	}
@@ -276,7 +278,11 @@ func compilePatterns(patterns []string, label string) ([]*regexp.Regexp, error) 
 	return out, nil
 }
 
-func connect(ctx context.Context, ep config.Endpoint, f syncFlags, trace io.Writer) (imapx.Conn, error) {
+// connect dials one side. insecure is passed per side rather than taken from
+// the flags because the two sides routinely differ: a self-signed destination
+// on your own network is a reasonable thing to accept, and accepting it must
+// not also stop verifying a public source over the internet.
+func connect(ctx context.Context, ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) (imapx.Conn, error) {
 	addr, err := ep.Address()
 	if err != nil {
 		return nil, err
@@ -290,7 +296,7 @@ func connect(ctx context.Context, ep config.Endpoint, f syncFlags, trace io.Writ
 		Password:           password,
 		DebugWriter:        trace,
 		Timeout:            f.dialTimeout,
-		InsecureSkipVerify: f.insecure,
+		InsecureSkipVerify: insecure,
 	})
 }
 
@@ -378,16 +384,37 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	flush()
 
 	copied, adopted, failed := report.Totals()
-	p.printf("\n%d %s, %d copied, %d adopted, %d failed, in %s\n",
-		len(report.Folders), plural(len(report.Folders), "folder"), copied, adopted, failed, elapsed.Round(time.Millisecond))
+	copiedWord := "copied"
+	if dryRun {
+		copiedWord = "to copy"
+	}
+	p.printf("\n%d %s, %d %s, %d adopted, %d failed, in %s\n",
+		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, failed, elapsed.Round(time.Millisecond))
 
-	if len(report.Skips) > 0 {
-		p.printf("\nSkipped %d %s:\n", len(report.Skips), plural(len(report.Skips), "folder"))
+	// Skips the caller asked for are not news: narrowing a 144-folder account
+	// to two with --folder should not bury the two skips that were our own
+	// decision under 142 that were theirs.
+	var notable []folder.Skip
+	byRequest := 0
+	for _, skip := range report.Skips {
+		if skip.ByRequest {
+			byRequest++
+			continue
+		}
+		notable = append(notable, skip)
+	}
+
+	if len(notable) > 0 {
+		p.printf("\nSkipped %d %s:\n", len(notable), plural(len(notable), "folder"))
 		st, flushSkips := p.table()
-		for _, skip := range report.Skips {
+		for _, skip := range notable {
 			st.printf("  %s\t%s\n", skip.Source, skip.Reason)
 		}
 		flushSkips()
+	}
+	if byRequest > 0 {
+		p.printf("\n%d further %s left out by --folder, --include or --exclude.\n",
+			byRequest, plural(byRequest, "folder"))
 	}
 
 	for _, fr := range report.Folders {
