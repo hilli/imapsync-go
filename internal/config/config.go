@@ -196,17 +196,27 @@ func (a Address) HostPort() string {
 //	imaps://user@host[:port]           implicit TLS, default port 993
 //	imap://user@host[:port]            STARTTLS,     default port 143
 //	imap+insecure://user@host[:port]   plaintext,    default port 143
+//
+// The username is taken literally up to the last "@" in the authority, so an
+// email address needs no percent-encoding:
+//
+//	imaps://apple@example.com@imap.mail.me.com
+//
+// Percent-encoded usernames are still accepted and decoded, so the equivalent
+// imaps://apple%40example.com@imap.mail.me.com also works.
 func (e Endpoint) Address() (Address, error) {
-	if strings.TrimSpace(e.URL) == "" {
+	raw := strings.TrimSpace(e.URL)
+	if raw == "" {
 		return Address{}, errors.New("url is required")
 	}
-	u, err := url.Parse(e.URL)
-	if err != nil {
-		return Address{}, fmt.Errorf("invalid url %q: %w", e.URL, err)
+
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok {
+		return Address{}, errors.New("missing scheme, expected scheme://user@host")
 	}
 
 	var addr Address
-	switch strings.ToLower(u.Scheme) {
+	switch strings.ToLower(scheme) {
 	case "imaps":
 		addr.TLS, addr.Port = TLSImplicit, 993
 	case "imap":
@@ -214,30 +224,90 @@ func (e Endpoint) Address() (Address, error) {
 	case "imap+insecure":
 		addr.TLS, addr.Port = TLSNone, 143
 	default:
-		return Address{}, fmt.Errorf("unsupported scheme %q, want imaps, imap or imap+insecure", u.Scheme)
+		return Address{}, fmt.Errorf("unsupported scheme %q, want imaps, imap or imap+insecure", scheme)
 	}
 
-	addr.Host = u.Hostname()
-	if addr.Host == "" {
-		return Address{}, fmt.Errorf("missing host in %q", e.URL)
-	}
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 1 || n > 65535 {
-			return Address{}, fmt.Errorf("invalid port %q", p)
+	// A mailbox path or query string would be silently ignored, so reject it
+	// rather than connect to something the user did not ask for.
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		if strings.Trim(rest[i:], "/") != "" {
+			return Address{}, errors.New("url must not contain a path or query, expected scheme://user@host[:port]")
 		}
-		addr.Port = n
+		rest = rest[:i]
 	}
 
-	if u.User == nil || u.User.Username() == "" {
+	// Split on the LAST "@": everything before it is the username, which lets an
+	// unencoded email address through unharmed.
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
 		return Address{}, errors.New("missing username, expected scheme://user@host")
 	}
-	if _, hasPassword := u.User.Password(); hasPassword {
+	userinfo, hostport := rest[:at], rest[at+1:]
+
+	if userinfo == "" {
+		return Address{}, errors.New("missing username, expected scheme://user@host")
+	}
+	if strings.Contains(userinfo, ":") {
 		return Address{}, errors.New("url contains an inline password; reference it via password.env, password.file or password.keychain instead")
 	}
-	addr.User = u.User.Username()
+	addr.User = userinfo
+	if strings.Contains(userinfo, "%") {
+		if decoded, err := url.PathUnescape(userinfo); err == nil {
+			addr.User = decoded
+		}
+	}
+
+	host, port, err := splitHostPort(hostport)
+	if err != nil {
+		return Address{}, err
+	}
+	addr.Host = host
+	if port != 0 {
+		addr.Port = port
+	}
 
 	return addr, nil
+}
+
+// splitHostPort splits "host", "host:port", "[::1]" or "[::1]:port". A zero
+// port means none was given, leaving the scheme default in place.
+func splitHostPort(hostport string) (host string, port int, err error) {
+	if hostport == "" {
+		return "", 0, errors.New("missing host")
+	}
+
+	var portStr string
+	if strings.HasPrefix(hostport, "[") {
+		close := strings.Index(hostport, "]")
+		if close < 0 {
+			return "", 0, fmt.Errorf("unterminated IPv6 address in %q", hostport)
+		}
+		host = hostport[1:close]
+		switch remainder := hostport[close+1:]; {
+		case remainder == "":
+		case strings.HasPrefix(remainder, ":"):
+			portStr = remainder[1:]
+		default:
+			return "", 0, fmt.Errorf("unexpected %q after IPv6 address", remainder)
+		}
+	} else if h, p, found := strings.Cut(hostport, ":"); found {
+		host, portStr = h, p
+	} else {
+		host = hostport
+	}
+
+	if host == "" {
+		return "", 0, errors.New("missing host")
+	}
+	if portStr == "" {
+		return host, 0, nil
+	}
+
+	n, err := strconv.Atoi(portStr)
+	if err != nil || n < 1 || n > 65535 {
+		return "", 0, fmt.Errorf("invalid port %q", portStr)
+	}
+	return host, n, nil
 }
 
 // Resolve returns the secret value from its configured source.

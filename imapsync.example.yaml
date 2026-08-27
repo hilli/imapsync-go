@@ -10,7 +10,8 @@ pairs:
 
     source:
       # iCloud requires an app-specific password, not the account password.
-      url: "imaps://you%40icloud.com@imap.mail.me.com:993"
+      # The username may be written plainly; no percent-encoding needed.
+      url: "imaps://you@icloud.com@imap.mail.me.com:993"
       password:
         env: ICLOUD_APP_PW
 

@@ -36,15 +36,45 @@ func TestEndpointAddress(t *testing.T) {
 			wantHost: "127.0.0.1", wantPort: 1143, wantUser: "you", wantTLS: TLSNone,
 		},
 		{
-			name:     "full email address as username",
+			name:     "percent-encoded email address as username",
 			url:      "imaps://you%40example.com@imap.example.com",
 			wantHost: "imap.example.com", wantPort: 993, wantUser: "you@example.com", wantTLS: TLSImplicit,
+		},
+		{
+			name:     "unencoded email address as username",
+			url:      "imaps://apple@hilli.dk@imap.mail.me.com",
+			wantHost: "imap.mail.me.com", wantPort: 993, wantUser: "apple@hilli.dk", wantTLS: TLSImplicit,
+		},
+		{
+			name:     "unencoded email address with explicit port",
+			url:      "imaps://apple@hilli.dk@imap.mail.me.com:993",
+			wantHost: "imap.mail.me.com", wantPort: 993, wantUser: "apple@hilli.dk", wantTLS: TLSImplicit,
+		},
+		{
+			name:     "ipv6 host without port",
+			url:      "imap+insecure://you@[::1]",
+			wantHost: "::1", wantPort: 143, wantUser: "you", wantTLS: TLSNone,
+		},
+		{
+			name:     "ipv6 host with port",
+			url:      "imap+insecure://you@[::1]:1143",
+			wantHost: "::1", wantPort: 1143, wantUser: "you", wantTLS: TLSNone,
+		},
+		{
+			name:     "trailing slash tolerated",
+			url:      "imaps://you@example.com/",
+			wantHost: "example.com", wantPort: 993, wantUser: "you", wantTLS: TLSImplicit,
 		},
 		{name: "rejects inline password", url: "imaps://you:hunter2@example.com", wantErr: "inline password"},
 		{name: "rejects missing user", url: "imaps://example.com", wantErr: "missing username"},
 		{name: "rejects unknown scheme", url: "pop3://you@example.com", wantErr: "unsupported scheme"},
 		{name: "rejects empty url", url: "", wantErr: "url is required"},
 		{name: "rejects bad port", url: "imaps://you@example.com:99999", wantErr: "invalid port"},
+		{name: "rejects missing scheme", url: "you@example.com", wantErr: "missing scheme"},
+		{name: "rejects empty username", url: "imaps://@example.com", wantErr: "missing username"},
+		{name: "rejects missing host", url: "imaps://you@", wantErr: "missing host"},
+		{name: "rejects a mailbox path", url: "imaps://you@example.com/INBOX", wantErr: "must not contain a path"},
+		{name: "rejects unterminated ipv6", url: "imaps://you@[::1", wantErr: "unterminated IPv6"},
 	}
 
 	for _, tt := range tests {
