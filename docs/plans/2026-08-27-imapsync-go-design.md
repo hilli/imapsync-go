@@ -475,7 +475,7 @@ That single invariant is the tombstone for the duplication bug.
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
-- **M1** — single-connection correct one-way sync + SQLite state.
+- **M1** — single-connection correct one-way sync + SQLite state. *Done.*
 - **M2** — pools, staged pipeline, byte-budget spooling. Parallel folder
   `STATUS` is the first easy win here (§6.3).
 - **M3** — AIMD governor + fault-injection suite.
