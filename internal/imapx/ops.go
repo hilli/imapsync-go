@@ -79,6 +79,7 @@ type SyncOps interface {
 	SearchHeader(ctx context.Context, field, value string) ([]uint32, error)
 	FetchFlags(ctx context.Context, changedSince uint64) ([]FlagSet, error)
 	StoreFlags(ctx context.Context, uid uint32, flags []string) error
+	DeleteMessages(ctx context.Context, uids []uint32) error
 }
 
 // FlagSet is one message's flags, as the server currently has them.
@@ -417,6 +418,45 @@ func (c *conn) SearchHeader(ctx context.Context, field, value string) ([]uint32,
 		return nil, fmt.Errorf("searching for header %s: server returned no search data", field)
 	}
 	return toUint32s(data.AllUIDs()), nil
+}
+
+// ErrNoUIDExpunge means the server cannot remove named messages, only every
+// \Deleted message in the mailbox at once.
+//
+// That distinction is the whole safety of deleting anything. Plain EXPUNGE is
+// defined to remove every message carrying \Deleted, which includes any the
+// account's owner marked themselves and has not yet purged. UIDPLUS adds UID
+// EXPUNGE, which removes only the UIDs named and leaves everything else alone.
+// Without it there is no way to delete our messages without volunteering to
+// delete theirs, so we decline.
+var ErrNoUIDExpunge = errors.New("server does not support UID EXPUNGE (UIDPLUS)")
+
+// DeleteMessages removes the named messages from the selected mailbox.
+//
+// Deletion in IMAP is two steps: mark, then purge. The mark is \Deleted, which
+// on its own changes nothing permanent; the purge is EXPUNGE. Doing only the
+// first would leave the messages visible in most clients and would make the
+// next run see them still there, so this does both.
+func (c *conn) DeleteMessages(ctx context.Context, uids []uint32) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("deleting %d messages: %w", len(uids), err)
+	}
+	if len(uids) == 0 {
+		return nil
+	}
+	if !c.Caps().UIDPlus {
+		return ErrNoUIDExpunge
+	}
+
+	set := toUIDSet(uids)
+	store := &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}
+	if err := c.c.Store(set, store, nil).Close(); err != nil {
+		return fmt.Errorf("marking %d messages deleted: %w", len(uids), err)
+	}
+	if err := c.c.UIDExpunge(set).Close(); err != nil {
+		return fmt.Errorf("expunging %d messages: %w", len(uids), err)
+	}
+	return nil
 }
 
 func toUIDSet(uids []uint32) imap.UIDSet {

@@ -551,3 +551,36 @@ func expectOneRow(res sql.Result, srcUID uint32) error {
 	}
 	return nil
 }
+
+// ForgetMessages drops the rows for messages that are no longer on either side.
+//
+// Once a message has been deleted from the destination because the source no
+// longer lists it, the row describes nothing: the source UID has no message and
+// the destination UID has been expunged. Leaving it would make the next run
+// consider deleting an already-deleted message, and a UID the destination may
+// eventually reissue under a new UIDVALIDITY.
+func (d *DB) ForgetMessages(ctx context.Context, folderID int64, srcUIDValidity uint32, srcUIDs []uint32) error {
+	if len(srcUIDs) == 0 {
+		return nil
+	}
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning forget: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`DELETE FROM messages WHERE folder_id = ? AND src_uidvalidity = ? AND src_uid = ?`)
+	if err != nil {
+		return fmt.Errorf("preparing forget: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, uid := range srcUIDs {
+		if _, err := stmt.ExecContext(ctx, folderID, srcUIDValidity, uid); err != nil {
+			return fmt.Errorf("forgetting message %d: %w", uid, err)
+		}
+	}
+	return tx.Commit()
+}

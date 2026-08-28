@@ -63,6 +63,10 @@ type syncFlags struct {
 	full          bool
 	resyncFlags   bool
 	noResyncFlags bool
+
+	delete2       bool
+	deleteCeiling float64
+	force         bool
 }
 
 func newSyncCmd() *cobra.Command {
@@ -130,6 +134,9 @@ watch for authentication failures.`,
 	// drop-in. The positive one carries the default so --help states it.
 	cmd.Flags().BoolVar(&f.resyncFlags, "resyncflags", true, "bring flags on already-copied messages back into line with the source")
 	cmd.Flags().BoolVar(&f.noResyncFlags, "noresyncflags", false, "leave flags on already-copied messages alone")
+	cmd.Flags().BoolVar(&f.delete2, "delete2", false, "delete destination messages whose source counterpart is gone")
+	cmd.Flags().Float64Var(&f.deleteCeiling, "delete2-ceiling", 0.10, "refuse to delete more than this fraction of a folder's copied messages in one run")
+	cmd.Flags().BoolVar(&f.force, "force", false, "carry out deletions the ceiling would otherwise refuse")
 	cmd.Flags().DurationVar(&f.progressEvery, "progress-interval", 30*time.Second, "how often to report what the sync has done so far; 0 to keep quiet")
 
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
@@ -215,6 +222,9 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		DryRun:        f.dryRun,
 		Full:          f.full,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
+		Delete2:       f.delete2,
+		DeleteCeiling: f.deleteCeiling,
+		Force:         f.force,
 		ProgressEvery: f.progressEvery,
 		Logger:        slog.Default(),
 	}).Run(ctx)
@@ -239,7 +249,70 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 			return fmt.Errorf("folder %q: %w", fr.Source, fr.Err)
 		}
 	}
+	// A refusal is not a failure — nothing went wrong and nothing was lost —
+	// but it is a run that did not do what was asked of it, and a zero exit
+	// would let a scheduled sync report success for months while a folder
+	// quietly stopped being mirrored. The message says what to do about it.
+	if refused := report.Refused(); refused > 0 {
+		return fmt.Errorf("refused to delete %d %s: see above", refused, plural(refused, "message"))
+	}
 	return writeErr
+}
+
+// writeFolderTable prints the per-folder counts.
+//
+// Split out from writeSyncReport only because the columns that appear
+// conditionally — vanished, deleted, refused — each cost two branches, and
+// together they took the report past what the linter will accept in one
+// function.
+func writeFolderTable(p *printer, report syncer.Report, dryRun bool) {
+	t, flush := p.table()
+	copiedHeading := "COPIED"
+	if dryRun {
+		copiedHeading = "TO COPY"
+	}
+	// The vanished column earns its place only when there is something in it.
+	// Most servers never produce one, and a column of zeroes on every report
+	// would be a worse trade than the occasional wider table.
+	vanished := report.Vanished()
+	gone := ""
+	if vanished > 0 {
+		gone = "\tVANISHED"
+	}
+	// Likewise deletion: the column appears when the run was allowed to delete,
+	// not only when it did, because "--delete2 and nothing went" is itself the
+	// answer to the question the flag asks.
+	deleted, refused := report.Deleted(), report.Refused()
+	removals := ""
+	if deleted > 0 || refused > 0 {
+		removals = "\tDELETED"
+		if refused > 0 {
+			removals += "\tREFUSED"
+		}
+	}
+	deletedHeading := removals
+	if dryRun {
+		deletedHeading = strings.Replace(removals, "\tDELETED", "\tTO DELETE", 1)
+	}
+	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY%s%s\tFAILED\n", copiedHeading, gone, deletedHeading)
+	for _, fr := range report.Folders {
+		status := ""
+		if fr.Err != nil {
+			status = "  ← " + fr.Err.Error()
+		}
+		if vanished > 0 {
+			gone = fmt.Sprintf("\t%d", fr.Vanished)
+		}
+		if removals != "" {
+			removals = fmt.Sprintf("\t%d", fr.Deleted)
+			if refused > 0 {
+				removals += fmt.Sprintf("\t%d", fr.Refused)
+			}
+		}
+		t.printf("%s\t%s\t%d\t%d\t%d\t%d%s%s\t%d%s\n",
+			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone, gone, removals, fr.Failed, status)
+	}
+	flush()
 }
 
 // syncEndpoints resolves the two sides, from a config file or from flags.
@@ -460,32 +533,9 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 			verb, len(report.Created), plural(len(report.Created), "folder"), strings.Join(report.Created, ", "))
 	}
 
-	t, flush := p.table()
-	copiedHeading := "COPIED"
-	if dryRun {
-		copiedHeading = "TO COPY"
-	}
-	// The vanished column earns its place only when there is something in it.
-	// Most servers never produce one, and a column of zeroes on every report
-	// would be a worse trade than the occasional wider table.
 	vanished := report.Vanished()
-	gone := ""
-	if vanished > 0 {
-		gone = "\tVANISHED"
-	}
-	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY%s\tFAILED\n", copiedHeading, gone)
-	for _, fr := range report.Folders {
-		status := ""
-		if fr.Err != nil {
-			status = "  ← " + fr.Err.Error()
-		}
-		if vanished > 0 {
-			gone = fmt.Sprintf("\t%d", fr.Vanished)
-		}
-		t.printf("%s\t%s\t%d\t%d\t%d\t%d%s\t%d%s\n",
-			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone, gone, fr.Failed, status)
-	}
-	flush()
+	deleted, refused := report.Deleted(), report.Refused()
+	writeFolderTable(p, report, dryRun)
 
 	copied, adopted, failed := report.Totals()
 	copiedWord := "copied"
@@ -496,6 +546,13 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if vanished > 0 {
 		goneWord = fmt.Sprintf("%d vanished, ", vanished)
 	}
+	if deleted > 0 {
+		verb := "deleted"
+		if dryRun {
+			verb = "to delete"
+		}
+		goneWord += fmt.Sprintf("%d %s, ", deleted, verb)
+	}
 	p.printf("\n%d %s, %d %s, %d adopted, %s%d failed, in %s%s\n",
 		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, goneWord, failed,
 		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
@@ -503,6 +560,20 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if vanished > 0 {
 		p.printf("\n%d %s the source listed but had no message for. Nothing was lost:\nthere is nothing at those numbers to copy, and they will not be asked for again.\n",
 			vanished, plural(vanished, "UID"))
+	}
+
+	// A refusal is the one thing here that asks the reader to do something, so
+	// it says which folders and what to do about it rather than leaving a
+	// number in a column to be noticed.
+	if refused > 0 {
+		p.printf("\nREFUSED to delete %d %s. That is a larger share of a folder's copied\nmessages than --delete2-ceiling allows to go in one run, and the usual cause is a\nsource that answered a listing with less than the truth.\n",
+			refused, plural(refused, "message"))
+		for _, fr := range report.Folders {
+			if fr.Refused > 0 {
+				p.printf("  %s: %d of %d\n", fr.Dest, fr.Refused, fr.Refused+fr.AlreadyDone+fr.Copied)
+			}
+		}
+		p.println("\nCheck the source, then pass --force to go ahead, or raise --delete2-ceiling.")
 	}
 
 	// Skips the caller asked for are not news: narrowing a 144-folder account

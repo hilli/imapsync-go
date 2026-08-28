@@ -104,6 +104,26 @@ type Options struct {
 	// waiting for someone to construct Options without thinking about it.
 	NoResyncFlags bool
 
+	// Delete2 removes destination messages whose source counterpart is gone.
+	//
+	// It only ever touches messages this tool copied and recorded. Mail that
+	// was on the destination before the first sync has no row in the state
+	// database, so it is not a candidate however long it sits there — which is
+	// narrower than imapsync's --delete2, deliberately.
+	Delete2 bool
+
+	// DeleteCeiling is the fraction of a folder's recorded messages that may be
+	// deleted in one run before the run refuses and asks to be told again.
+	// Zero means defaultDeleteCeiling.
+	//
+	// The failure it exists to catch is a source that answers a UID listing
+	// with nothing, or with a fraction of the truth. Copying nothing is
+	// harmless and self-correcting; deleting everything is neither.
+	DeleteCeiling float64
+
+	// Force carries out deletions the ceiling would otherwise refuse.
+	Force bool
+
 	// ProgressEvery is how often the run says what it has done so far. Zero
 	// silences it, which is the right default for a caller that has its own
 	// idea of what to report; the command line sets its own interval.
@@ -188,6 +208,13 @@ type FolderReport struct {
 	// Reflagged is how many had their flags brought back into line on the
 	// destination without being copied again.
 	Reflagged int
+	// Deleted is how many were removed from the destination because the source
+	// no longer has them.
+	Deleted int
+	// Refused is how many deletions the safety ceiling declined to carry out.
+	// They are not failures: nothing went wrong, and the run is asking to be
+	// told again rather than guessing.
+	Refused int
 	// Failed is how many were abandoned; see Errors.
 	Failed int
 
@@ -217,6 +244,24 @@ func (r Report) Vanished() int {
 	n := 0
 	for _, f := range r.Folders {
 		n += f.Vanished
+	}
+	return n
+}
+
+// Deleted is how many messages the run removed from the destination.
+func (r Report) Deleted() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Deleted
+	}
+	return n
+}
+
+// Refused is how many deletions the safety ceiling declined to carry out.
+func (r Report) Refused() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Refused
 	}
 	return n
 }
@@ -661,6 +706,18 @@ func (l *live) vanished(n int) {
 	l.mu.Unlock()
 }
 
+func (l *live) deleted(n int) {
+	l.mu.Lock()
+	l.report.Deleted += n
+	l.mu.Unlock()
+}
+
+func (l *live) refused(n int) {
+	l.mu.Lock()
+	l.report.Refused += n
+	l.mu.Unlock()
+}
+
 func (l *live) reflagged() {
 	l.mu.Lock()
 	l.report.Reflagged++
@@ -707,6 +764,29 @@ type prepared struct {
 	// skipped folder into STOREs issued on a connection that never selected the
 	// mailbox.
 	skipped bool
+	// live is the source UIDs as the server listed them, sorted, kept only when
+	// deletion is on. Deletion asks the opposite question from copying — not
+	// "what is here that we lack" but "what have we got that is no longer
+	// there" — and that needs the listing itself, not the difference.
+	live []uint32
+	// mirror is the message map, loaded at most once. Both the flag resync and
+	// the deletion pass want it, and on a folder of 414,000 messages reading it
+	// twice is a cost worth one field.
+	mirror []state.Mirror
+	loaded bool
+}
+
+// mirrored reads the folder's message map, once.
+func (s *Syncer) mirrored(ctx context.Context, p *prepared) ([]state.Mirror, error) {
+	if p.loaded {
+		return p.mirror, nil
+	}
+	rows, err := s.db.Mirrored(ctx, p.folderID, p.src.UIDValidity, p.dst.UIDValidity)
+	if err != nil {
+		return nil, err
+	}
+	p.mirror, p.loaded = rows, true
+	return rows, nil
 }
 
 // syncFolder copies one mailbox.
@@ -728,6 +808,10 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	}
 
 	if err := s.resyncFlags(ctx, pair, p, lv); err != nil {
+		return lv.snapshot(), err
+	}
+
+	if err := s.deleteVanished(ctx, pair, p, lv); err != nil {
 		return lv.snapshot(), err
 	}
 
@@ -791,7 +875,7 @@ func (s *Syncer) resyncFlags(ctx context.Context, pair folder.Pair, p *prepared,
 	// dst_uid we hold names a message that no longer exists, and a STORE
 	// against one would land on whatever occupies that number now. Mirrored
 	// returns nothing in that case, which ends the work here.
-	mirrors, err := s.db.Mirrored(ctx, p.folderID, p.src.UIDValidity, p.dst.UIDValidity)
+	mirrors, err := s.mirrored(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -1008,6 +1092,14 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 
 	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox, since: watermark(row, kept)}
 	p.todo = triage(uids, known, lv)
+	if s.opts.Delete2 {
+		// Sorted so the deletion pass can ask "is this UID still there" by
+		// binary search rather than by building a second map the size of the
+		// mailbox. Most servers list in order already; sorting a sorted slice
+		// costs a scan.
+		slices.Sort(uids)
+		p.live = uids
+	}
 
 	// Nothing below reads the source, and indexing a large destination can take
 	// a while. Handing the connection back now lets another folder use it.
@@ -1257,6 +1349,143 @@ func (s *Syncer) markGone(ctx context.Context, p *prepared, chunk []uint32, meta
 	}
 	return nil
 }
+
+// defaultDeleteCeiling is the fraction of a folder's recorded messages that may
+// be deleted in one run without being asked twice.
+const defaultDeleteCeiling = 0.10
+
+// defaultDeleteFloor is the number of messages a folder may always lose,
+// whatever share of it they are.
+//
+// A proportion is meaningless on small numbers. One message out of six is 16.7%
+// and would trip a 10% ceiling, but one message out of six leaving a mailbox is
+// the single most ordinary thing that happens to mail. A guard that fires on
+// the ordinary case gets --force written into the cron line permanently, and
+// then it is not a guard at all. So a small absolute number of deletions is
+// always allowed: a source that lies about a six-message folder costs you six
+// messages, while one that lies about a four-hundred-thousand-message folder is
+// the disaster actually worth stopping, and that one is nowhere near the floor.
+const defaultDeleteFloor = 10
+
+// condemned reports which recorded messages the source no longer lists, and
+// whether the safety ceiling will let them go.
+//
+// Both the real run and the dry run go through here, which is the only reason
+// the dry run is worth anything: a preview computed by a second implementation
+// previews that implementation.
+func (s *Syncer) condemned(mirrors []state.Mirror, live []uint32) (victims []state.Mirror, allowed bool, share float64) {
+	for _, m := range mirrors {
+		if _, found := slices.BinarySearch(live, m.SrcUID); !found {
+			victims = append(victims, m)
+		}
+	}
+	if len(victims) == 0 || len(mirrors) == 0 {
+		return victims, true, 0
+	}
+
+	// The denominator is what we manage, not what the folder holds. The failure
+	// this catches is a source that answers a UID listing with nothing or with
+	// a fraction of the truth, and that shows up as a large share of the
+	// message map going at once — which a destination-sized denominator would
+	// dilute into looking reasonable.
+	share = float64(len(victims)) / float64(len(mirrors))
+	if len(victims) <= defaultDeleteFloor {
+		return victims, true, share
+	}
+	return victims, share <= s.ceiling() || s.opts.Force, share
+}
+
+// deleteVanished removes destination messages whose source counterpart is gone.
+//
+// The question is asked only of messages this tool copied and recorded. Mail
+// that was on the destination before the first sync has no row here, so no
+// amount of divergence makes it a candidate. That is narrower than imapsync's
+// --delete2, which will empty a destination of anything the source lacks, and
+// the narrowness is the point: the state database is the only record of what we
+// are actually responsible for.
+func (s *Syncer) deleteVanished(ctx context.Context, pair folder.Pair, p *prepared, lv *live) (err error) {
+	// p.skipped is a barrier, like the one in resyncFlags. No test can
+	// distinguish it: a fast-pathed folder never reached the code that gathers
+	// the source listing, and its zero destination mailbox makes the message
+	// map come back empty, so nothing would be nominated anyway. It is kept
+	// against a later change that populates either of those earlier, which
+	// would otherwise turn "the server says nothing has changed" into a folder
+	// full of deletions.
+	if !s.opts.Delete2 || p.skipped {
+		return nil
+	}
+	// A folder that could not copy everything is a folder whose picture of the
+	// source is already known to be incomplete. Deleting from it is exactly the
+	// wrong response to that.
+	if lv.report.Failed > 0 {
+		s.log.Warn("not deleting from a folder that failed to copy everything",
+			"dest", pair.Dest, "failed", lv.report.Failed)
+		return nil
+	}
+
+	mirrors, err := s.mirrored(ctx, p)
+	if err != nil {
+		return err
+	}
+
+	doomed, allowed, share := s.condemned(mirrors, p.live)
+	if len(doomed) == 0 {
+		return nil
+	}
+	if !allowed {
+		lv.refused(len(doomed))
+		s.log.Error("refusing to delete this many messages at once",
+			"dest", pair.Dest, "would_delete", len(doomed), "of", len(mirrors),
+			"share", pct(share), "ceiling", pct(s.ceiling()))
+		return nil
+	}
+
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection for deletion: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	dst := lease.Conn()
+
+	if _, err = dst.Select(ctx, pair.Dest, imapx.SelectOptions{}); err != nil {
+		return fmt.Errorf("selecting destination mailbox for deletion: %w", err)
+	}
+
+	uids := make([]uint32, 0, len(doomed))
+	forget := make([]uint32, 0, len(doomed))
+	for _, m := range doomed {
+		uids = append(uids, m.DstUID)
+		forget = append(forget, m.SrcUID)
+	}
+
+	if err = dst.DeleteMessages(ctx, uids); err != nil {
+		return fmt.Errorf("deleting %d messages from %q: %w", len(uids), pair.Dest, err)
+	}
+
+	// Only now. A row removed before the expunge that followed it failed would
+	// leave a message on the destination that nothing remembers putting there,
+	// and so nothing would ever remove.
+	write, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateWriteGrace)
+	defer cancel()
+	if err = s.db.ForgetMessages(write, p.folderID, p.src.UIDValidity, forget); err != nil {
+		return err
+	}
+
+	lv.deleted(len(doomed))
+	s.log.Info("deleted messages the source no longer has",
+		"dest", pair.Dest, "messages", len(doomed))
+	return nil
+}
+
+// ceiling is the configured deletion ceiling, or the default.
+func (s *Syncer) ceiling() float64 {
+	if s.opts.DeleteCeiling == 0 {
+		return defaultDeleteCeiling
+	}
+	return s.opts.DeleteCeiling
+}
+
+func pct(f float64) string { return fmt.Sprintf("%.1f%%", f*100) }
 
 // chunkMeta reads the headers that open a chunk, retrying on a fresh
 // connection.
@@ -1639,7 +1868,55 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 			fr.Copied++
 		}
 	}
+
+	if s.opts.Delete2 {
+		if err := s.dryRunDeletions(ctx, pair, row.ID, srcBox, uids, &fr); err != nil {
+			return fr, err
+		}
+	}
 	return fr, nil
+}
+
+// dryRunDeletions works out what a real run would remove, and says so without
+// removing it.
+//
+// This costs a destination connection that a dry run would otherwise not need,
+// and it is worth it: the whole point of previewing a destructive run is to see
+// the destruction. It selects read-only, because the UIDVALIDITY it reads is
+// half the question — if the destination has been renumbered, the real run
+// would find no message map and delete nothing, and so must this.
+func (s *Syncer) dryRunDeletions(ctx context.Context, pair folder.Pair, folderID int64, srcBox imapx.Mailbox, uids []uint32, fr *FolderReport) (err error) {
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	dstBox, err := lease.Conn().Select(ctx, pair.Dest, imapx.SelectOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+
+	mirrors, err := s.db.Mirrored(ctx, folderID, srcBox.UIDValidity, dstBox.UIDValidity)
+	if err != nil {
+		return err
+	}
+
+	live := slices.Clone(uids)
+	slices.Sort(live)
+	doomed, allowed, share := s.condemned(mirrors, live)
+	if len(doomed) == 0 {
+		return nil
+	}
+	if !allowed {
+		fr.Refused = len(doomed)
+		s.log.Error("would refuse to delete this many messages at once",
+			"dest", pair.Dest, "would_delete", len(doomed), "of", len(mirrors),
+			"share", pct(share), "ceiling", pct(s.ceiling()))
+		return nil
+	}
+	fr.Deleted = len(doomed)
+	return nil
 }
 
 // fail records an abandoned copy and keeps the run going.

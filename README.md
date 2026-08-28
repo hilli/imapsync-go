@@ -266,6 +266,58 @@ INBOX would re-request ninety thousand headers on every single run, for ever.
 The same column counts messages genuinely deleted from the source between the
 moment the run listed them and the moment it went to read them.
 
+### Deleting what the source no longer has
+
+By default nothing is ever deleted: `sync` only adds. `--delete2` asks for the
+destination to follow the source when mail leaves it.
+
+```console
+imapsync-go sync --source-url ... --dest-url ... --delete2
+```
+
+It deletes **only messages this tool copied and recorded**. Mail that was on the
+destination before the first sync has no entry in the state database, so no
+amount of divergence makes it a candidate. This is deliberately narrower than
+imapsync's `--delete2`, which will empty a destination of anything the source
+lacks. The state database is the only record of what this tool is actually
+responsible for, and it will not delete mail it cannot account for putting
+there.
+
+Deleting needs UIDPLUS, and the run stops rather than working around a server
+that lacks it. Plain `EXPUNGE` purges *every* message in the mailbox flagged
+`\Deleted`, including ones you flagged by hand in your own mail client, so
+`UID EXPUNGE` is required rather than merely preferred.
+
+There is a safety valve. A source that answers a UID listing with nothing, or
+with a fraction of the truth, looks exactly like a source whose mail has been
+deleted — and the response to those two is very different. So a run refuses to
+delete more than a tenth of a folder's copied messages at once:
+
+```
+REFUSED to delete 47 messages. That is a larger share of a folder's copied
+messages than --delete2-ceiling allows to go in one run, and the usual cause is a
+source that answered a listing with less than the truth.
+  Archive: 47 of 312
+
+Check the source, then pass --force to go ahead, or raise --delete2-ceiling.
+```
+
+A refusal is not a failure and nothing is lost, but the run exits non-zero, so a
+scheduled sync cannot quietly stop mirroring a folder while still reporting
+success. `--force` carries out the deletions anyway, and `--delete2-ceiling`
+moves the line.
+
+A handful of messages is always allowed through whatever share of the folder
+they are, because one message out of six is 16.7% and refusing that would mean
+`--force` living permanently in your cron line — at which point the ceiling is
+protecting nothing.
+
+`--dry-run` reports what would be deleted without touching anything, and it
+computes it with the same code the real run uses, including the ceiling.
+
+Folders are left alone entirely if anything in them failed to copy, or if the
+server said nothing in them had changed.
+
 ### Choosing folders
 
 | Flag | Effect |

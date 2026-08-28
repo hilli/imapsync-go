@@ -680,7 +680,76 @@ Worth revisiting only if a measurement, rather than an argument, calls for it.
 
 Destructive operations (`--delete2`, `--delete1`, expunge) require explicit
 opt-in **and** pass a safety valve: a run that would delete more than a threshold
-(default 10%) of a folder aborts with a diff summary unless `--force` is given.
+(default 10%) of a folder refuses unless `--force` is given.
+
+### 7.1 What `--delete2` deletes — as built
+
+Only messages this tool copied and recorded. The state database is the sole
+record of what we are responsible for; destination mail with no row cannot be
+nominated however far it diverges from the source. This is narrower than
+imapsync's `--delete2`, which empties a destination of anything the source
+lacks. A strict mirror stays addable later — the narrow behaviour is a subset of
+it, so nothing is foreclosed.
+
+One nuance: a destination message byte-identical to a source message is
+*adopted* on the first run, recorded as the copy that would otherwise have been
+made. From then on it is ours, and deleting it when the source loses it is
+correct. The promise is about mail with no source counterpart, not about mail
+that arrived by another route.
+
+**UIDPLUS is required, not preferred.** Plain `EXPUNGE` is defined to purge
+every `\Deleted` message in the mailbox, including ones the account owner
+flagged by hand in their own client. `DeleteMessages` therefore returns
+`ErrNoUIDExpunge` rather than falling back to it. A mutation swapping
+`UID EXPUNGE` for `EXPUNGE` confirmed this empirically by destroying a
+bystander's message.
+
+### 7.2 The valve has a floor as well as a ceiling
+
+The denominator is what we manage, not what the destination folder holds. The
+failure being guarded against is a source that answers a UID listing with
+nothing or a fraction of the truth, which shows up as a large share of the
+*message map* going at once; a destination-sized denominator would dilute that
+into looking reasonable.
+
+A proportion alone is not enough. One message out of six is 16.7% and would trip
+a 10% ceiling, but that is the most ordinary thing that happens to mail. A guard
+that fires on the ordinary case gets `--force` written into the cron line
+permanently, and then it is not a guard. So a small absolute number of deletions
+(10) is always allowed. A source that lies about a six-message folder costs six
+messages; the disaster worth stopping is the one that lies about a
+four-hundred-thousand-message folder, and that is nowhere near the floor.
+
+This was found by a test, not by reasoning: the first CLI test of the happy path
+refused to delete a single message from a six-message folder.
+
+### 7.3 Ordering and barriers
+
+`ForgetMessages` runs only *after* `DeleteMessages` succeeds, on a
+`context.WithoutCancel` timeout. A row removed before a failed expunge would
+leave a message on the destination that nothing remembers putting there, and so
+nothing would ever remove.
+
+Deletion is skipped for a folder that failed to copy anything (its picture of
+the source is already known to be incomplete) and for a fast-pathed folder.
+
+Both the real run and the dry run go through `condemned()`. A preview computed
+by a second implementation previews that implementation. The dry run costs a
+destination connection it would not otherwise need, and selects read-only,
+because the destination UIDVALIDITY is half the question: if the destination was
+renumbered the real run finds no message map and deletes nothing, so the preview
+must agree.
+
+A refusal is not a failure — nothing went wrong and nothing was lost — but it
+exits non-zero, because a zero exit would let a scheduled sync report success
+for months while a folder quietly stopped being mirrored.
+
+### 7.4 The fast path does not hide deletions
+
+Checked rather than assumed: RFC 7162 requires any server storing modsequences
+to increment HIGHESTMODSEQ when at least one message is permanently removed. A
+source expunge therefore wakes the folder, and `--delete2` needs no `--full`
+implication. iCloud advertises QRESYNC, confirmed with our own `probe`.
 
 ## 8. Surface
 
@@ -909,6 +978,40 @@ rows under the *new* numbering — where they could not appear whether they had
 been deleted or not. Every read is scoped by UIDVALIDITY, so the assertion had to
 be made under the old one to mean anything.
 
+### 9.6 What mutation testing found in `--delete2`
+
+Eighteen mutations, sixteen caught. The two survivors are documented barriers,
+not gaps: removing the `p.skipped` guard from `deleteVanished` changes nothing
+observable, because a fast-pathed folder has a zero destination mailbox and so
+an empty message map anyway. It is kept against a later change that populates
+either earlier, which would turn "the server says nothing has changed" into a
+folder full of deletions.
+
+**A test that passed for the wrong reason.** Dropping the `!s.opts.Delete2`
+guard survived: with deletion off, the source listing is nil, so *everything*
+looked doomed — and the ceiling refused it. The test asserted `Deleted == 0` and
+passed. Fixed by also asserting `Refused == 0`: "off" has to mean the machinery
+never ran, not that a second guard caught it.
+
+**A harness that could not fail.** Comparing `DstUID` instead of `SrcUID`
+against the source listing survived because the fixture gave both sides
+identical UID numbering. That mutation deletes *arbitrary innocent messages* on
+a real server. The harness now stuffs five throwaway messages into the
+destination and expunges them, so the two sides number differently and the
+confusion is visible.
+
+**A fixture that proved the opposite of its name.** The test that deletion never
+touches mail it did not put there seeded the destination using the helper that
+names messages after the mailbox — producing "strangers" byte-identical to
+source messages, which were duly adopted, and then correctly deleted. Genuine
+strangers need genuinely different content.
+
+**A destructive query nothing pinned.** `ForgetMessages` ignoring its
+UIDVALIDITY argument survived, because fencing means two numberings never
+coexist in practice. Asserted anyway: the statement is a `DELETE`, and the cost
+of discovering later that it was scoped too widely is measured in other people's
+mail.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
@@ -923,7 +1026,8 @@ be made under the old one to mean anything.
   fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
   `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder
   `STATUS` was cut, because it is a `probe` cost and not a sync one — see below.
-- **M5** — `compat` shim, `--delete2` + safety valve, progress UI.
+- **M5** — `compat` shim, `--delete2` + safety valve (**done**, §7.1–7.4, §9.6),
+  progress UI (dropped: M3 already logs progress and a rate).
 - **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
   unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:
   Dovecot, Gmail, Microsoft 365, Cyrus.

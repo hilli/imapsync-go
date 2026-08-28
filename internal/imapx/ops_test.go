@@ -559,3 +559,134 @@ func TestFetchFlagsReadsTheWholeMailbox(t *testing.T) {
 		}
 	}
 }
+
+// appendTo puts a message in the mailbox and returns the UID it landed on.
+func appendTo(t *testing.T, conn imapx.Conn, subject string) uint32 {
+	t.Helper()
+
+	body := testMessage(subject, subject+"@example.test")
+	res, err := conn.Append(context.Background(), "INBOX", imapx.AppendMessage{
+		Size:         int64(len(body)),
+		InternalDate: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC),
+		Body:         bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("Append(%q) error = %v", subject, err)
+	}
+	if !res.Assigned() {
+		t.Fatalf("Append(%q) returned no APPENDUID", subject)
+	}
+	return res.UID
+}
+
+// TestDeleteMessagesRemovesOnlyWhatItWasGiven.
+//
+// The message marked \Deleted by hand is the point. A plain EXPUNGE is defined
+// to purge every message carrying that flag, so a tool that deleted its own
+// messages that way would silently purge whatever the account's owner had
+// marked and not yet got round to.
+func TestDeleteMessagesRemovesOnlyWhatItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, rev2Caps())
+	conn := dialMem(t, addr)
+
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	doomed := appendTo(t, conn, "doomed")
+	theirs := appendTo(t, conn, "marked by hand")
+	keep := appendTo(t, conn, "keep")
+
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("re-Select() error = %v", err)
+	}
+	if err := conn.StoreFlags(ctx, theirs, []string{"\\Deleted"}); err != nil {
+		t.Fatalf("StoreFlags() error = %v", err)
+	}
+
+	if err := conn.DeleteMessages(ctx, []uint32{doomed}); err != nil {
+		t.Fatalf("DeleteMessages() error = %v", err)
+	}
+
+	left, err := conn.AllUIDs(ctx)
+	if err != nil {
+		t.Fatalf("AllUIDs() error = %v", err)
+	}
+	if slices.Contains(left, doomed) {
+		t.Errorf("UID %d survived deletion", doomed)
+	}
+	if !slices.Contains(left, theirs) {
+		t.Errorf("UID %d was purged, but it was marked \\Deleted by someone else and never named", theirs)
+	}
+	if !slices.Contains(left, keep) {
+		t.Errorf("UID %d was purged and was never named or marked", keep)
+	}
+}
+
+// TestDeleteMessagesRefusesWithoutUIDPlus.
+//
+// Refusing is the only safe answer. Without UID EXPUNGE there is no way to purge
+// our messages without also purging every other \Deleted message in the mailbox,
+// and quietly doing the destructive thing is not a fallback.
+func TestDeleteMessagesRefusesWithoutUIDPlus(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, imap.CapSet{imap.CapIMAP4rev1: {}})
+	conn := dialMem(t, addr)
+
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	uid := appendTo(t, conn, "should survive")
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("re-Select() error = %v", err)
+	}
+
+	err := conn.DeleteMessages(ctx, []uint32{uid})
+	if !errors.Is(err, imapx.ErrNoUIDExpunge) {
+		t.Fatalf("DeleteMessages() error = %v, want ErrNoUIDExpunge", err)
+	}
+
+	left, err := conn.AllUIDs(ctx)
+	if err != nil {
+		t.Fatalf("AllUIDs() error = %v", err)
+	}
+	if !slices.Contains(left, uid) {
+		t.Errorf("UID %d was deleted by a refusal", uid)
+	}
+}
+
+// TestDeleteMessagesOfNothingTouchesNothing guards the empty set, which is the
+// common case on a mirror that is up to date. A UID set built from no UIDs is
+// "1:*" in some encodings, which would purge the mailbox.
+func TestDeleteMessagesOfNothingTouchesNothing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, rev2Caps())
+	conn := dialMem(t, addr)
+
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	appendTo(t, conn, "bystander one")
+	appendTo(t, conn, "bystander two")
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("re-Select() error = %v", err)
+	}
+
+	if err := conn.DeleteMessages(ctx, nil); err != nil {
+		t.Fatalf("DeleteMessages(nil) error = %v", err)
+	}
+
+	left, err := conn.AllUIDs(ctx)
+	if err != nil {
+		t.Fatalf("AllUIDs() error = %v", err)
+	}
+	if len(left) != 2 {
+		t.Errorf("deleting nothing left %d of 2 messages", len(left))
+	}
+}

@@ -701,3 +701,45 @@ func TestAGoneUIDIsRememberedButNotForEver(t *testing.T) {
 		t.Errorf("%d rows survived renumbering, want 0: a tombstone outlived the numbering it was written under", len(after))
 	}
 }
+
+// TestForgettingIsScopedToOneNumbering pins the reach of a destructive query.
+//
+// Fencing means two UIDVALIDITIES never coexist for a folder in practice, so
+// nothing observable depends on this today. It is asserted anyway because the
+// statement is a DELETE, and the cost of finding out later that it was scoped
+// too widely is measured in other people's mail.
+func TestForgettingIsScopedToOneNumbering(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	folder, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder() error = %v", err)
+	}
+	for _, validity := range []uint32{100, 200} {
+		if err := db.MarkGone(ctx, folder.ID, validity, 7); err != nil {
+			t.Fatalf("MarkGone(%d) error = %v", validity, err)
+		}
+	}
+
+	if err := db.ForgetMessages(ctx, folder.ID, 100, []uint32{7}); err != nil {
+		t.Fatalf("ForgetMessages() error = %v", err)
+	}
+
+	gone, err := db.SyncedUIDs(ctx, folder.ID, 100)
+	if err != nil {
+		t.Fatalf("SyncedUIDs(100) error = %v", err)
+	}
+	if len(gone) != 0 {
+		t.Errorf("%d rows survived at the numbering that was forgotten", len(gone))
+	}
+	kept, err := db.SyncedUIDs(ctx, folder.ID, 200)
+	if err != nil {
+		t.Fatalf("SyncedUIDs(200) error = %v", err)
+	}
+	if len(kept) != 1 {
+		t.Errorf("%d rows left at the other numbering, want 1: the delete reached past its own", len(kept))
+	}
+}

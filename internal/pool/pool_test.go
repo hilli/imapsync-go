@@ -92,6 +92,8 @@ func (f *fakeConn) FetchFlags(context.Context, uint64) ([]imapx.FlagSet, error) 
 
 func (f *fakeConn) StoreFlags(context.Context, uint32, []string) error { return nil }
 
+func (f *fakeConn) DeleteMessages(context.Context, []uint32) error { return nil }
+
 // dialer hands out fakeConns and counts how many it was asked for.
 type dialer struct {
 	mu     sync.Mutex
