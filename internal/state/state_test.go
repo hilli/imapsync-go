@@ -346,7 +346,7 @@ func TestMarkSyncedRoundTripsModSeq(t *testing.T) {
 	const modSeq = uint64(406622125881845)
 
 	at := time.Unix(1700000000, 0).UTC()
-	if err := db.MarkSynced(ctx, f.ID, modSeq, at); err != nil {
+	if err := db.MarkSynced(ctx, f.ID, modSeq, 0, at); err != nil {
 		t.Fatalf("MarkSynced() error = %v", err)
 	}
 
@@ -376,7 +376,7 @@ func TestARenumberedFolderKeepsNoWatermark(t *testing.T) {
 	db := openTestDB(t)
 	f := seedFolder(t, db, 111, 222)
 
-	if err := db.MarkSynced(ctx, f.ID, 900, time.Unix(1700000000, 0)); err != nil {
+	if err := db.MarkSynced(ctx, f.ID, 900, 0, time.Unix(1700000000, 0)); err != nil {
 		t.Fatalf("MarkSynced() error = %v", err)
 	}
 
@@ -407,10 +407,10 @@ func TestMarkSyncedTreatsZeroAsNoNews(t *testing.T) {
 	db := openTestDB(t)
 	f := seedFolder(t, db, 111, 222)
 
-	if err := db.MarkSynced(ctx, f.ID, 500, time.Unix(1700000000, 0)); err != nil {
+	if err := db.MarkSynced(ctx, f.ID, 500, 0, time.Unix(1700000000, 0)); err != nil {
 		t.Fatalf("MarkSynced() error = %v", err)
 	}
-	if err := db.MarkSynced(ctx, f.ID, 0, time.Unix(1700000100, 0)); err != nil {
+	if err := db.MarkSynced(ctx, f.ID, 0, 0, time.Unix(1700000100, 0)); err != nil {
 		t.Fatalf("MarkSynced() error = %v", err)
 	}
 

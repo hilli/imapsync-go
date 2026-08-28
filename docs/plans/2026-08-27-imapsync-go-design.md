@@ -744,7 +744,30 @@ A refusal is not a failure — nothing went wrong and nothing was lost — but i
 exits non-zero, because a zero exit would let a scheduled sync report success
 for months while a folder quietly stopped being mirrored.
 
-### 7.4 The fast path does not hide deletions
+### 7.4 Copying and deleting are watermarked separately
+
+Found by verifying against real servers, not by tests. The stored modseq meant
+one thing — "everything the source held at that point is on the destination" —
+which is a statement about copying only. A run without `--delete2` advances it
+while carrying out no deletions at all, so the next run *with* `--delete2` found
+the folder unchanged, skipped it, and lost those deletions permanently. Only
+`--full` recovered them.
+
+That fires on the most natural way to adopt the flag: sync for months, then add
+`--delete2`. Every folder's watermark is current, so nothing is ever deleted.
+
+Folders therefore carry `src_deleted_through` alongside `src_highestmodseq`, and
+the fast path may skip a folder only if deletions have been carried out through
+the same point. A refused deletion does not advance it either — otherwise the
+safety valve would turn into the failure it exists to catch, the folder looking
+settled and never being offered again.
+
+This needed the first schema migration. `CREATE TABLE IF NOT EXISTS` does
+nothing to a table that already exists, and an existing state database is
+exactly the one with something to lose, so `Open` now applies `ALTER TABLE`
+statements and treats "duplicate column name" as success.
+
+### 7.5 The fast path does not hide deletions
 
 Checked rather than assumed: RFC 7162 requires any server storing modsequences
 to increment HIGHESTMODSEQ when at least one message is permanently removed. A

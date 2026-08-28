@@ -763,7 +763,7 @@ func TestRecoveryFindsAStampedCopy(t *testing.T) {
 		t.Fatalf("FenceUIDValidity() error = %v", err)
 	}
 	// A completed sync, so the bulk index is out of the picture.
-	if err := h.db.MarkSynced(ctx, f.ID, 0, time.Now()); err != nil {
+	if err := h.db.MarkSynced(ctx, f.ID, 0, 0, time.Now()); err != nil {
 		t.Fatalf("MarkSynced() error = %v", err)
 	}
 	if err := h.db.BeginAppend(ctx, state.Message{

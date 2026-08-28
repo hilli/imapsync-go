@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure Go driver, registered as "sqlite"
@@ -47,7 +48,11 @@ type Folder struct {
 	SrcUIDValidity   uint32
 	DstUIDValidity   uint32
 	SrcHighestModSeq uint64
-	LastSync         time.Time
+	// SrcDeletedThrough is the source modseq up to which deletions have been
+	// carried out on the destination. It is not the same as SrcHighestModSeq:
+	// a run that was not asked to delete advances one and not the other.
+	SrcDeletedThrough uint64
+	LastSync          time.Time
 }
 
 // Message is one message copy, keyed by its source identity.
@@ -88,6 +93,7 @@ CREATE TABLE IF NOT EXISTS folders (
   src_uidvalidity    INTEGER NOT NULL DEFAULT 0,
   dst_uidvalidity    INTEGER NOT NULL DEFAULT 0,
   src_highestmodseq  INTEGER NOT NULL DEFAULT 0,
+  src_deleted_through INTEGER NOT NULL DEFAULT 0,
   last_sync          INTEGER NOT NULL DEFAULT 0,
   UNIQUE (pair_id, source)
 );
@@ -138,7 +144,34 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("applying schema to %s: %w", path, err)
 	}
+	if err := migrate(ctx, sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("migrating %s: %w", path, err)
+	}
 	return &DB{db: sqlDB}, nil
+}
+
+// migrations are applied to databases created before a column existed.
+//
+// CREATE TABLE IF NOT EXISTS does nothing to a table that is already there, so
+// a column added to the schema above never reaches an existing state database —
+// and an existing database is precisely the one that has something to lose.
+var migrations = []string{
+	`ALTER TABLE folders ADD COLUMN src_deleted_through INTEGER NOT NULL DEFAULT 0`,
+}
+
+// migrate applies each migration, treating a column that is already there as
+// success. SQLite has no ADD COLUMN IF NOT EXISTS, so the error is the check.
+func migrate(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range migrations {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	return nil
 }
 
 // Close releases the database.
@@ -161,7 +194,7 @@ ON CONFLICT (pair_id, source) DO UPDATE SET dest = excluded.dest`
 	}
 
 	const query = `
-SELECT id, pair_id, source, dest, src_uidvalidity, dst_uidvalidity, src_highestmodseq, last_sync
+SELECT id, pair_id, source, dest, src_uidvalidity, dst_uidvalidity, src_highestmodseq, src_deleted_through, last_sync
 FROM folders WHERE pair_id = ? AND source = ?`
 
 	var (
@@ -170,7 +203,7 @@ FROM folders WHERE pair_id = ? AND source = ?`
 	)
 	err := d.db.QueryRowContext(ctx, query, pairID, source).Scan(
 		&f.ID, &f.PairID, &f.Source, &f.Dest,
-		&f.SrcUIDValidity, &f.DstUIDValidity, &f.SrcHighestModSeq, &lastSync,
+		&f.SrcUIDValidity, &f.DstUIDValidity, &f.SrcHighestModSeq, &f.SrcDeletedThrough, &lastSync,
 	)
 	if err != nil {
 		return Folder{}, fmt.Errorf("reading folder %q: %w", source, err)
@@ -215,7 +248,7 @@ func (d *DB) FenceUIDValidity(ctx context.Context, folderID int64, srcUIDValidit
 		// comparable within one UIDVALIDITY, and a renumbered mailbox can come
 		// back with a lower one than we stored — which would leave the folder
 		// looking permanently up to date to a fast path that trusts it.
-		if _, err := tx.ExecContext(ctx, `UPDATE folders SET src_highestmodseq = 0 WHERE id = ?`, folderID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE folders SET src_highestmodseq = 0, src_deleted_through = 0 WHERE id = ?`, folderID); err != nil {
 			return false, fmt.Errorf("clearing folder %d watermark: %w", folderID, err)
 		}
 	}
@@ -237,13 +270,18 @@ func (d *DB) FenceUIDValidity(ctx context.Context, folderID int64, srcUIDValidit
 // and a folder that finished with messages still to copy, which must not
 // advance the watermark but has no reason to forget the last one it earned —
 // that older watermark still bounds which flags can have changed.
-func (d *DB) MarkSynced(ctx context.Context, folderID int64, highestModSeq uint64, at time.Time) error {
+// deletedThrough follows the same rule for the same reason: zero leaves the
+// stored value alone. A run that was not asked to delete, or that refused to,
+// must not claim that deletions have been carried out up to this point, or the
+// next run's fast path will skip the folder and the deletion will never happen.
+func (d *DB) MarkSynced(ctx context.Context, folderID int64, highestModSeq, deletedThrough uint64, at time.Time) error {
 	const update = `UPDATE folders
 	                SET src_highestmodseq = CASE WHEN ?1 = 0 THEN src_highestmodseq ELSE ?1 END,
-	                    last_sync = ?2
-	                WHERE id = ?3`
+	                    src_deleted_through = CASE WHEN ?2 = 0 THEN src_deleted_through ELSE ?2 END,
+	                    last_sync = ?3
+	                WHERE id = ?4`
 	//nolint:gosec // modseq values are far below 2^63 in practice
-	if _, err := d.db.ExecContext(ctx, update, int64(highestModSeq), at.Unix(), folderID); err != nil {
+	if _, err := d.db.ExecContext(ctx, update, int64(highestModSeq), int64(deletedThrough), at.Unix(), folderID); err != nil {
 		return fmt.Errorf("marking folder %d synced: %w", folderID, err)
 	}
 	return nil

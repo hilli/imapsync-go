@@ -474,3 +474,107 @@ func TestASmallFolderMayStillLoseAMessage(t *testing.T) {
 		t.Errorf("destination holds %d messages, want 5", got)
 	}
 }
+
+// TestTurningDeletionOnLooksAtFoldersThatLookUnchanged is a regression test for
+// a hole that only real servers found.
+//
+// The natural way to adopt --delete2 is to have been syncing without it for a
+// while and then add the flag. Every folder's watermark is current at that
+// point, so a fast path that trusts the watermark alone skips all of them —
+// and any deletion the source made in the meantime is never carried out, on
+// that run or any later one. The mirror is silently, permanently wrong.
+//
+// A watermark records that copying is up to date. It says nothing about
+// deleting, and this is the difference.
+func TestTurningDeletionOnLooksAtFoldersThatLookUnchanged(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 20)
+
+	seq := &atomic.Uint64{}
+	seq.Store(100)
+	uids := &atomic.Int32{}
+
+	// Months of syncing without --delete2.
+	if _, err := syncFlaky(t, h, 1, 1, syncer.Options{}, modseq(seq, uids), nil); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// A message leaves the source. A real server bumps its modseq for this,
+	// as RFC 7162 requires of any server that keeps them.
+	removeFrom(t, h.src, "INBOX", uidsIn(t, h.src, "INBOX")[0])
+	seq.Store(200)
+
+	// One more run without the flag, which brings the watermark up to date and
+	// carries out no deletion at all. This is the run that used to poison the
+	// state.
+	if _, err := syncFlaky(t, h, 1, 1, syncer.Options{}, modseq(seq, uids), nil); err != nil {
+		t.Fatalf("catch-up run: %v", err)
+	}
+
+	// Now the flag goes on, and nothing about the source has changed since.
+	rep, err := syncFlaky(t, h, 1, 1, syncer.Options{Delete2: true}, modseq(seq, uids), nil)
+	if err != nil {
+		t.Fatalf("first deleting run: %v", err)
+	}
+	if fr := folderReport(t, rep, "INBOX"); fr.Deleted != 1 {
+		t.Errorf("deleted %d, want 1: the folder looked unchanged and the deletion was lost", fr.Deleted)
+	}
+	if got := len(uidsIn(t, h.dst, "INBOX")); got != 19 {
+		t.Errorf("destination holds %d messages, want 19", got)
+	}
+
+	// And once deletion has been carried out at that watermark, the folder is
+	// allowed to be skipped again — otherwise --delete2 would mean giving up
+	// the fast path for ever.
+	before := uids.Load()
+	if _, err := syncFlaky(t, h, 1, 1, syncer.Options{Delete2: true}, modseq(seq, uids), nil); err != nil {
+		t.Fatalf("second deleting run: %v", err)
+	}
+	if uids.Load() != before {
+		t.Errorf("the source was listed again; --delete2 gave up the fast path permanently")
+	}
+}
+
+// TestARefusalDoesNotBecomePermanent is the same hole seen from the other side.
+//
+// If a refused deletion advanced the deletion watermark, the folder would look
+// settled on the next run, be skipped, and never be offered again — so the
+// safety valve would quietly turn into the thing it was protecting against.
+func TestARefusalDoesNotBecomePermanent(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 80)
+
+	seq := &atomic.Uint64{}
+	seq.Store(100)
+	uids := &atomic.Int32{}
+	opts := syncer.Options{Delete2: true}
+
+	if _, err := syncFlaky(t, h, 1, 1, opts, modseq(seq, uids), nil); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	for _, uid := range uidsIn(t, h.src, "INBOX")[:20] {
+		removeFrom(t, h.src, "INBOX", uid)
+	}
+	seq.Store(200)
+
+	if rep, err := syncFlaky(t, h, 1, 1, opts, modseq(seq, uids), nil); err != nil {
+		t.Fatalf("refusing run: %v", err)
+	} else if fr := folderReport(t, rep, "INBOX"); fr.Refused != 20 {
+		t.Fatalf("refused %d, want 20", fr.Refused)
+	}
+
+	// Nothing has changed on the source since the refusal, so a watermark-only
+	// fast path would skip this folder and the refusal would be final.
+	forced := syncer.Options{Delete2: true, Force: true}
+	rep, err := syncFlaky(t, h, 1, 1, forced, modseq(seq, uids), nil)
+	if err != nil {
+		t.Fatalf("forced run: %v", err)
+	}
+	if fr := folderReport(t, rep, "INBOX"); fr.Deleted != 20 {
+		t.Errorf("deleted %d, want 20: the refusal was never offered again", fr.Deleted)
+	}
+}

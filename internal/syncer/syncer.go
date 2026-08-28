@@ -827,7 +827,17 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	if fr.Failed > 0 {
 		modseq = 0
 	}
-	if err := s.db.MarkSynced(ctx, p.folderID, modseq, time.Now()); err != nil {
+	// Deletions are watermarked separately, because they are a separate
+	// promise. A run without --delete2 keeps the folder's copies current and
+	// advances the modseq, but leaves every deletion the source made
+	// uncarried-out — and if that advanced watermark were taken to cover
+	// deletion too, the next --delete2 run would find the folder unchanged,
+	// skip it, and lose those deletions for good.
+	deleted := uint64(0)
+	if s.opts.Delete2 && fr.Failed == 0 && fr.Refused == 0 {
+		deleted = p.src.HighestModSeq
+	}
+	if err := s.db.MarkSynced(ctx, p.folderID, modseq, deleted, time.Now()); err != nil {
 		return lv.snapshot(), fmt.Errorf("recording folder completion: %w", err)
 	}
 	return fr, nil
@@ -997,6 +1007,11 @@ func flagText(flags []string) string {
 // has drifted asks for everything to be checked, since nothing about the source
 // can reveal a message deleted at the far end.
 func (s *Syncer) unchanged(row state.Folder, src imapx.Mailbox) bool {
+	// A folder whose deletions are not carried out up to this same point has
+	// changed in a way this run cares about, whatever the modseq says.
+	if s.opts.Delete2 && row.SrcDeletedThrough != src.HighestModSeq {
+		return false
+	}
 	if s.opts.Full || row.SrcHighestModSeq == 0 || src.HighestModSeq == 0 {
 		return false
 	}

@@ -315,8 +315,14 @@ protecting nothing.
 `--dry-run` reports what would be deleted without touching anything, and it
 computes it with the same code the real run uses, including the ceiling.
 
-Folders are left alone entirely if anything in them failed to copy, or if the
-server said nothing in them had changed.
+Folders are left alone entirely if anything in them failed to copy.
+
+Turning `--delete2` on for the first time works on an account you have been
+syncing for months. Folders record separately how far copying and deleting have
+each got, so adding the flag examines every folder once, even ones the server
+says have not changed — otherwise the deletions made while the flag was off
+would never be carried out. After that the fast path resumes as normal, and a
+refusal is offered again on the next run rather than being final.
 
 ### Choosing folders
 
