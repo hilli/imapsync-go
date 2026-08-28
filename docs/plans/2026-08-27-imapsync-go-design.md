@@ -805,12 +805,98 @@ implication. iCloud advertises QRESYNC, confirmed with our own `probe`.
 ### Commands
 
 - `sync` — native interface.
-- `compat` — imapsync flag translator, handling Getopt::Long semantics
-  (`--noX` negation, `--opt=val`, unambiguous abbreviations).
+- `compat` — imapsync flag translator. See §8.1.
 - `probe` — connect, dump capabilities, measure the connection ceiling, print a
   suggested config. Particularly useful against iCloud.
 - `status` — read the state DB.
 - `verify` — standalone consistency check.
+
+### 8.1 The compat shim — as built
+
+Someone with a working imapsync line has already solved the hard part. The shim
+exists so that line keeps working, and so the migration to native flags is a
+thing they can do later rather than a precondition.
+
+**Invocation.** `imapsync-go compat <imapsync flags>`, or by name: if `argv[0]`
+is `imapsync`, the argument list is treated as a compat invocation. A symlink
+therefore makes the binary a drop-in for scripts that call `imapsync` directly
+and have no subcommand to hang the translation off.
+
+**Getopt::Long semantics were verified, not remembered.** A Perl script
+declaring all 218 of imapsync's options was run over a corpus of spellings and
+its answers recorded in `internal/compat/getoptlong_test.go`. Two of them
+contradicted what the implementation would otherwise have assumed:
+
+- `--dry=0` is an **error**, not a negation. A `!` option never takes `=value`.
+- `--auto` resolves to `automap`, while `--expung` is ambiguous between four
+  options despite being longer. Whether an abbreviation is ambiguous is a
+  property of the entire table, so it cannot be reasoned about one option at a
+  time and the answer changes as the table does. This is exactly the kind of
+  thing a golden file should hold and a person should not.
+
+Also confirmed there: matching is case-insensitive, a single dash is accepted,
+a mandatory value swallows the next argument even when it looks like an option,
+negated forms take part in abbreviation, and `--noexclude` is its own option
+rather than a negation of `--exclude`.
+
+**Four dispositions, with `refuse` as the zero value** — an option someone
+forgets to classify refuses rather than silently doing nothing:
+
+| | |
+|---|---|
+| `refuse` | Changes which messages move or what becomes of them, and cannot be honoured exactly. Also every unknown option. |
+| `translate` | Has a native equivalent. |
+| `ignore` | Asks for what already happens, or cannot mean anything here. **Always reported with a reason.** |
+| `endpoint` | Folded into `--source-url`/`--dest-url`. |
+
+The failure mode being designed against is silence. Accepting `--maxage 30` and
+not applying it copies twelve years of mail instead of a month, and the user
+finds out from a full disk. Refusing it costs them one edit.
+
+Refusals are collected and reported **together**. Discovering four unsupported
+flags one run at a time is four round trips through a cron table.
+
+**Dispositions are per-polarity**, because for several options the two
+directions are not equally safe:
+
+- `--syncinternaldates` is ignored (it is what happens); `--nosyncinternaldates`
+  is refused.
+- `--sslcheck` is ignored; `--nosslcheck` translates.
+- `--uidexpunge2` is ignored; `--nouidexpunge2` is refused, because plain
+  EXPUNGE would purge messages the owner flagged by hand.
+
+**Passwords never become arguments.** `--password1` goes into the environment
+and the translation names the variable. Arguments are readable by every process
+on the machine, and the translation is printed for pasting into bug reports.
+
+**The printed translation is the thing that runs.** `Plan.Args` is both echoed
+and executed, so the two cannot drift.
+
+**One assumption, stated.** imapsync probes port 993 when told neither `--ssl1`
+nor `--tls1` (imapsync.pl:21870ff). Replicating that would make translation
+depend on a network call. The shim assumes TLS and prints an `Assumed:` line.
+It never assumes in the other direction.
+
+**Provider bundles were read rather than guessed.** `--office1` is exactly
+`--host1 outlook.office365.com --ssl1 --exclude "^Files$"`, so it is translated
+in full. `--exchange1` does literally nothing in imapsync, so it is ignored
+with that as the stated reason. `--gmail1` sets rate limits, folder rewriting,
+label sync and folder ordering, so it is refused.
+
+**The coverage test is the contract.** `imapsyncOptions` holds all 218 specs
+verbatim from imapsync's two `GetOptions` calls; one test asserts the table
+covers every one with matching kind and aliases, another that it invents none.
+A new imapsync release is a diff against that list.
+
+**`NativeFlags()` exists for a test in the command package**, which checks every
+flag the table emits against the flags `sync` accepts. A typo in a native flag
+name is otherwise invisible: the translation prints, looks right, and dies at
+the far end naming a flag the user never typed.
+
+**Dropped:** an `action` disposition for `--justconnect`/`--justlogin`/
+`--justbanner`. `probe` takes one endpoint at a time, so honouring them meant
+two invocations for three flags nobody puts in a cron line. They are refused
+with a pointer to `probe`.
 
 ### Config
 
@@ -1085,6 +1171,36 @@ is an optimisation with no behaviour to observe, and selecting the destination
 read-only in a dry run cannot be caught by a test that never writes.
 See also §9.6, whose findings still stand.
 
+### 9.8 What mutation testing found in the compat shim
+
+Sixteen mutations, sixteen caught — the highest rate in the project so far,
+which says more about the shape of the problem than about the tests. A
+translator is close to a pure function: an argument list in, an argument list
+out, with no server, no clock and no concurrency in the way. Almost every
+mutation changes an output somebody is already asserting on.
+
+The two worth recording are the ones aimed at the failure modes the design is
+built around:
+
+**A password onto the command line.** Making `side()` emit
+`--source-password` with the value instead of `--source-password-env` with a
+variable name is a one-word change that produces a translation which works
+perfectly and leaks the password to every process on the machine. Caught twice:
+once by a test that scans both the arguments and the printed translation for
+the password, and once by the end-to-end translation test.
+
+**A typo in a native flag name.** `--log-lvel` instead of `--log-level`
+survives compilation, survives every test in the compat package, prints without
+complaint, and fails at the far end naming a flag the user never typed and
+cannot find in any documentation. Nothing in the package can catch it, because
+the package cannot see the flags it is translating into. `NativeFlags()` and a
+test in the command package exist for this one mutation.
+
+No survivors, and no barriers — which is itself the argument for keeping the
+translator free of I/O. The TLS assumption (§8.1) is what that buys: a shim
+that probed port 993 to decide would have a network call in the middle of a
+pure function, and the mutations that matter would stop being observable.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
@@ -1099,8 +1215,9 @@ See also §9.6, whose findings still stand.
   fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
   `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder
   `STATUS` was cut, because it is a `probe` cost and not a sync one — see below.
-- **M5** — `compat` shim, `--delete2` + safety valve (**done**, §7.1–7.4, §9.6),
-  progress UI (dropped: M3 already logs progress and a rate).
+- **M5** — `compat` shim (§8.1, §9.8), `--delete2` + safety valve
+  (§7.1–7.4, §9.6). *Done.* Progress UI dropped: M3 already logs progress and a
+  rate.
 - **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
   unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:
   Dovecot, Gmail, Microsoft 365, Cyrus.

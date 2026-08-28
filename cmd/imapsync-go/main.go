@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -20,7 +21,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := newRootCmd().ExecuteContext(ctx); err != nil {
+	root := newRootCmd()
+	root.SetArgs(argsFor(os.Args))
+
+	if err := root.ExecuteContext(ctx); err != nil {
 		// Cobra has already printed the error for usage problems; this covers
 		// runtime failures.
 		if !errors.Is(err, context.Canceled) {
@@ -28,6 +32,20 @@ func main() {
 		}
 		os.Exit(1)
 	}
+}
+
+// argsFor decides what the arguments mean, which depends on what this binary
+// was called.
+//
+// Linked as "imapsync" it is asked for compat, so that an existing cron line
+// keeps working with nothing edited but the path — which is the only sense in
+// which anything can honestly be called a drop-in replacement.
+func argsFor(argv []string) []string {
+	args := argv[1:]
+	if filepath.Base(argv[0]) == "imapsync" {
+		return append([]string{"compat"}, args...)
+	}
+	return args
 }
 
 type globalFlags struct {
@@ -52,6 +70,7 @@ func newRootCmd() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&g.logLevel, "log-level", "info", "log level: debug, info, warn or error")
 	cmd.PersistentFlags().BoolVar(&g.logJSON, "log-json", false, "force JSON logs (default: JSON when stderr is not a terminal)")
 
+	cmd.AddCommand(newCompatCmd())
 	cmd.AddCommand(newProbeCmd())
 	cmd.AddCommand(newSyncCmd())
 

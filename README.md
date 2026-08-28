@@ -8,10 +8,10 @@ per connection, so throughput comes from running many connections and slicing
 work across them — folder-parallel *and* intra-folder parallel, so a single
 200k-message INBOX still saturates the available connections.
 
-> **Status:** early development. Milestone M1 works: `probe` reports what a
-> server supports, and `sync` performs a correct, resumable, one-way copy over a
-> single connection per side. The concurrency the project exists for is M2 and
-> does not exist yet. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
+> **Status:** M0–M5 complete. `probe` reports what a server supports, `sync`
+> performs a correct, resumable, concurrent one-way copy across many
+> connections, `--delete2` mirrors deletions, and `compat` runs imapsync
+> command lines. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
 
 ## Install
 
@@ -251,6 +251,17 @@ asked at all.
 Only flags travel. This is a one-way mirror, so a message you read on the
 *destination* will be marked unread again to match the source.
 
+### Subscriptions
+
+Folders created by a run are subscribed, as imapsync does by default. A mail
+client browsing by subscription would otherwise not show them, which looks
+exactly like the mail never having been copied. `--subscribe=false` turns it
+off.
+
+Only newly created folders are touched: a folder you deliberately unsubscribed
+from stays that way. A server that refuses SUBSCRIBE gets a warning rather than
+a failed run.
+
 ### Numbers with no message behind them
 
 Some servers list UIDs they have nothing to give you. iCloud is one: on an INBOX
@@ -361,6 +372,91 @@ source reached over the internet, so there is no single flag that does both.
 macOS rejects a self-signed certificate whose validity exceeds 398 days with
 `certificate is not standards compliant`, and adding it to the keychain does not
 help. Either reissue it with a shorter lifetime or pass `--dest-insecure`.
+
+## Running imapsync command lines
+
+Existing imapsync invocations — the ones in your cron table and your notes —
+can be run through the `compat` shim, which translates them and runs the
+resulting `sync`:
+
+```sh
+imapsync-go compat --host1 imap.mail.me.com --user1 you@example.com \
+  --passfile1 ~/.icloud --ssl1 \
+  --host2 mail.example.net --user2 you --passfile2 ~/.mox --ssl2 \
+  --folder Archive --dry
+```
+
+Symlink the binary to make it a genuine drop-in, so scripts that call
+`imapsync` by name keep working without being edited:
+
+```sh
+ln -s "$(command -v imapsync-go)" /usr/local/bin/imapsync
+```
+
+The shim prints the translation before running it:
+
+```
+translated to:
+  imapsync-go sync --source-url imaps://you%40example.com@imap.mail.me.com:993 \
+    --source-password-file /Users/you/.icloud \
+    --dest-url imaps://you@mail.example.net:993 \
+    --dest-password-file /Users/you/.mox --folder Archive --dry-run
+```
+
+That is the command that runs, not an approximation of it, so it can be copied
+into a bug report or kept as the native version of a script you are migrating.
+
+### It refuses rather than guesses
+
+A flag that changes **which messages move, or what becomes of them** is refused
+if this tool cannot honour it exactly. `--maxage`, `--regextrans2`,
+`--minsize`, `--gmail1` and the rest stop the run and say so, all of them at
+once rather than one per attempt.
+
+The alternative — accepting a flag and quietly not applying it — fails in the
+worst possible way. `--maxage 30` silently ignored copies twelve years of mail
+instead of a month, and you find out from a full disk.
+
+```
+error: 2 imapsync options cannot be honoured:
+  --maxage: it changes which messages are copied, and this tool would copy all
+            of them instead
+  --justfolders: copying folders without their messages is not implemented;
+            --dry-run reports the plan instead
+```
+
+Flags that ask for something that already happens are **ignored and reported**,
+never silently dropped:
+
+```
+accepted but did nothing:
+  --addheader     this tool stamps only the messages that have no Message-ID, and
+                  its digest covers a fixed list of header fields, so a stamp
+                  cannot change how anything is matched
+  --exchange1     it does nothing in imapsync either
+  --useuid        the state database records what has been copied, so this is
+                  not needed
+```
+
+### Passwords
+
+`--password1` and `--password2` are moved into the environment rather than
+passed as arguments, because arguments are readable by every process on the
+machine. `--passfile1`/`--passfile2` are better still and translate directly.
+
+### One assumption it has to make
+
+Given neither `--ssl1` nor `--tls1`, imapsync probes port 993 and uses TLS if
+something answers. Doing that here would make translation depend on the
+network. The shim assumes TLS instead and says so:
+
+```
+assumed: neither --ssl1 nor --tls1 was given, so TLS on port 993 was assumed;
+say --tls1 for STARTTLS, or --nossl1 for no encryption
+```
+
+It never assumes in the other direction: nothing you type gets quietly
+downgraded to an unencrypted connection.
 
 ## Configuration
 
