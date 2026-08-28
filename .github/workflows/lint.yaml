@@ -17,7 +17,7 @@ concurrency:
 jobs:
   golangci-lint:
     name: golangci-lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -33,7 +33,7 @@ jobs:
 
   goreleaser-check:
     name: goreleaser check
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7

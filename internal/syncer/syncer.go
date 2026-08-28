@@ -181,6 +181,10 @@ type FolderReport struct {
 	// AlreadyDone is how many the state database had already recorded. On a
 	// second run of an unchanged account this is everything.
 	AlreadyDone int
+	// Vanished is how many UIDs the source listed and then had no message for.
+	// Not a failure: there is nothing at that number to copy, and there never
+	// will be.
+	Vanished int
 	// Reflagged is how many had their flags brought back into line on the
 	// destination without being copied again.
 	Reflagged int
@@ -202,6 +206,19 @@ func (r Report) Totals() (copied, adopted, failed int) {
 		failed += f.Failed
 	}
 	return copied, adopted, failed
+}
+
+// Vanished sums the UIDs the sources listed and had no message for.
+//
+// Reported separately because it is neither work done nor work failed, and
+// because on some servers it is large enough that leaving it out makes the
+// other numbers look like loss.
+func (r Report) Vanished() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Vanished
+	}
+	return n
 }
 
 // health tells the difference between a run meeting the ordinary friction of a
@@ -638,6 +655,12 @@ func (l *live) adopted(n int) {
 	l.health.progress(0, n)
 }
 
+func (l *live) vanished(n int) {
+	l.mu.Lock()
+	l.report.Vanished += n
+	l.mu.Unlock()
+}
+
 func (l *live) reflagged() {
 	l.mu.Lock()
 	l.report.Reflagged++
@@ -984,13 +1007,7 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	}
 
 	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox, since: watermark(row, kept)}
-	for _, uid := range uids {
-		if known[uid] == state.StateDone {
-			lv.report.AlreadyDone++
-			continue
-		}
-		p.todo = append(p.todo, uid)
-	}
+	p.todo = triage(uids, known, lv)
 
 	// Nothing below reads the source, and indexing a large destination can take
 	// a while. Handing the connection back now lets another folder use it.
@@ -1016,6 +1033,28 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 		}
 	}
 	return p, nil
+}
+
+// triage sorts what the source listed into what still needs copying, counting
+// the rest as it goes.
+//
+// The three outcomes are not two-and-an-oddity. "Already on the destination"
+// and "the source has no message here" are both settled, and the only reason
+// they are counted apart is that one of them is a number the source made up.
+func triage(uids []uint32, known map[uint32]state.State, lv *live) []uint32 {
+	var todo []uint32
+	for _, uid := range uids {
+		switch known[uid] {
+		case state.StateDone:
+			lv.report.AlreadyDone++
+		case state.StateGone:
+			// The source listed it again and still has no message for it.
+			lv.report.Vanished++
+		default:
+			todo = append(todo, uid)
+		}
+	}
+	return todo
 }
 
 // pendingAppend is a message that has been read from the source and is waiting
@@ -1135,6 +1174,9 @@ func (s *Syncer) fetchChunk(
 	if err != nil {
 		return err
 	}
+	if err := s.markGone(ctx, p, chunk, metas, lv); err != nil {
+		return err
+	}
 
 	attempt := 0
 	for done := 0; done < len(metas); {
@@ -1173,6 +1215,45 @@ func (s *Syncer) fetchChunk(
 		}
 		done++
 		attempt = 0
+	}
+	return nil
+}
+
+// markGone records the UIDs of a chunk the server had no message for.
+//
+// A UID FETCH that completes successfully and says nothing about a message is
+// the server saying there is no such message: FETCH is not an error for a UID
+// that does not exist, it simply returns nothing. A short response therefore
+// means those UIDs are not there, not that the command went wrong — a command
+// that went wrong fails, and this is only reached when it did not.
+//
+// iCloud makes this routine rather than exceptional. Its SEARCH ALL on a
+// 414k-message INBOX returns just over half a million UIDs, of which roughly
+// ninety thousand have nothing behind them. Silently dropping those, which is
+// what happened before, left a report that did not add up and a folder that
+// asked for the same ninety thousand on every run for ever.
+func (s *Syncer) markGone(ctx context.Context, p *prepared, chunk []uint32, metas []imapx.MessageMeta, lv *live) error {
+	if len(metas) == len(chunk) {
+		return nil
+	}
+
+	got := make(map[uint32]struct{}, len(metas))
+	for _, m := range metas {
+		got[m.UID] = struct{}{}
+	}
+
+	n := 0
+	for _, uid := range chunk {
+		if _, ok := got[uid]; ok {
+			continue
+		}
+		if err := s.db.MarkGone(ctx, p.folderID, p.src.UIDValidity, uid); err != nil {
+			return err
+		}
+		n++
+	}
+	if n > 0 {
+		lv.vanished(n)
 	}
 	return nil
 }
@@ -1346,10 +1427,17 @@ func (s *Syncer) fetchOne(
 	if _, err := src.FetchBody(ctx, meta.UID, &buf); err != nil {
 		release()
 		if errors.Is(err, imapx.ErrMessageGone) {
-			// Expunged between enumeration and fetch. Nothing was appended, and
-			// nothing can be: record it so the next run does not retry forever.
-			return s.fail(ctx, p.folderID, p.src.UIDValidity, meta.UID,
-				"source message expunged before it could be read", lv)
+			// Expunged between enumeration and fetch. Nothing was appended and
+			// nothing can be, so this is not a failure — recording it as one
+			// would put the UID back in the queue on every later run and stop
+			// the folder's watermark ever advancing, which is the opposite of
+			// "do not retry forever".
+			if err := s.db.MarkGone(ctx, p.folderID, p.src.UIDValidity, meta.UID); err != nil {
+				return err
+			}
+			lv.vanished(1)
+			s.log.Info("source message expunged before it could be read", "uid", meta.UID)
+			return nil
 		}
 		return fmt.Errorf("fetching message %d: %w", meta.UID, err)
 	}
@@ -1542,9 +1630,12 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 		return fr, fmt.Errorf("enumerating source messages: %w", err)
 	}
 	for _, uid := range uids {
-		if known[uid] == state.StateDone {
+		switch known[uid] {
+		case state.StateDone:
 			fr.AlreadyDone++
-		} else {
+		case state.StateGone:
+			fr.Vanished++
+		default:
 			fr.Copied++
 		}
 	}

@@ -846,6 +846,69 @@ reports no `HIGHESTMODSEQ` at all, so everything about the fast path is tested
 through a decorator that states the sequence the test wants — including the case
 a real server makes hard to arrange, where the sequence has genuinely not moved.
 
+### 9.5 The UIDs iCloud lists but does not have
+
+Verifying the fast path on a genuinely large folder turned up something the
+in-process server could never have shown. A `--dry-run` over iCloud's INBOX
+reported **503,786 messages to copy** from a mailbox whose `STATUS` says it holds
+**414,053**.
+
+The measurement was repeated in raw Python `imaplib`, so it is not a bug in this
+tool or in go-imap:
+
+| Question | Answer |
+| --- | --- |
+| `STATUS INBOX (MESSAGES)` | 414,053 |
+| `EXISTS` on `SELECT` | 414,053 |
+| `UID SEARCH ALL` | **503,786 distinct UIDs** |
+| Highest UID returned | 570,679 (`UIDNEXT` 570,688) |
+| `UID FETCH` of the first 500 searched UIDs | **358 returned data** |
+
+So `SEARCH` over-reports by about 18%, and the surplus UIDs are not messages
+that were deleted while we looked: fetching them succeeds and returns nothing.
+
+**Why the tests were quiet.** `FetchMeta` builds its result by iterating what the
+server sent back, and `fetchChunk` iterates the metadata rather than the chunk it
+asked for, so a UID with no message simply fell out of the pipeline. It was never
+copied, never failed, and never recorded. The run reported `to_copy 503786`,
+`copied 414053`, `failed 0` — which reads like ninety thousand lost messages and
+was in fact ninety thousand numbers that never existed.
+
+Nothing was lost or duplicated, but the silence cost two things. The report was
+unreadable, and because nothing was written down, every later run in which the
+INBOX had changed re-enumerated all 89,733 of them and spent about 180 chunk
+round trips asking a server that charges by the round trip.
+
+**The rule adopted: the source not having a message is a fact, not a failure.**
+A failure returns to the queue on the next run and holds the folder's watermark
+down, which is right for something that could not be copied and wrong for
+something that does not exist. `state = 'gone'` records it instead. Within one
+UIDVALIDITY a UID is never reissued, so the record is permanently safe, and
+`FenceUIDValidity` discards it along with everything else when the mailbox is
+renumbered.
+
+**It also fixes a bug that predates the discovery.** A message expunged between
+enumeration and fetch took the `ErrMessageGone` path, whose comment said it
+recorded a failure "so the next run does not retry forever" — which is precisely
+what recording a failure fails to do. A single such message would be re-queued
+and re-failed on every run, and because a folder with failures keeps its old
+watermark, it would deny that folder the CONDSTORE fast path permanently. Both
+sites now record the message as gone.
+
+**The interpretation this rests on.** A `UID FETCH` that completes and says
+nothing about a UID is the server saying there is no such message; a fetch that
+went wrong returns an error and never reaches the recording. The residual risk is
+a server that transiently omits a real message from an otherwise successful
+response, which would leave that message permanently skipped. Accepted: the only
+alternative is a verification round trip per UID, which at 89,733 UIDs costs more
+than the problem.
+
+**What a mutation caught that a test did not.** Sparing gone rows from the
+UIDVALIDITY fence initially survived, because the test asked for the surviving
+rows under the *new* numbering — where they could not appear whether they had
+been deleted or not. Every read is scoped by UIDVALIDITY, so the assertion had to
+be made under the old one to mean anything.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*

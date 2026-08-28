@@ -465,14 +465,25 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if dryRun {
 		copiedHeading = "TO COPY"
 	}
-	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY\tFAILED\n", copiedHeading)
+	// The vanished column earns its place only when there is something in it.
+	// Most servers never produce one, and a column of zeroes on every report
+	// would be a worse trade than the occasional wider table.
+	vanished := report.Vanished()
+	gone := ""
+	if vanished > 0 {
+		gone = "\tVANISHED"
+	}
+	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY%s\tFAILED\n", copiedHeading, gone)
 	for _, fr := range report.Folders {
 		status := ""
 		if fr.Err != nil {
 			status = "  ← " + fr.Err.Error()
 		}
-		t.printf("%s\t%s\t%d\t%d\t%d\t%d\t%d%s\n",
-			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone, fr.Failed, status)
+		if vanished > 0 {
+			gone = fmt.Sprintf("\t%d", fr.Vanished)
+		}
+		t.printf("%s\t%s\t%d\t%d\t%d\t%d%s\t%d%s\n",
+			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone, gone, fr.Failed, status)
 	}
 	flush()
 
@@ -481,9 +492,18 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if dryRun {
 		copiedWord = "to copy"
 	}
-	p.printf("\n%d %s, %d %s, %d adopted, %d failed, in %s%s\n",
-		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, failed,
+	goneWord := ""
+	if vanished > 0 {
+		goneWord = fmt.Sprintf("%d vanished, ", vanished)
+	}
+	p.printf("\n%d %s, %d %s, %d adopted, %s%d failed, in %s%s\n",
+		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, goneWord, failed,
 		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
+
+	if vanished > 0 {
+		p.printf("\n%d %s the source listed but had no message for. Nothing was lost:\nthere is nothing at those numbers to copy, and they will not be asked for again.\n",
+			vanished, plural(vanished, "UID"))
+	}
 
 	// Skips the caller asked for are not news: narrowing a 144-folder account
 	// to two with --folder should not bury the two skips that were our own

@@ -1,0 +1,6 @@
+# actionlint's built-in runner label list ships with the release binary, and
+# v1.7.12 predates the ubuntu-26.04 images. Declare the label so `actionlint`
+# stops reporting it as unknown. Remove this once actionlint knows the label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

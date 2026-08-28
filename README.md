@@ -42,11 +42,10 @@ Or plain Go:
 go build -o imapsync-go ./cmd/imapsync-go
 ```
 
-To run without building, pass the **package**, not the file:
+To run without building:
 
 ```sh
-go run ./cmd/imapsync-go probe --help     # correct
-go run cmd/imapsync-go/main.go probe      # fails: compiles only main.go
+go run ./cmd/imapsync-go probe --help
 ```
 
 ## Shell completion
@@ -251,6 +250,21 @@ asked at all.
 
 Only flags travel. This is a one-way mirror, so a message you read on the
 *destination* will be marked unread again to match the source.
+
+### Numbers with no message behind them
+
+Some servers list UIDs they have nothing to give you. iCloud is one: on an INBOX
+holding 414,053 messages it lists 503,786 UIDs, and roughly ninety thousand of
+them have no message. This is not a mid-run deletion and not an error — asking
+for one of those messages succeeds and simply says nothing.
+
+Those are reported separately as VANISHED, and they are neither loss nor
+failure: nothing was skipped that the server actually had. They are also written
+down, so the next run does not ask about them again. Without that, iCloud's
+INBOX would re-request ninety thousand headers on every single run, for ever.
+
+The same column counts messages genuinely deleted from the source between the
+moment the run listed them and the moment it went to read them.
 
 ### Choosing folders
 

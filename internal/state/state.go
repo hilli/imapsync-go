@@ -30,6 +30,11 @@ const (
 	StateDone State = "done"
 	// StateFailed means the copy was abandoned with a recorded reason.
 	StateFailed State = "failed"
+	// StateGone means the source listed this UID and then had no message for
+	// it. That is a fact about the source rather than a failure of ours, and it
+	// is permanent: within one UIDVALIDITY a UID is never reissued, so there
+	// will never be anything at that number to copy.
+	StateGone State = "gone"
 )
 
 // Folder is one source mailbox and the destination it maps to.
@@ -301,6 +306,30 @@ func (d *DB) SyncedUIDs(ctx context.Context, folderID int64, srcUIDValidity uint
 		return nil, fmt.Errorf("reading synchronised UIDs for folder %d: %w", folderID, err)
 	}
 	return out, nil
+}
+
+// MarkGone records that the source has no message at this UID.
+//
+// iCloud's SEARCH ALL is the reason this exists: on a 414k-message INBOX it
+// returns just over half a million UIDs, and around ninety thousand of them
+// have no message behind them. Without somewhere to write that down, every run
+// asks for all ninety thousand again.
+//
+// It is deliberately not a failure. A failure goes back into the queue on the
+// next run and stops the folder's watermark advancing, which is right for a
+// message that could not be copied and wrong for one that does not exist.
+func (d *DB) MarkGone(ctx context.Context, folderID int64, srcUIDValidity, srcUID uint32) error {
+	const upsert = `
+INSERT INTO messages (folder_id, src_uidvalidity, src_uid, state, internaldate)
+VALUES (?, ?, ?, ?, 0)
+ON CONFLICT (folder_id, src_uidvalidity, src_uid) DO UPDATE SET
+  state      = excluded.state,
+  last_error = ''`
+
+	if _, err := d.db.ExecContext(ctx, upsert, folderID, srcUIDValidity, srcUID, StateGone); err != nil {
+		return fmt.Errorf("recording UID %d as absent from the source: %w", srcUID, err)
+	}
+	return nil
 }
 
 // Mirror is one copied message's place on both sides, together with the flags
