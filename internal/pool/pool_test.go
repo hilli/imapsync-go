@@ -88,6 +88,10 @@ func (f *fakeConn) Append(context.Context, string, imapx.AppendMessage) (imapx.A
 }
 func (f *fakeConn) SearchHeader(context.Context, string, string) ([]uint32, error) { return nil, nil }
 
+func (f *fakeConn) FetchFlags(context.Context, uint64) ([]imapx.FlagSet, error) { return nil, nil }
+
+func (f *fakeConn) StoreFlags(context.Context, uint32, []string) error { return nil }
+
 // dialer hands out fakeConns and counts how many it was asked for.
 type dialer struct {
 	mu     sync.Mutex

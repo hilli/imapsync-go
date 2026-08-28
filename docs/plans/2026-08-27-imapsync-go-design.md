@@ -396,14 +396,55 @@ Recovery is therefore a bounded, targeted `SEARCH` — not a full re-diff.
 Any change on either side invalidates that folder's rows and forces a tier-3
 reconciliation pass. Never a silent re-copy.
 
-### 5.6 CONDSTORE fast path
+### 5.6 CONDSTORE fast path — as built
 
-- Stored `HIGHESTMODSEQ` unchanged → the whole folder is skipped in one command.
-- Changed → `FETCH 1:* (FLAGS) (CHANGEDSINCE n)` returns only what moved, so flag
-  sync costs a delta rather than a full scan.
-- CONDSTORE does not report expunges (that is QRESYNC's job), so new-message
-  detection still needs a UID-range diff, and a periodic full UID reconcile runs
-  via `--reconcile-every` (default: every 7th run).
+A folder whose stored `HIGHESTMODSEQ` equals what `SELECT` reports is skipped
+outright: no UID listing, no destination connection, one command. On an account
+of 144 folders and 776k messages that is most of a repeat run, because the
+alternative is enumerating every UID of every mailbox to discover that nothing
+moved, against a server charging by the round trip.
+
+**The watermark is a promise, not a timestamp.** It means *everything the source
+held at that point is on the destination*. So it is written only by a folder
+that finished with nothing failed — `syncFolder` passes zero when
+`report.Failed > 0`, and `MarkSynced` treats zero as "no news, keep what you
+had". Without that rule a folder that failed one message would be skipped from
+then on and that message never retried: a transient failure promoted to a
+permanent divergence. The same reasoning governs flag resync, where a rejected
+`STORE` counts as a failure for exactly this purpose.
+
+**Modification sequences do not survive a renumbering.** They are only
+comparable within one `UIDVALIDITY`, and a renumbered mailbox may report a
+*lower* sequence than the one stored — so the assignment is conditional rather
+than `MAX(...)`, which would preserve a stale high watermark forever.
+`FenceUIDValidity` clears the watermark when it clears the message rows, and the
+flag delta asks for everything rather than "what changed since" a sequence that
+belongs to a mailbox the server no longer has.
+
+**What the fast path cannot see.** It never selects the destination, so
+destination-side drift — a message deleted there, or a `UIDVALIDITY` change at
+the far end — is invisible. `--full` is the escape hatch and diffs every folder
+regardless. The planned `--reconcile-every` was dropped: it wanted a schema
+column and a run counter to cover a case `--full` already covers on demand, and
+nothing in the failure reports asked for it.
+
+**Flag resync.** `FETCH 1:* (FLAGS) (CHANGEDSINCE n)` returns only what moved,
+so keeping flags in step costs a delta rather than a full scan. Without
+CONDSTORE the fallback is the full enumeration, which is what imapsync has
+always paid. Writing is `STORE ... FLAGS` — replacement of the whole set, not a
+computed add and remove, because the destination is a copy of the source and a
+difference applied as two commands is a difference that can be half-applied. The
+flags are compared in sorted form: servers are free to list them in any order,
+and an unsorted comparison would rewrite every flagged message in the account on
+every run and call it work.
+
+The two features compose. An unchanged modification sequence means no flag moved
+either, so the fast path skips the resync as well — the cheapest flag sync is the
+one that never starts. Default on, matching imapsync's `resyncflags = 1`;
+`--noresyncflags` turns it off.
+
+CONDSTORE does not report expunges (that is QRESYNC's job), so new-message
+detection still needs a UID diff on any folder that has moved.
 
 ### 5.7 Surviving the network
 
@@ -545,6 +586,15 @@ Three things follow:
 **QRESYNC is worth implementing ourselves.** It was deferred post-v1 on the
 grounds that go-imap lacks it. iCloud supporting it changes the calculus: the
 slow, throttled, 414,022-message side is exactly where resync cost is felt.
+
+**Folder enumeration costs 144 round trips — but only in `probe`.** Parallelising
+those `STATUS` calls was carried as an outstanding item from M2 to M4 and then
+cut, on discovering that `sync` never asks for `STATUS` at all: it lists folders
+with no return options and learns the counts it needs from `SELECT`, one folder
+at a time, already spread across the pool. The serial loop lives on a single bare
+connection inside `probe --status`, a diagnostic run occasionally. Giving `probe`
+a pool to speed itself up — against an account with strict connection limits —
+buys nothing the sync pays for. It can be built when something real asks for it.
 
 **Folder enumeration costs 144 round trips.** LIST-STATUS being unusable means a
 `STATUS` per folder, 60–200 ms each, which is most of the 35.7 s probe. This is
@@ -755,19 +805,61 @@ whether an append landed before retrying it. It produces silent duplicates, on
 exactly the failure the retry exists to survive, and only the exactly-once
 assertion catches it.
 
+### 9.4 What M4's mutations found
+
+Fifteen mutations across the fast path, the flag resync, the state layer and the
+command line. Three survived; two of them were real gaps and one is documented
+scaffolding.
+
+**A rejected `STORE` was not counted as a failure.** Removing `lv.failed` from
+the flag path changed nothing any test could see, because no test made the
+destination refuse a `STORE`. The consequence would have been the tombstone trap
+in flag-shaped form: the folder finishes clean, the watermark advances, the fast
+path skips the folder from then on, and one transient rejection becomes a
+permanent divergence. A decorator that refuses on demand now proves the folder is
+looked at again.
+
+**Flags were stored and never remembered.** Dropping the `RecordFlags` write
+survived, because the tests that counted `STORE`s never changed a flag twice.
+Every later run would have found the stored flags still disagreeing and issued
+the same command again — harmless once, a permanent tax on any folder somebody
+keeps touching. The test now runs a third pass over a folder that still looks
+changed and asserts nothing more is written.
+
+**A stale watermark survived a renumbering.** Removing the clause that clears it
+changed nothing, because the in-process server does not implement CONDSTORE and
+ignores `CHANGEDSINCE` — so a delta asked for relative to a meaningless sequence
+still returned everything. Against a real server it would have returned nothing,
+and the flags the fence had just made the state forget would have stayed
+forgotten. The test asserts on the sequence the fetch was asked for rather than
+on its result, which is the only observable the fake server can offer.
+
+**The barrier on the skipped folder is scaffolding.** Removing the `p.skipped`
+check survived, because a folder the fast path recognised has no destination
+mailbox recorded, so the flag resync finds no mapping to work through and stops
+anyway. It is kept and recorded here for what it prevents rather than what it
+does: a later change to that query turning a skipped folder into `STORE`s issued
+on a connection that never selected the mailbox.
+
+**Two tests exist only because a mutation demanded them.** The in-process server
+reports no `HIGHESTMODSEQ` at all, so everything about the fast path is tested
+through a decorator that states the sequence the test wants — including the case
+a real server makes hard to arrange, where the sequence has genuinely not moved.
+
 ## 10. Milestones
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state. *Done.*
-- **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3);
-  parallel folder `STATUS` remains outstanding (§6.3).
+- **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3).
 - **M3** — resilience: retry with backoff, a run-wide failure ceiling, a second
   pass over failed folders, progress reporting (§5.7). *Done.* The AIMD governor
   was deferred: the throttling it exists to answer has not been observed, and a
   controller tuned against a server that is not pushing back is a controller
   tuned against nothing.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
-  fallback (§6).
+  fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
+  `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder
+  `STATUS` was cut, because it is a `probe` cost and not a sync one — see below.
 - **M5** — `compat` shim, `--delete2` + safety valve, progress UI.
 - **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
   unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:

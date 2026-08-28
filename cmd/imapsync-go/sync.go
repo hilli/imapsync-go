@@ -60,6 +60,9 @@ type syncFlags struct {
 	memoryLimit string
 
 	progressEvery time.Duration
+	full          bool
+	resyncFlags   bool
+	noResyncFlags bool
 }
 
 func newSyncCmd() *cobra.Command {
@@ -122,6 +125,11 @@ watch for authentication failures.`,
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
 	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once")
 
+	cmd.Flags().BoolVar(&f.full, "full", false, "examine every folder, even ones the server says have not changed")
+	// Both spellings, because imapsync has both and this is meant to be a
+	// drop-in. The positive one carries the default so --help states it.
+	cmd.Flags().BoolVar(&f.resyncFlags, "resyncflags", true, "bring flags on already-copied messages back into line with the source")
+	cmd.Flags().BoolVar(&f.noResyncFlags, "noresyncflags", false, "leave flags on already-copied messages alone")
 	cmd.Flags().DurationVar(&f.progressEvery, "progress-interval", 30*time.Second, "how often to report what the sync has done so far; 0 to keep quiet")
 
 	cmd.Flags().DurationVar(&f.dialTimeout, "dial-timeout", 30*time.Second, "connection establishment timeout")
@@ -205,6 +213,8 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		PairID:        pairName,
 		Folders:       opts,
 		DryRun:        f.dryRun,
+		Full:          f.full,
+		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
 		ProgressEvery: f.progressEvery,
 		Logger:        slog.Default(),
 	}).Run(ctx)

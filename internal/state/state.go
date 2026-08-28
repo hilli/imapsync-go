@@ -206,6 +206,13 @@ func (d *DB) FenceUIDValidity(ctx context.Context, folderID int64, srcUIDValidit
 		if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE folder_id = ?`, folderID); err != nil {
 			return false, fmt.Errorf("invalidating folder %d: %w", folderID, err)
 		}
+		// The watermark goes with them. Modification sequences are only
+		// comparable within one UIDVALIDITY, and a renumbered mailbox can come
+		// back with a lower one than we stored — which would leave the folder
+		// looking permanently up to date to a fast path that trusts it.
+		if _, err := tx.ExecContext(ctx, `UPDATE folders SET src_highestmodseq = 0 WHERE id = ?`, folderID); err != nil {
+			return false, fmt.Errorf("clearing folder %d watermark: %w", folderID, err)
+		}
 	}
 	const update = `UPDATE folders SET src_uidvalidity = ?, dst_uidvalidity = ? WHERE id = ?`
 	if _, err := tx.ExecContext(ctx, update, srcUIDValidity, dstUIDValidity, folderID); err != nil {
@@ -219,8 +226,17 @@ func (d *DB) FenceUIDValidity(ctx context.Context, folderID int64, srcUIDValidit
 }
 
 // MarkSynced records a successful pass over a folder.
+//
+// A modseq of zero leaves the stored watermark alone rather than clearing it.
+// Two callers need that: a server that does not report HIGHESTMODSEQ at all,
+// and a folder that finished with messages still to copy, which must not
+// advance the watermark but has no reason to forget the last one it earned —
+// that older watermark still bounds which flags can have changed.
 func (d *DB) MarkSynced(ctx context.Context, folderID int64, highestModSeq uint64, at time.Time) error {
-	const update = `UPDATE folders SET src_highestmodseq = ?, last_sync = ? WHERE id = ?`
+	const update = `UPDATE folders
+	                SET src_highestmodseq = CASE WHEN ?1 = 0 THEN src_highestmodseq ELSE ?1 END,
+	                    last_sync = ?2
+	                WHERE id = ?3`
 	//nolint:gosec // modseq values are far below 2^63 in practice
 	if _, err := d.db.ExecContext(ctx, update, int64(highestModSeq), at.Unix(), folderID); err != nil {
 		return fmt.Errorf("marking folder %d synced: %w", folderID, err)
@@ -285,6 +301,67 @@ func (d *DB) SyncedUIDs(ctx context.Context, folderID int64, srcUIDValidity uint
 		return nil, fmt.Errorf("reading synchronised UIDs for folder %d: %w", folderID, err)
 	}
 	return out, nil
+}
+
+// Mirror is one copied message's place on both sides, together with the flags
+// it carried when it was copied.
+type Mirror struct {
+	SrcUID uint32
+	DstUID uint32
+	Flags  string
+}
+
+// Mirrored returns the messages of a folder that are known to exist on both
+// sides, with the destination UID that names each one.
+//
+// The destination UIDVALIDITY is part of the question rather than an
+// afterthought. A dst_uid recorded under a different validity names a message
+// that no longer exists, and a STORE against it would land on whatever occupies
+// that number now — silently marking a stranger read. When the destination has
+// been renumbered this returns nothing, which is the right answer: there is no
+// mapping left to update through.
+func (d *DB) Mirrored(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) ([]Mirror, error) {
+	const query = `
+SELECT src_uid, dst_uid, flags FROM messages
+WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = ? AND dst_uid != 0`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, srcUIDValidity, dstUIDValidity, StateDone)
+	if err != nil {
+		return nil, fmt.Errorf("reading the message map for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Mirror
+	for rows.Next() {
+		var m Mirror
+		if err := rows.Scan(&m.SrcUID, &m.DstUID, &m.Flags); err != nil {
+			return nil, fmt.Errorf("reading the message map for folder %d: %w", folderID, err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading the message map for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
+// RecordFlags remembers the flags a message now carries on the destination.
+//
+// This is written after the STORE, not before. The two orderings fail
+// differently: recording first and crashing leaves the state claiming a change
+// that never reached the server, and nothing would ever correct it. Recording
+// afterwards and crashing costs one repeated STORE on the next run, which sets
+// the flags to what they already are.
+func (d *DB) RecordFlags(ctx context.Context, folderID int64, srcUIDValidity, srcUID uint32, flags string) error {
+	const update = `
+UPDATE messages SET flags = ?
+WHERE folder_id = ? AND src_uidvalidity = ? AND src_uid = ?`
+
+	res, err := d.db.ExecContext(ctx, update, flags, folderID, srcUIDValidity, srcUID)
+	if err != nil {
+		return fmt.Errorf("recording flags of UID %d: %w", srcUID, err)
+	}
+	return expectOneRow(res, srcUID)
 }
 
 // BeginAppend records a message as in flight and commits before returning.

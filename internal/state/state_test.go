@@ -362,6 +362,129 @@ func TestMarkSyncedRoundTripsModSeq(t *testing.T) {
 	}
 }
 
+// TestARenumberedFolderKeepsNoWatermark.
+//
+// A modification sequence means something only within one UIDVALIDITY. A
+// renumbered mailbox is a different mailbox, and it can come back with a lower
+// sequence than the one recorded against its predecessor — so a watermark that
+// outlived the mailbox it described would eventually be matched by a folder
+// that had never been synchronised to that point, and skipped.
+func TestARenumberedFolderKeepsNoWatermark(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+	f := seedFolder(t, db, 111, 222)
+
+	if err := db.MarkSynced(ctx, f.ID, 900, time.Unix(1700000000, 0)); err != nil {
+		t.Fatalf("MarkSynced() error = %v", err)
+	}
+
+	kept, err := db.FenceUIDValidity(ctx, f.ID, 112, 222)
+	if err != nil {
+		t.Fatalf("FenceUIDValidity() error = %v", err)
+	}
+	if kept {
+		t.Fatal("FenceUIDValidity() kept state across a renumbering")
+	}
+
+	reloaded, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder() error = %v", err)
+	}
+	if reloaded.SrcHighestModSeq != 0 {
+		t.Errorf("SrcHighestModSeq = %d after renumbering, want 0", reloaded.SrcHighestModSeq)
+	}
+}
+
+// TestMarkSyncedTreatsZeroAsNoNews checks a run that has nothing to report does
+// not erase what an earlier one earned: a server with no CONDSTORE, or a folder
+// that finished with messages still to copy and must not advance its watermark.
+func TestMarkSyncedTreatsZeroAsNoNews(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+	f := seedFolder(t, db, 111, 222)
+
+	if err := db.MarkSynced(ctx, f.ID, 500, time.Unix(1700000000, 0)); err != nil {
+		t.Fatalf("MarkSynced() error = %v", err)
+	}
+	if err := db.MarkSynced(ctx, f.ID, 0, time.Unix(1700000100, 0)); err != nil {
+		t.Fatalf("MarkSynced() error = %v", err)
+	}
+
+	reloaded, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder() error = %v", err)
+	}
+	if reloaded.SrcHighestModSeq != 500 {
+		t.Errorf("SrcHighestModSeq = %d, want the 500 an earlier run earned", reloaded.SrcHighestModSeq)
+	}
+	if !reloaded.LastSync.Equal(time.Unix(1700000100, 0).UTC()) {
+		t.Errorf("LastSync = %v, want the later run's time", reloaded.LastSync)
+	}
+}
+
+// TestMirroredWillNotHandBackAMappingToARenumberedMailbox.
+//
+// A dst_uid recorded under one UIDVALIDITY names nothing once the destination
+// has renumbered, and the number it used to hold now belongs to some other
+// message. Handing the mapping back would let a flag resync mark a stranger
+// read — a corruption written by the tool that exists to avoid one.
+func TestMirroredWillNotHandBackAMappingToARenumberedMailbox(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+	f := seedFolder(t, db, 111, 222)
+	seedDone(t, db, f.ID, 111, 7, 222, 70)
+
+	got, err := db.Mirrored(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("Mirrored() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SrcUID != 7 || got[0].DstUID != 70 {
+		t.Fatalf("Mirrored() = %v, want one mapping 7 -> 70", got)
+	}
+
+	moved, err := db.Mirrored(ctx, f.ID, 111, 999)
+	if err != nil {
+		t.Fatalf("Mirrored() error = %v", err)
+	}
+	if len(moved) != 0 {
+		t.Errorf("Mirrored() = %v under a different destination UIDVALIDITY, want nothing", moved)
+	}
+}
+
+// TestRecordFlagsIsWhatMirroredReadsBack closes the loop: what one run writes
+// after a STORE is what the next run compares against, and a comparison against
+// something never written would repeat the STORE forever.
+func TestRecordFlagsIsWhatMirroredReadsBack(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+	f := seedFolder(t, db, 111, 222)
+	seedDone(t, db, f.ID, 111, 7, 222, 70)
+
+	if err := db.RecordFlags(ctx, f.ID, 111, 7, "\\Answered \\Seen"); err != nil {
+		t.Fatalf("RecordFlags() error = %v", err)
+	}
+
+	got, err := db.Mirrored(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("Mirrored() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Flags != "\\Answered \\Seen" {
+		t.Errorf("Mirrored() = %v, want the flags RecordFlags wrote", got)
+	}
+
+	if err := db.RecordFlags(ctx, f.ID, 111, 404, "\\Seen"); err == nil {
+		t.Error("RecordFlags() accepted a UID that is not in the folder")
+	}
+}
+
 func seedFolder(t *testing.T, db *DB, srcUIDValidity, dstUIDValidity uint32) Folder {
 	t.Helper()
 

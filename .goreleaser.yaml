@@ -1,0 +1,130 @@
+# Make sure to check the documentation at https://goreleaser.com
+
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - /bin/sh -c "set -e; mkdir -p completions; go run ./cmd/imapsync-go completion bash > completions/imapsync-go.bash; go run ./cmd/imapsync-go completion zsh > completions/imapsync-go.zsh; go run ./cmd/imapsync-go completion fish > completions/imapsync-go.fish; go run ./cmd/imapsync-go completion powershell > completions/imapsync-go.ps1"
+
+builds:
+  - id: imapsync-go
+    main: ./cmd/imapsync-go
+    binary: imapsync-go
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    # this name template makes the OS and Arch compatible with the results of `uname`.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    files:
+      - README.md
+      - LICENSE
+      - imapsync.example.yaml
+      - completions/*
+
+homebrew_casks:
+  - name: imapsync-go
+    commit_author:
+      name: Jens Hilligsøe
+      email: github@hilli.dk
+    commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
+    homepage: "https://github.com/hilli/imapsync-go"
+    description: "Concurrent IMAP account synchronisation"
+    url:
+      template: "https://github.com/hilli/imapsync-go/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+      verified: "github.com/hilli/imapsync-go/"
+    skip_upload: false
+    completions:
+      bash: completions/imapsync-go.bash
+      zsh: completions/imapsync-go.zsh
+      fish: completions/imapsync-go.fish
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/imapsync-go"]
+          end
+    repository:
+      owner: hilli
+      name: homebrew-tap
+      branch: release-imapsync-go-{{.Tag}}
+      pull_request:
+        enabled: true
+        draft: false
+
+nfpms:
+  - id: packages
+    file_name_template: "{{ .ConventionalFileName }}"
+    homepage: https://github.com/hilli/imapsync-go
+    description: |-
+      Concurrent IMAP account synchronisation
+    maintainer: Jens Hilligsøe <github@hilli.dk>
+    license: MIT
+    vendor: Jens Hilligsøe
+    bindir: /usr/bin
+    section: utils
+    contents:
+      - src: ./completions/imapsync-go.bash
+        dst: /usr/share/bash-completion/completions/imapsync-go
+        file_info:
+          mode: 0644
+      - src: ./completions/imapsync-go.fish
+        dst: /usr/share/fish/vendor_completions.d/imapsync-go.fish
+        file_info:
+          mode: 0644
+      - src: ./completions/imapsync-go.zsh
+        dst: /usr/share/zsh/vendor-completions/_imapsync-go
+        file_info:
+          mode: 0644
+      - src: ./LICENSE
+        dst: /usr/share/doc/imapsync-go/copyright
+        file_info:
+          mode: 0644
+    formats:
+      - apk
+      - deb
+      - rpm
+      - archlinux
+    deb:
+      lintian_overrides:
+        - statically-linked-binary
+        - changelog-file-missing-in-native-package
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch

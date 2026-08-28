@@ -13,7 +13,30 @@ work across them — folder-parallel *and* intra-folder parallel, so a single
 > single connection per side. The concurrency the project exists for is M2 and
 > does not exist yet. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
 
+## Install
+
+Homebrew (macOS, Linux):
+
+```sh
+brew install hilli/tap/imapsync-go
+```
+
+Otherwise grab a binary or `.deb`/`.rpm`/`.apk` from the [releases page], or
+build from source.
+
 ## Build and run
+
+With [Task] (`brew install go-task`):
+
+```sh
+task build       # -> bin/imapsync-go
+task test        # go test ./...
+task lint        # golangci-lint run ./...
+task complete    # generate shell completions into completions/
+task --list      # everything else
+```
+
+Or plain Go:
 
 ```sh
 go build -o imapsync-go ./cmd/imapsync-go
@@ -24,6 +47,16 @@ To run without building, pass the **package**, not the file:
 ```sh
 go run ./cmd/imapsync-go probe --help     # correct
 go run cmd/imapsync-go/main.go probe      # fails: compiles only main.go
+```
+
+## Shell completion
+
+Cobra generates completions for bash, zsh, fish and PowerShell. The Homebrew
+cask and the Linux packages install them for you; otherwise:
+
+```sh
+imapsync-go completion zsh > "$(brew --prefix)/share/zsh-completions/_imapsync-go"
+imapsync-go completion bash > "$(brew --prefix)/share/bash-completion/completions/imapsync-go"
 ```
 
 ## probe
@@ -184,6 +217,41 @@ what the next run will not have to do again. Press Ctrl-C once and the run winds
 down: in-flight appends are recorded before it exits, so an interrupt costs a
 few seconds rather than a folder.
 
+### Skipping folders nothing has touched
+
+A second run over an account that has not changed should not have to look at
+every message to find that out. Where the server supports CONDSTORE — iCloud
+does — each folder is asked for one number at `SELECT` time, and a folder whose
+number has not moved is skipped in that single command: no message listing, no
+destination connection.
+
+The number is only recorded by a run that finished the folder with nothing
+failed, so a message that could not be copied is always tried again rather than
+being silently written off.
+
+What this cannot see is the destination. A message deleted at the far end, or a
+mailbox renumbered there, leaves the source's number untouched. `--full` ignores
+the shortcut and compares every folder properly:
+
+```sh
+imapsync-go sync ... --full
+```
+
+### Flags
+
+Read, answered, flagged and your own keywords are copied with each message, and
+kept in step afterwards: a message you read on the source is marked read on the
+destination on the next run, and one you mark unread again comes back unread.
+This is on by default, as it is in imapsync. `--noresyncflags` turns it off.
+
+Finding out what changed is the expensive part, and CONDSTORE makes it cheap —
+the server is asked only for the flags that moved since the last run, rather than
+for all 414,000 of them. On a folder the shortcut above skipped, nothing is
+asked at all.
+
+Only flags travel. This is a one-way mirror, so a message you read on the
+*destination* will be marked unread again to match the source.
+
 ### Choosing folders
 
 | Flag | Effect |
@@ -223,6 +291,13 @@ go run ./cmd/imapsync-go probe --config imapsync.yaml --pair icloud-to-mox --sid
 ## Development
 
 ```sh
+task check       # lint + test
+task all         # lint, build, test, completions
+```
+
+Or directly:
+
+```sh
 go build ./...
 go vet ./...
 golangci-lint run ./...
@@ -232,8 +307,28 @@ go test -race ./...
 Tests run against go-imap's in-process `imapmemserver`, so no network or
 container is needed.
 
+## Releasing
+
+Releases are cut by [GoReleaser] from an annotated tag. Push a `v*` tag and the
+`Release` workflow builds binaries for Linux/macOS/Windows on amd64 and arm64,
+publishes archives and Linux packages to the GitHub release, and opens a PR
+against [hilli/homebrew-tap] with the updated cask.
+
+```sh
+task release-check   # validate .goreleaser.yaml
+task release-test    # full local snapshot into dist/, nothing published
+git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+```
+
+The workflow needs a `PACKAGES_TOKEN` repository secret with write access to
+`hilli/homebrew-tap`.
+
 ## Licence
 
 MIT
 
 [imapsync]: https://github.com/imapsync/imapsync
+[releases page]: https://github.com/hilli/imapsync-go/releases
+[Task]: https://taskfile.dev
+[GoReleaser]: https://goreleaser.com
+[hilli/homebrew-tap]: https://github.com/hilli/homebrew-tap
