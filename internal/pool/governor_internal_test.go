@@ -196,3 +196,47 @@ func TestTheWidthNeverReachesZero(t *testing.T) {
 		t.Errorf("Width() = %d, want a floor of 1", got)
 	}
 }
+
+// TestDebtIsNotPaidOnceTheShutdownHasCounted.
+//
+// Close works out how many tokens are in circulation and then waits for exactly
+// that many. A shrink destroys tokens as they come back. The two are in direct
+// conflict: one token destroyed after Close has taken its count and Close waits
+// for something that no longer exists — no error, no output, just a process
+// that has to be killed, which is the worst way for a sync tool to fail.
+//
+// The window is real but narrow. A worker refused between the shrink it caused
+// and its own repayment, while Close takes its count in between, hangs the
+// shutdown. It is also not schedulable: paying debt from the refusal path
+// drains debt to zero so promptly that a test cannot reliably arrange to be
+// inside it. So the rule is asserted directly rather than pretended to be
+// reachable through the pool's front door.
+func TestDebtIsNotPaidOnceTheShutdownHasCounted(t *testing.T) {
+	t.Parallel()
+
+	p := poolForClock(t, 8)
+
+	p.mu.Lock()
+	p.width, p.debt = 3, 5
+	p.mu.Unlock()
+
+	if !p.payDebt() {
+		t.Fatal("a token returned to a pool that owes five must be swallowed")
+	}
+
+	p.mu.Lock()
+	p.closed = true
+	counted := p.width + p.debt
+	p.mu.Unlock()
+
+	if p.payDebt() {
+		t.Errorf("a token returned after the shutdown counted %d must come home, not be destroyed", counted)
+	}
+
+	p.mu.Lock()
+	debt := p.debt
+	p.mu.Unlock()
+	if debt != 4 {
+		t.Errorf("debt = %d, want 4: the closed pool must not have recorded a payment", debt)
+	}
+}

@@ -229,17 +229,48 @@ Three failure modes get tests written at them deliberately rather than sampled:
 test can prove the mechanism honours whatever the window is; nothing available
 here can prove the number is right. The comment in the code says so.
 
-## 8. What a real run has to answer
+## 8. What a real run answered
 
-1. Does the destination pool ever shrink at width 16, or is mox's 30 simply never
-   reached in practice?
-2. If it shrinks, does it **settle** — or ratchet toward the floor, which would
-   mean the window is too short?
-3. Is ten seconds right?
+Run against mox on 2026-08-28: a pool capped at 40 against a server that holds
+30, forty workers, twelve leases each.
 
-Growth (the "AI" half of AIMD) is worth building when, and only when, (2)
-answers "it ratchets" or a run demonstrably ends far below the width it could
-have used.
+1. **Does it ever shrink?** Yes. One shrink, 40 → 23, then nothing.
+2. **Does it settle or ratchet?** It settles. 470 leases succeeded and 10 failed,
+   all ten in the opening burst before the pool knew where the wall was.
+3. **Is ten seconds right?** Still unanswered, and now much less load-bearing —
+   see below.
+
+The run also found two bugs that every unit test had passed, both because the
+tests primed the pool before pushing on it and a real run does not.
+
+**The signal arrived too late.** A successful *dial* was not evidence; only a
+completed lease was. But every worker dials at once, so the first refusals land
+before anybody has finished anything, and were judged against nothing. The pool
+never narrowed at all: 120 failed leases, no shrink, for the whole run. A dial
+that succeeds is stronger evidence than work that finished — it is the server
+accepting a connection, which is precisely the question — and it is available at
+the moment the refusals arrive. This also makes the ten-second window far less
+important, because the evidence now arrives in the same instant as the thing it
+is judging.
+
+**The tokens went round again.** A shrink cannot reclaim tokens already lent
+out, so it records what it is owed and collects them as they return — but only
+`put` paid, and `put` is the path a *successful* lease takes. The workers holding
+the excess tokens were the refused ones, and they handed theirs straight back.
+So the pool held a small width and went on lending concurrency it had already
+decided it could not have: 121 failed leases against 10, and the version that
+failed twelve times more was the one that settled on the *wider* number, which is
+how the bug stayed invisible. Every path that returns a token now pays.
+
+Both are worth recording as a method result: mutation testing found the machinery
+that was not needed, and only a real server found the machinery that was missing.
+
+The settled width of 23 is short of mox's true 30, because a shrink lands on what
+is demonstrably open at that instant rather than on the maximum. It never grows
+back, so that is a real cost, and it is the strongest argument yet for the
+increase half of AIMD. It is still not worth building on one measurement: the
+run is printed now, so the next few will say whether 23-of-30 is typical or was
+an artefact of forty workers starting in the same millisecond.
 
 ## 9. Related, separate — fixed
 

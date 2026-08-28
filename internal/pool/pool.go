@@ -237,7 +237,15 @@ func (p *Pool) Acquire(ctx context.Context, mailbox string) (*Lease, error) {
 
 	c, err := p.ready(ctx, mailbox)
 	if err != nil {
-		p.tokens <- struct{}{}
+		// A worker whose dial was refused is holding a token the pool may have
+		// already decided to destroy, and handing it straight back is what let
+		// a shrunk pool go on being refused indefinitely: the excess tokens
+		// simply went round again, each one producing another refusal. Debt is
+		// paid by whichever token comes back first, and a failed acquire
+		// returns one just as a finished lease does.
+		if !p.payDebt() {
+			p.tokens <- struct{}{}
+		}
 		return nil, err
 	}
 	return &Lease{pool: p, c: c}, nil
@@ -296,6 +304,14 @@ func (p *Pool) take(ctx context.Context) (*conn, error) {
 
 	p.mu.Lock()
 	p.open++
+	// A dial that completed is proof the server is alive and accepting, which
+	// is exactly what a dial that failed alongside it is judged against. It is
+	// recorded here rather than only on the return of a working connection
+	// because of the cold start: every worker dials at once, so the first
+	// refusals arrive before anybody has finished anything, and judging them
+	// against completed work would let a pool opened well past a server's limit
+	// sit there being refused for the length of the run.
+	p.lastOK = p.now()
 	p.mu.Unlock()
 	return &conn{c: c}, nil
 }
@@ -417,19 +433,8 @@ func (p *Pool) put(c *conn, err error) {
 		p.lastOK = p.now()
 	}
 
-	swallow := false
-	if p.closed {
+	if p.closed || p.open > p.width {
 		discard = true
-	} else {
-		if p.open > p.width {
-			discard = true
-		}
-		// Once closed, tokens must all come home: Close is counting them, and a
-		// token swallowed after it started counting would hang the shutdown.
-		if p.debt > 0 {
-			p.debt--
-			swallow = true
-		}
 	}
 
 	if discard {
@@ -442,9 +447,29 @@ func (p *Pool) put(c *conn, err error) {
 	if discard {
 		_ = c.c.Close()
 	}
-	if !swallow {
+	if !p.payDebt() {
 		p.tokens <- struct{}{}
 	}
+}
+
+// payDebt reports whether a token coming back should be destroyed rather than
+// put back into circulation, and records the payment if so.
+//
+// A shrink cannot take tokens that are already lent out, so it records how many
+// it is owed and collects them as they come home. Every path that gives a token
+// back must come through here, or the pool keeps lending out concurrency it has
+// already decided it cannot have.
+func (p *Pool) payDebt() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Once closed, tokens must all come home: Close is counting them, and a
+	// token swallowed after it started counting would hang the shutdown.
+	if p.closed || p.debt == 0 {
+		return false
+	}
+	p.debt--
+	return true
 }
 
 // Close logs out and closes every connection the pool holds.

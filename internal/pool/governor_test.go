@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,11 +58,17 @@ func (w *wall) stats() (dials, refused, live int) {
 
 // work leases a connection, pretends to use it, and releases it.
 func work(ctx context.Context, p *pool.Pool) error {
+	return workFor(ctx, p, time.Millisecond)
+}
+
+// workFor is work that holds the connection long enough to overlap with the
+// other workers, which is what makes spare tokens turn into real dials.
+func workFor(ctx context.Context, p *pool.Pool, hold time.Duration) error {
 	l, err := p.Acquire(ctx, "")
 	if err != nil {
 		return err
 	}
-	time.Sleep(time.Millisecond)
+	time.Sleep(hold)
 	l.Release(nil)
 	return nil
 }
@@ -311,5 +318,69 @@ func TestACapacityRefusalIsDistinguishableByCallers(t *testing.T) {
 	}
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("Acquire() error = %v, want the server's own error preserved beneath the judgement", err)
+	}
+}
+
+// TestAPoolOpenedPastTheLimitStopsFailingWork.
+//
+// Every other test here primes the pool first, and that priming was hiding a
+// bug that only a real server found. A run does not arrive one connection at a
+// time: forty workers start together and dial in the same instant, so the first
+// refusals land before anybody has finished any work. Judging those refusals
+// against completed work meant judging them against nothing, so they read as
+// "the server is gone" and the pool never narrowed at all.
+//
+// The measurement that matters is not the width but the work that fails.
+// Against mox, asking for forty where thirty are allowed: 121 leases failed
+// before this was right and 10 after, and the version that failed more was the
+// one that settled on the *wider* number. A pool can hold a small width and
+// still hand out concurrency it has already decided it cannot have, and every
+// worker that takes some gets refused again.
+func TestAPoolOpenedPastTheLimitStopsFailingWork(t *testing.T) {
+	t.Parallel()
+
+	const workers = 24
+	w := &wall{limit: 5}
+	p, err := pool.New(pool.Options{Cap: workers, Dial: w.dial})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	ctx := context.Background()
+
+	// No priming: this is the first thing that happens to the pool. Sustained
+	// overlapping load, because that is the only condition under which excess
+	// tokens turn into dials the server has to refuse.
+	var (
+		wg          sync.WaitGroup
+		early, late atomic.Int64
+	)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for round := range 8 {
+				if err := workFor(ctx, p, 3*time.Millisecond); err != nil {
+					if round < 2 {
+						early.Add(1)
+					} else {
+						late.Add(1)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := p.Width(); got > 5 {
+		t.Errorf("Width() = %d, want the pool narrowed to the server's limit of 5 without being primed", got)
+	}
+
+	// Failing while the pool works out where the wall is, is the design. Still
+	// failing six rounds later is the bug.
+	if n := late.Load(); n > 0 {
+		t.Errorf("%d leases failed after the pool had settled (%d during); a settled pool must stop handing out concurrency it cannot use",
+			n, early.Load())
 	}
 }
