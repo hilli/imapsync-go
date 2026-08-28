@@ -411,7 +411,7 @@ func TestReportSeparatesRequestedSkipsFromOurOwn(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, false); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()
@@ -439,7 +439,7 @@ func TestDryRunReportDoesNotClaimToHaveCopied(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, true); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, true, nil); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()
@@ -449,5 +449,39 @@ func TestDryRunReportDoesNotClaimToHaveCopied(t *testing.T) {
 	}
 	if strings.Contains(got, "8 copied") {
 		t.Errorf("a dry run must not say it copied anything, got:\n%s", got)
+	}
+}
+
+// TestReportSaysWhenAServerWouldNotHoldTheConnectionsAsked.
+//
+// The width a run settles on outlives the run: it is the only measurement
+// anyone has of what a server will actually hold, and if it is not written down
+// the next run asks for too many again. A side that got what it asked for has
+// nothing to say.
+func TestReportSaysWhenAServerWouldNotHoldTheConnectionsAsked(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{{Source: "AU", Dest: "AU", Messages: 8, Copied: 8}},
+	}
+
+	var out bytes.Buffer
+	err := writeSyncReport(&out, report, time.Second, false, connections{
+		{"source", "source-connections", 16, 16},
+		{"destination", "dest-connections", 16, 5},
+	})
+	if err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "destination server would not hold 16 connections") {
+		t.Errorf("the shrink must be reported, got:\n%s", got)
+	}
+	if !strings.Contains(got, "--dest-connections=5") {
+		t.Errorf("the report must name the flag to set next time, got:\n%s", got)
+	}
+	if strings.Contains(got, "source server would not hold") {
+		t.Errorf("a side that got what it asked for has nothing to report, got:\n%s", got)
 	}
 }

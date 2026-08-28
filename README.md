@@ -81,8 +81,11 @@ go run ./cmd/imapsync-go probe \
 Note the username needs no percent-encoding: everything before the **last** `@`
 is treated as the username, so an email address works as-is.
 
-`--max-connections` opens connections until the server refuses. It is off by
-default because it is intrusive; iCloud in particular throttles aggressively.
+`--max-connections` opens connections until the server refuses, and it is off by
+default because it is intrusive. Read the result carefully: if the search
+reaches the number you gave without being refused, no limit was found, and the
+report says so rather than calling your own cap a ceiling. Measured here, mox
+stopped dead at 30 while iCloud never refused at all.
 
 Add `--json` for machine-readable output.
 
@@ -157,11 +160,27 @@ The destination gets more connections than the source because appending is the
 slower half: the server has to accept, store and index a whole message where the
 source only has to read one back.
 
-Raise the counts gradually. Servers impose connection limits, and exceeding them
-is not always reported as such — iCloud in particular will refuse, throttle or
-simply stall rather than say plainly that you have opened too many. If a run
-starts failing or stalling after a change, lower the number rather than
-retrying: state is written as the copy proceeds, so a re-run resumes.
+Asking for more connections than a server will hold is not a disaster. When a
+connection is refused while the others are working normally, the pool takes that
+as the server's answer, drops to the number currently open, and closes what it
+cannot keep. The refused operation retries; nothing is lost. The run ends by
+telling you the width it settled on and which flag to set to start there next
+time, which is the only measurement of that server anyone has:
+
+```
+The destination server would not hold 16 connections; the run settled on 12.
+Pass --dest-connections=12 next time to start there and skip the refusals.
+```
+
+The pool never grows back within a run. Servers do not announce that a limit has
+lifted, so growing means probing for a refusal, and a refusal is what we were
+avoiding.
+
+Raise the counts gradually all the same. Not every server says plainly that you
+have opened too many, and a limit met as a stall rather than a refusal is
+invisible to this. If a run starts failing or stalling after a change, lower the
+number rather than retrying: state is written as the copy proceeds, so a re-run
+resumes.
 
 Bodies are held in memory between the fetch and the append, never spooled to
 disk. `--memory-limit` bounds that. A message larger than the whole limit is

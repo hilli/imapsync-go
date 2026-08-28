@@ -1217,9 +1217,13 @@ pure function, and the mutations that matter would stop being observable.
 - **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3).
 - **M3** — resilience: retry with backoff, a run-wide failure ceiling, a second
   pass over failed folders, progress reporting (§5.7). *Done.* The AIMD governor
-  was deferred: the throttling it exists to answer has not been observed, and a
+  was deferred: the throttling it exists to answer had not been observed, and a
   controller tuned against a server that is not pushing back is a controller
-  tuned against nothing.
+  tuned against nothing. Deferring it was right — when a wall was finally
+  measured it was on the destination, not the source, and it was a hard
+  connection count rather than a throttle, so §4.2's controller would have been
+  built against the wrong thing. A shrink-only governor was built afterwards;
+  see [its design](2026-08-28-connection-governor-design.md).
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
   `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder

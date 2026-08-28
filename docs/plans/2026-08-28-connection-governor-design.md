@@ -105,20 +105,37 @@ discards half the run's throughput to discover something already in hand.
 **New width = connections open at the moment of refusal.** One step, no
 overshoot, nothing to oscillate. Floor of 1. It never grows again (§6).
 
-### 4.1 The herd, and why the cooldown needs no clock
+### 4.1 The herd, and the cooldown that was not needed
 
 Thirty workers meet the wall in the same instant, so thirty refusals arrive. If
 each recomputed a width from a falling `open` count they would ratchet the pool
-to its floor over a single event. This is the most likely bug in the design.
+to its floor over a single event. This was the most likely bug in the design,
+and it was designed against directly: a cooldown suppressed refusals while a
+shrink was still being applied, using the unpaid token debt (§5) as the flag
+that said so.
 
-**While a shrink is still being applied, further refusals are ignored.** The pool
-already carries the state that says so — the unpaid token debt from the last
-decision (§5). Refusals arriving during that window are the echo of the event
-being answered.
+**The cooldown was built, and then deleted.** Mutation testing removed it and no
+test failed. Working out why showed it was not merely redundant but wrong.
 
-Once the pool has actually reached the new width, a further refusal is new
-information — another client took connections while we were shrinking — and it
-shrinks again. Convergent, and it tracks a limit that moves.
+The herd is already handled by the arithmetic. All thirty refusals read the same
+`open` count, so all thirty compute the same new width, and the guard `to >=
+width` means twenty-nine of them find the pool already where they would have put
+it. The protection is a consequence of shrinking to an observed number rather
+than a machine we added; halving would have needed the cooldown, which is
+probably why the design started with both.
+
+The only case where the cooldown changed the outcome was a connection breaking
+while the pool still owed tokens — `debt > 0 && open < width`. There, shrinking
+to `open` is the correct answer, and the cooldown withheld it.
+
+This is worth recording as a method result: the mutation did not find a bug in
+the code, it found machinery the code did not need. Removing it left the
+behaviour identical everywhere the tests could see and better in the one place
+they could not.
+
+Once the pool has reached the new width, a further refusal is new information —
+another client took connections while we were shrinking — and it shrinks again.
+Convergent, and it tracks a limit that moves.
 
 The refusing operation is unaffected: it retries as `Slower` under the existing
 exponential-with-jitter policy, so no message is dropped by any of this.
@@ -191,15 +208,20 @@ returns `io.ErrUnexpectedEOF` past a threshold is, for our purposes, mox. The
 test asserts the pool converges to the threshold and then **stops dialling past
 it** — the behaviour that matters, and the one a counter-only assertion misses.
 
-**Time needs a seam.** `Options.now func() time.Time`, defaulting to `time.Now`.
-One field, and the only way to test the restart case at all: advance past the
+**Time needs a seam.** A `now func() time.Time` on the pool, defaulting to
+`time.Now`. It is the only way to test the restart case at all: advance past the
 window, fail a dial, assert no shrink.
+
+It sits on `Pool` rather than on `Options` because `pool_test.go` is an external
+test package and could not have set an unexported option. Exporting it to make
+the tests convenient would have put a clock in the public API for no caller's
+benefit, so the clock tests live in-package instead.
 
 Three failure modes get tests written at them deliberately rather than sampled:
 
 | | |
 |---|---|
-| Herd | thirty simultaneous refusals shrink **once**. Without §4.1 this collapses to the floor. |
+| Herd | thirty simultaneous refusals shrink **once**, by the `to >= width` guard alone (§4.1). |
 | `Close` after shrink | must not hang. It fails *by hanging*, so it needs its own timeout and a clear message. |
 | Idle connections | the connections dropped must be **closed**, asserted on the fake's close count rather than on `Width()`. |
 
@@ -212,16 +234,26 @@ here can prove the number is right. The comment in the code says so.
 1. Does the destination pool ever shrink at width 16, or is mox's 30 simply never
    reached in practice?
 2. If it shrinks, does it **settle** — or ratchet toward the floor, which would
-   mean §4.1's cooldown is wrong or the window is too short?
+   mean the window is too short?
 3. Is ten seconds right?
 
 Growth (the "AI" half of AIMD) is worth building when, and only when, (2)
 answers "it ratchets" or a run demonstrably ends far below the width it could
 have used.
 
-## 9. Related, separate
+## 9. Related, separate — fixed
 
-`probe` reports *"Suggested concurrency: 47 (one below the ceiling, leaving
-headroom for other clients)"* for iCloud, where **no ceiling was found** — 47 is
-one below our own cap. `SuggestedConcurrency` does not distinguish "the server
-refused at 30" from "we stopped asking at 48". Its own fix and its own commit.
+`probe` reported *"Suggested concurrency: 47 (one below the ceiling, leaving
+headroom for other clients)"* for iCloud, where **no ceiling was found** — 47 was
+one below our own cap. `SuggestedConcurrency` could not distinguish "the server
+refused at 30" from "we stopped asking at 48", so the more we asked for, the
+lower its advice went, always by exactly one.
+
+`Report.Refused` now records which of the two ended the search. Where the server
+refused, the advice is unchanged: stay one below the wall so a competing client
+does not push the sync over it. Where the search only ran out of its own budget
+there is nothing to stay below, so the suggestion is the count itself and the
+output stops calling it a ceiling — a number we chose should not be written into
+a config as though it had been measured.
+
+Its own commit.

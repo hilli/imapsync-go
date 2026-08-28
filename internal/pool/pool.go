@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/hilli/imapsync-go/internal/imapx"
 )
@@ -46,7 +47,24 @@ type Options struct {
 	// pool wants ReadOnly true: EXAMINE avoids setting \Seen on messages
 	// merely by reading them, which would silently rewrite the source.
 	Select imapx.SelectOptions
+
+	// OnShrink, if set, is told when the pool gives up capacity. It exists so a
+	// run can report the width it settled at, which is the only evidence that
+	// says whether growing back would ever be worth building.
+	OnShrink func(from, to int, cause error)
 }
+
+// capacityWindow is how recently another connection must have finished work for
+// a failed dial to be read as the server's connection limit rather than as the
+// network.
+//
+// It has to outlast one slow operation — a large fetch over a bad link — without
+// outlasting a server restart, during which nothing succeeds anywhere. Ten
+// seconds is a judgement call between those two, and no test here can tell me it
+// is the right one: a test can only show that the mechanism honours whatever the
+// window is. It is a constant rather than a flag because nobody can tune what
+// they cannot observe.
+const capacityWindow = 10 * time.Second
 
 // Pool hands out exclusive leases on connections, dialling lazily up to Cap.
 //
@@ -55,12 +73,24 @@ type Options struct {
 // need them, and on a server that counts connections against a low ceiling the
 // unused ones are actively harmful.
 type Pool struct {
-	dial DialFunc
-	sel  imapx.SelectOptions
-	cap  int
+	dial     DialFunc
+	sel      imapx.SelectOptions
+	cap      int
+	onShrink func(from, to int, cause error)
 
-	// tokens is the concurrency limit, nothing more. It holds Cap values for
-	// the pool's whole life, so capacity can be neither leaked nor invented.
+	// now is the clock. It is a field only so that an in-package test can move
+	// time past capacityWindow without sleeping; nothing outside sets it, which
+	// is why it is not in Options.
+	now func() time.Time
+
+	// tokens is the concurrency limit, nothing more. It is created holding Cap
+	// values, and thereafter capacity can be neither leaked nor invented: it
+	// can only be destroyed, in one place, by shrink. The bookkeeping that says
+	// so is width and debt, and the invariant relating them to this channel is
+	//
+	//	tokens still in circulation == width + debt
+	//
+	// which is what Close relies on to know how many to wait for.
 	tokens chan struct{}
 
 	// done is closed by Close. Without it, an Acquire already blocked on
@@ -81,6 +111,19 @@ type Pool struct {
 	// nothing here should be read as claiming that it does.
 	idle   []*conn
 	closed bool
+
+	// width is how many connections the pool currently allows itself, starting
+	// at cap and only ever falling. debt is how much of the last reduction has
+	// yet to be taken out of circulation, and open is how many connections
+	// exist right now.
+	width int
+	debt  int
+	open  int
+
+	// lastOK is when a connection most recently finished work without error.
+	// It is the whole basis for telling a connection limit from a network
+	// fault: at a limit, the connections that got in keep working.
+	lastOK time.Time
 }
 
 // conn is one pooled connection and what it currently has selected.
@@ -103,11 +146,14 @@ func New(opts Options) (*Pool, error) {
 	}
 
 	p := &Pool{
-		dial:   opts.Dial,
-		sel:    opts.Select,
-		cap:    opts.Cap,
-		tokens: make(chan struct{}, opts.Cap),
-		done:   make(chan struct{}),
+		dial:     opts.Dial,
+		sel:      opts.Select,
+		cap:      opts.Cap,
+		onShrink: opts.OnShrink,
+		now:      time.Now,
+		tokens:   make(chan struct{}, opts.Cap),
+		done:     make(chan struct{}),
+		width:    opts.Cap,
 	}
 	for range opts.Cap {
 		p.tokens <- struct{}{}
@@ -117,6 +163,14 @@ func New(opts Options) (*Pool, error) {
 
 // Cap reports the configured ceiling.
 func (p *Pool) Cap() int { return p.cap }
+
+// Width reports how many connections the pool currently allows itself, which is
+// Cap until the server refuses one and never rises again afterwards.
+func (p *Pool) Width() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.width
+}
 
 // Lease is exclusive use of one connection until Release.
 type Lease struct {
@@ -234,20 +288,153 @@ func (p *Pool) take(ctx context.Context) (*conn, error) {
 
 	c, err := p.dial(ctx)
 	if err != nil {
+		if p.refused(err) {
+			return nil, fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, err))
+		}
 		return nil, fmt.Errorf("dialling: %w", err)
 	}
+
+	p.mu.Lock()
+	p.open++
+	p.mu.Unlock()
 	return &conn{c: c}, nil
 }
 
+// refused decides whether a failed dial was the server's connection limit, and
+// if so shrinks the pool to the width that is demonstrably working.
+//
+// The error cannot answer this on its own. A server at its limit may hang up
+// during authentication, which arrives as an unexpected EOF and is
+// indistinguishable from a dropped network connection — the same bytes, the same
+// Go error. What separates them is the surroundings: at a connection limit, the
+// connections that already got in carry on working, whereas a server that has
+// restarted or a network that has gone is failing everything at once.
+//
+// So the question asked here is whether any connection finished work in the last
+// capacityWindow. Answering no leaves the error classified as a retry, which
+// costs one attempt if this really was the limit. Answering yes when the server
+// has merely restarted would shrink the pool over a fault that has nothing to do
+// with counting, and since the width never rises again that would cost the rest
+// of the run. The cheaper mistake wins.
+func (p *Pool) refused(cause error) bool {
+	p.mu.Lock()
+
+	if p.closed || p.lastOK.IsZero() || p.now().Sub(p.lastOK) > capacityWindow {
+		p.mu.Unlock()
+		return false
+	}
+
+	// A wall is met by every worker at once, so one refusal arrives per worker.
+	// What stops that crowd walking the pool down to its floor is not a timer
+	// or a flag but the arithmetic below: every one of them reads the same
+	// number of open connections, so every one of them computes the same width,
+	// and all but the first find nothing left to do.
+	//
+	// A cooldown was built here first, suppressing refusals until the previous
+	// decision had been fully applied. Mutation testing could not find a
+	// behaviour that changed when it was removed, and working out why showed it
+	// was worse than redundant: the only case it altered was a connection
+	// breaking while the pool still owed tokens, where shrinking again is the
+	// correct answer and the cooldown withheld it.
+	//
+	// The connections currently open are exactly the ones the server is willing
+	// to hold, so that is the answer rather than something to search for by
+	// halving. Multiplicative decrease is for a limit you cannot see; this one
+	// can be read off at the moment of refusal.
+	to := max(p.open, 1)
+	if to >= p.width {
+		p.mu.Unlock()
+		return true
+	}
+
+	from := p.width
+	p.debt += p.width - to
+	p.width = to
+
+	// Pay what can be paid without waiting. A token sitting free belongs to
+	// nobody, so taking it now costs no one anything and makes the new width
+	// real immediately rather than whenever the next worker happens to finish.
+	for p.debt > 0 && p.takeFreeToken() {
+		p.debt--
+	}
+
+	closing := p.trimIdleLocked()
+	p.mu.Unlock()
+
+	for _, c := range closing {
+		_ = c.c.Close()
+	}
+	if p.onShrink != nil {
+		p.onShrink(from, to, cause)
+	}
+	return true
+}
+
+// takeFreeToken removes one token if one is free, without waiting. The caller
+// holds mu; a non-blocking receive cannot block, so it cannot deadlock.
+func (p *Pool) takeFreeToken() bool {
+	select {
+	case <-p.tokens:
+		return true
+	default:
+		return false
+	}
+}
+
+// trimIdleLocked removes idle connections until the pool holds no more than its
+// width allows, returning them for the caller to close outside the lock.
+//
+// Closing idle connections is not an optimisation. The server counts
+// connections, not busy ones, so a shrink that reduced only the concurrency
+// limit would leave the same number of sockets open and change nothing at all on
+// the wire.
+func (p *Pool) trimIdleLocked() []*conn {
+	var closing []*conn
+	for p.open > p.width && len(p.idle) > 0 {
+		n := len(p.idle) - 1
+		closing = append(closing, p.idle[n])
+		p.idle = p.idle[:n]
+		p.open--
+	}
+	return closing
+}
+
 // put returns a connection, or closes it if it can no longer be trusted.
+//
+// This is also where a shrink is paid for. A returning connection is closed
+// rather than parked when the pool now holds more than its width allows, and its
+// token is swallowed rather than returned when the pool still owes one. The two
+// are counted separately because they are separate resources: the server counts
+// connections, while the token is what stops another worker opening a
+// replacement.
 func (p *Pool) put(c *conn, err error) {
 	discard := errors.Is(err, imapx.ErrConnectionBroken)
 
 	p.mu.Lock()
+	if err == nil {
+		// Proof that the server is alive and serving, which is what a later
+		// failed dial is judged against.
+		p.lastOK = p.now()
+	}
+
+	swallow := false
 	if p.closed {
 		discard = true
+	} else {
+		if p.open > p.width {
+			discard = true
+		}
+		// Once closed, tokens must all come home: Close is counting them, and a
+		// token swallowed after it started counting would hang the shutdown.
+		if p.debt > 0 {
+			p.debt--
+			swallow = true
+		}
 	}
-	if !discard {
+
+	if discard {
+		p.open--
+	} else {
 		p.idle = append(p.idle, c)
 	}
 	p.mu.Unlock()
@@ -255,15 +442,22 @@ func (p *Pool) put(c *conn, err error) {
 	if discard {
 		_ = c.c.Close()
 	}
-	p.tokens <- struct{}{}
+	if !swallow {
+		p.tokens <- struct{}{}
+	}
 }
 
 // Close logs out and closes every connection the pool holds.
 //
-// It waits for outstanding leases to be released first, by taking every token:
-// since the number of tokens is fixed, holding them all means nobody else holds
-// anything. Closing a connection out from under a command in flight would race
-// with go-imap's own reader goroutine.
+// It waits for outstanding leases to be released first, by taking every token
+// still in circulation: holding them all means nobody else holds anything.
+// Closing a connection out from under a command in flight would race with
+// go-imap's own reader goroutine.
+//
+// The number to wait for is width+debt rather than cap, because a pool that has
+// shrunk has permanently destroyed the difference. Setting closed under the
+// mutex first is what makes that number safe to read: after it, no shrink starts
+// and no token is swallowed, so the count cannot move while it is being counted.
 func (p *Pool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -271,10 +465,11 @@ func (p *Pool) Close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
+	circulating := p.width + p.debt
 	p.mu.Unlock()
 	close(p.done)
 
-	for range p.cap {
+	for range circulating {
 		<-p.tokens
 	}
 

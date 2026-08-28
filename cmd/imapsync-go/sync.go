@@ -25,6 +25,14 @@ import (
 	"github.com/hilli/imapsync-go/internal/syncer"
 )
 
+// The two sides, named once. They reach the user in three different places —
+// log lines, the connection flags, and probe's --side — so a typo in any one of
+// them would be a lie that still compiled.
+const (
+	sideSource = "source"
+	sideDest   = "dest"
+)
+
 type syncFlags struct {
 	configPath string
 	pair       string
@@ -192,23 +200,25 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	// EXAMINE on the source: reading a message must not mark it \Seen, which
 	// would rewrite an account this tool is only supposed to read.
 	srcPool, err := pool.New(pool.Options{
-		Cap:    f.srcConns,
-		Dial:   dialer(source, f, f.insecureSrc, trace),
-		Select: imapx.SelectOptions{ReadOnly: true},
+		Cap:      f.srcConns,
+		Dial:     dialer(source, f, f.insecureSrc, trace),
+		Select:   imapx.SelectOptions{ReadOnly: true},
+		OnShrink: shrinkLogger(sideSource),
 	})
 	if err != nil {
 		return fmt.Errorf("source connections: %w", err)
 	}
-	defer closePool(ctx, srcPool, "source")
+	defer closePool(ctx, srcPool, sideSource)
 
 	dstPool, err := pool.New(pool.Options{
-		Cap:  f.dstConns,
-		Dial: dialer(dest, f, f.insecureDst, trace),
+		Cap:      f.dstConns,
+		Dial:     dialer(dest, f, f.insecureDst, trace),
+		OnShrink: shrinkLogger(sideDest),
 	})
 	if err != nil {
 		return fmt.Errorf("destination connections: %w", err)
 	}
-	defer closePool(ctx, dstPool, "dest")
+	defer closePool(ctx, dstPool, sideDest)
 
 	if pairName == "" {
 		pairName, err = derivePairID(source, dest)
@@ -232,7 +242,10 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		Logger:        slog.Default(),
 	}).Run(ctx)
 
-	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun)
+	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun, connections{
+		{"source", sideSource + "-connections", f.srcConns, srcPool.Width()},
+		{"destination", sideDest + "-connections", f.dstConns, dstPool.Width()},
+	})
 
 	// A run that ended badly still copied something, and after an interruption
 	// or a run the engine gave up on, what was copied is the thing worth
@@ -349,7 +362,7 @@ func syncEndpoints(f syncFlags) (source, dest config.Endpoint, folders config.Fo
 		URL:      f.destURL,
 		Password: config.Secret{Env: f.destPasswordEnv, File: f.destPasswordFile, Keychain: f.destPasswordKeychain},
 	}
-	for label, ep := range map[string]config.Endpoint{"source": source, "dest": dest} {
+	for label, ep := range map[string]config.Endpoint{sideSource: source, sideDest: dest} {
 		if err := ep.Password.Validate(); err != nil {
 			return source, dest, folders, "", fmt.Errorf("%s password: %w", label, err)
 		}
@@ -442,6 +455,19 @@ func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) poo
 	}
 }
 
+// shrinkLogger reports a pool giving up connections.
+//
+// Being refused is not a failure and nothing is lost by it, but it is the only
+// moment at which a server says what it will actually hold, and a run that
+// silently ran at half the requested width would look identical to a slow
+// server. So it is said out loud, once per adjustment.
+func shrinkLogger(side string) func(from, to int, cause error) {
+	return func(from, to int, cause error) {
+		slog.Info("server refused another connection, using fewer",
+			"side", side, "from", from, "to", to, "cause", cause)
+	}
+}
+
 func closePool(ctx context.Context, p *pool.Pool, label string) {
 	// LOGOUT is the polite ending and lets a server release the session
 	// promptly, which matters on accounts with a low connection ceiling. A
@@ -519,7 +545,33 @@ func statePath(override string) (string, error) {
 	return filepath.Join(dir, "state.db"), nil
 }
 
-func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration, dryRun bool) error {
+// writeConnectionNote reports any side that ended narrower than it started.
+//
+// The width a run settles on is worth more than the run: it is the only
+// measurement of what a server will actually hold, and it is what the next
+// run's connection flag should say. Putting it here means nobody has to infer
+// it from a throughput number.
+func writeConnectionNote(p *printer, conns connections) {
+	for _, c := range conns {
+		if c.got >= c.asked {
+			continue
+		}
+		p.printf("\nThe %s server would not hold %d connections; the run settled on %d.\nPass --%s=%d next time to start there and skip the refusals.\n",
+			c.side, c.asked, c.got, c.flag, c.got)
+	}
+}
+
+// connection is what one side of a run asked for and what it ended up with.
+type connection struct {
+	side  string
+	flag  string
+	asked int
+	got   int
+}
+
+type connections []connection
+
+func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration, dryRun bool, conns connections) error {
 	p := &printer{w: out}
 
 	if dryRun {
@@ -564,6 +616,8 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 		p.printf("\n%d %s the source listed but had no message for. Nothing was lost:\nthere is nothing at those numbers to copy, and they will not be asked for again.\n",
 			vanished, plural(vanished, "UID"))
 	}
+
+	writeConnectionNote(p, conns)
 
 	// A refusal is the one thing here that asks the reader to do something, so
 	// it says which folders and what to do about it rather than leaving a

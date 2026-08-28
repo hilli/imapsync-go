@@ -228,3 +228,29 @@ func TestWaitGivesUpWhenTheRunIsCancelled(t *testing.T) {
 		t.Errorf("Wait took %v to notice cancellation", took)
 	}
 }
+
+// TestACapacityRefusalOutranksTheEOFBeneathIt.
+//
+// This is the bug that measuring mox found. A server at its connection limit
+// hangs up during authentication, which arrives as an unexpected EOF, which on
+// its own means "the peer went away, dial again". Answering a server that is
+// asking for less load by immediately dialling into it is how a throttle becomes
+// a ban, and this package says so in its own comments while classifying it as a
+// prompt retry.
+//
+// The pool decides which EOF is which, because only the pool can see that the
+// other connections are still working. All that is required here is that its
+// judgement is not thrown away by the error it is wrapped around.
+func TestACapacityRefusalOutranksTheEOFBeneathIt(t *testing.T) {
+	t.Parallel()
+
+	bare := io.ErrUnexpectedEOF
+	if got := retry.Classify(bare); got != retry.Again {
+		t.Errorf("Classify(unexpected EOF) = %v, want %v: an EOF on its own is just a lost connection", got, retry.Again)
+	}
+
+	judged := fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, bare))
+	if got := retry.Classify(judged); got != retry.Slower {
+		t.Errorf("Classify(refusal at capacity) = %v, want %v", got, retry.Slower)
+	}
+}
