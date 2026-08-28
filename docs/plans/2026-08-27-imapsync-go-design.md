@@ -587,6 +587,15 @@ Three things follow:
 grounds that go-imap lacks it. iCloud supporting it changes the calculus: the
 slow, throttled, 414,022-message side is exactly where resync cost is felt.
 
+**Folder enumeration costs 144 round trips — but only in `probe`.** Parallelising
+those `STATUS` calls was carried as an outstanding item from M2 to M4 and then
+cut, on discovering that `sync` never asks for `STATUS` at all: it lists folders
+with no return options and learns the counts it needs from `SELECT`, one folder
+at a time, already spread across the pool. The serial loop lives on a single bare
+connection inside `probe --status`, a diagnostic run occasionally. Giving `probe`
+a pool to speed itself up — against an account with strict connection limits —
+buys nothing the sync pays for. It can be built when something real asks for it.
+
 **Folder enumeration costs 144 round trips.** LIST-STATUS being unusable means a
 `STATUS` per folder, 60–200 ms each, which is most of the 35.7 s probe. This is
 a natural first consumer of the destination pool: the calls are independent and
@@ -841,17 +850,16 @@ a real server makes hard to arrange, where the sequence has genuinely not moved.
 
 - **M0** — skeleton, config, `probe`, capability negotiation. *Done.*
 - **M1** — single-connection correct one-way sync + SQLite state. *Done.*
-- **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3);
-  parallel folder `STATUS` remains outstanding (§6.3).
+- **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3).
 - **M3** — resilience: retry with backoff, a run-wide failure ceiling, a second
   pass over failed folders, progress reporting (§5.7). *Done.* The AIMD governor
   was deferred: the throttling it exists to answer has not been observed, and a
   controller tuned against a server that is not pushing back is a controller
   tuned against nothing.
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
-  fallback (§6). *Done*, except parallel folder `STATUS`, which turned out to be
-  a `probe` cost rather than a sync one (§9.4). `SPECIAL-USE` mapping was already
-  built in M1. `--reconcile-every` was dropped in favour of `--full` (§5.6).
+  fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
+  `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder
+  `STATUS` was cut, because it is a `probe` cost and not a sync one — see below.
 - **M5** — `compat` shim, `--delete2` + safety valve, progress UI.
 - **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
   unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:
