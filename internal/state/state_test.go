@@ -644,3 +644,60 @@ func TestReadsProceedDuringWrites(t *testing.T) {
 		t.Errorf("only %d reads completed in 500ms of concurrent writing", reads)
 	}
 }
+
+// TestAGoneUIDIsRememberedButNotForEver.
+//
+// The tombstone is safe only because a UID is never reissued within one
+// UIDVALIDITY. When the server renumbers, a UID that was a phantom can come back
+// as a real message, so the record has to go with the rest.
+func TestAGoneUIDIsRememberedButNotForEver(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	folder, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	if err != nil {
+		t.Fatalf("EnsureFolder() error = %v", err)
+	}
+	if _, err := db.FenceUIDValidity(ctx, folder.ID, 100, 200); err != nil {
+		t.Fatalf("FenceUIDValidity() error = %v", err)
+	}
+
+	// Twice, because a phantom is re-enumerated on every run and must not
+	// become a second row or an error.
+	for range 2 {
+		if err := db.MarkGone(ctx, folder.ID, 100, 9001); err != nil {
+			t.Fatalf("MarkGone() error = %v", err)
+		}
+	}
+
+	known, err := db.SyncedUIDs(ctx, folder.ID, 100)
+	if err != nil {
+		t.Fatalf("SyncedUIDs() error = %v", err)
+	}
+	if got := known[9001]; got != StateGone {
+		t.Errorf("UID 9001 recorded as %q, want %q", got, StateGone)
+	}
+	if len(known) != 1 {
+		t.Errorf("recorded %d rows, want 1: MarkGone is not idempotent", len(known))
+	}
+
+	kept, err := db.FenceUIDValidity(ctx, folder.ID, 101, 200)
+	if err != nil {
+		t.Fatalf("FenceUIDValidity() error = %v", err)
+	}
+	if kept {
+		t.Fatal("a changed source UIDVALIDITY was not treated as a renumbering")
+	}
+	// Asked at the old UIDVALIDITY, which is where the row was written. Asking
+	// at the new one would pass whether or not the row was deleted, since every
+	// read is scoped by UIDVALIDITY anyway.
+	after, err := db.SyncedUIDs(ctx, folder.ID, 100)
+	if err != nil {
+		t.Fatalf("SyncedUIDs() error = %v", err)
+	}
+	if len(after) != 0 {
+		t.Errorf("%d rows survived renumbering, want 0: a tombstone outlived the numbering it was written under", len(after))
+	}
+}
