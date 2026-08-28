@@ -63,6 +63,7 @@ type syncFlags struct {
 	full          bool
 	resyncFlags   bool
 	noResyncFlags bool
+	subscribe     bool
 
 	delete2       bool
 	deleteCeiling float64
@@ -134,6 +135,7 @@ watch for authentication failures.`,
 	// drop-in. The positive one carries the default so --help states it.
 	cmd.Flags().BoolVar(&f.resyncFlags, "resyncflags", true, "bring flags on already-copied messages back into line with the source")
 	cmd.Flags().BoolVar(&f.noResyncFlags, "noresyncflags", false, "leave flags on already-copied messages alone")
+	cmd.Flags().BoolVar(&f.subscribe, "subscribe", true, "subscribe to destination folders as they are created, so clients show them")
 	cmd.Flags().BoolVar(&f.delete2, "delete2", false, "delete destination messages whose source counterpart is gone")
 	cmd.Flags().Float64Var(&f.deleteCeiling, "delete2-ceiling", 0.10, "refuse to delete more than this fraction of a folder's copied messages in one run")
 	cmd.Flags().BoolVar(&f.force, "force", false, "carry out deletions the ceiling would otherwise refuse")
@@ -222,6 +224,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		DryRun:        f.dryRun,
 		Full:          f.full,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
+		NoSubscribe:   !f.subscribe,
 		Delete2:       f.delete2,
 		DeleteCeiling: f.deleteCeiling,
 		Force:         f.force,

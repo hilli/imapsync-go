@@ -104,6 +104,14 @@ type Options struct {
 	// waiting for someone to construct Options without thinking about it.
 	NoResyncFlags bool
 
+	// NoSubscribe leaves destination folders this run creates unsubscribed.
+	//
+	// Negative for the same reason as NoResyncFlags: subscribing is imapsync's
+	// default and therefore this tool's, because a folder that exists but is
+	// unsubscribed is invisible in every client that browses by LSUB, and mail
+	// the owner cannot see may as well not have been copied.
+	NoSubscribe bool
+
 	// Delete2 removes destination messages whose source counterpart is gone.
 	//
 	// This is imapsync's --delete2: the destination ends up looking like the
@@ -527,6 +535,18 @@ func (s *Syncer) createFolders(ctx context.Context, names []string, report *Repo
 		}
 		report.Created = append(report.Created, name)
 		s.log.Info("created destination folder", "folder", name)
+
+		if s.opts.NoSubscribe {
+			continue
+		}
+		// A refused subscription does not fail the run. The mailbox exists and
+		// the mail will reach it; the folder being harder to find is a smaller
+		// harm than abandoning the copy, and some servers do not implement
+		// SUBSCRIBE at all.
+		if subErr := lease.Conn().SubscribeFolder(ctx, name); subErr != nil {
+			s.log.Warn("could not subscribe to destination folder",
+				"folder", name, "error", subErr)
+		}
 	}
 	return nil
 }

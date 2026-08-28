@@ -72,6 +72,7 @@ func (r AppendResult) Assigned() bool { return r.UID != 0 && r.UIDValidity != 0 
 type SyncOps interface {
 	Select(ctx context.Context, mailbox string, opts SelectOptions) (Mailbox, error)
 	CreateFolder(ctx context.Context, name string) error
+	SubscribeFolder(ctx context.Context, name string) error
 	AllUIDs(ctx context.Context) ([]uint32, error)
 	FetchMeta(ctx context.Context, uids []uint32, headerFields []string) ([]MessageMeta, error)
 	FetchBody(ctx context.Context, uid uint32, w io.Writer) (int64, error)
@@ -149,6 +150,22 @@ func (c *conn) CreateFolder(ctx context.Context, name string) error {
 		return nil
 	}
 	return fmt.Errorf("creating mailbox %q: %w", name, err)
+}
+
+// SubscribeFolder adds a mailbox to the subscription list.
+//
+// Subscription is how a mailbox becomes visible in clients that browse by LSUB
+// rather than LIST, which is most of them by default. A folder this tool
+// created but left unsubscribed exists and holds mail that the owner cannot
+// see, which is indistinguishable from not having copied it.
+func (c *conn) SubscribeFolder(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("subscribing to mailbox %q: %w", name, err)
+	}
+	if err := c.c.Subscribe(name).Wait(); err != nil {
+		return fmt.Errorf("subscribing to mailbox %q: %w", name, err)
+	}
+	return nil
 }
 
 // AllUIDs returns every UID in the selected mailbox, in ascending order.

@@ -77,8 +77,9 @@ func (f *fakeConn) Namespaces(context.Context) (imapx.Namespaces, error) {
 func (f *fakeConn) ListFolders(context.Context, imapx.ListOptions) ([]imapx.Folder, error) {
 	return nil, nil
 }
-func (f *fakeConn) CreateFolder(context.Context, string) error { return nil }
-func (f *fakeConn) AllUIDs(context.Context) ([]uint32, error)  { return nil, nil }
+func (f *fakeConn) CreateFolder(context.Context, string) error    { return nil }
+func (f *fakeConn) SubscribeFolder(context.Context, string) error { return nil }
+func (f *fakeConn) AllUIDs(context.Context) ([]uint32, error)     { return nil, nil }
 func (f *fakeConn) FetchMeta(context.Context, []uint32, []string) ([]imapx.MessageMeta, error) {
 	return nil, nil
 }
