@@ -2,6 +2,11 @@
 /imapsync-go
 /dist/
 /bin/
+/completions/
+/share/
+/coverage.out
+/coverage.html
+/.task/
 
 # Local state and spool
 *.db

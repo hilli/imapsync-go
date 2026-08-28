@@ -1,0 +1,128 @@
+# This is a Taskfile. See https://taskfile.dev
+# `brew install go-task` to install task runner or `go install github.com/go-task/task/v3/cmd/task@latest`
+# `task --list` to list all tasks
+# `task <taskname>` to run a task
+
+version: '3'
+
+vars:
+  GIT_SHA:
+    sh: git rev-parse --short HEAD
+  LDFLAGS: >-
+    -X main.version=dev-{{.GIT_SHA}}
+
+tasks:
+  build:
+    desc: Build the imapsync-go binary
+    aliases: [b]
+    cmds:
+      - go build -ldflags='-s -w {{.LDFLAGS}}' -o bin/imapsync-go{{exeExt}} ./cmd/imapsync-go
+    sources:
+      - cmd/**/*.go
+      - internal/**/*.go
+      - go.mod
+      - go.sum
+    generates:
+      - bin/imapsync-go
+
+  run:
+    desc: Run imapsync-go (pass args after --)
+    aliases: [r]
+    cmds:
+      - go run -ldflags='{{.LDFLAGS}}' ./cmd/imapsync-go {{.CLI_ARGS}}
+
+  complete:
+    desc: Generate shell completion scripts into completions/
+    aliases: [c]
+    deps: [build]
+    cmds:
+      - mkdir -p completions
+      - bin/imapsync-go completion bash > completions/imapsync-go.bash
+      - bin/imapsync-go completion zsh > completions/imapsync-go.zsh
+      - bin/imapsync-go completion fish > completions/imapsync-go.fish
+      - bin/imapsync-go completion powershell > completions/imapsync-go.ps1
+    sources:
+      - cmd/**/*.go
+      - Taskfile.yaml
+    generates:
+      - completions/imapsync-go.bash
+      - completions/imapsync-go.zsh
+      - completions/imapsync-go.fish
+      - completions/imapsync-go.ps1
+
+  complete:install:
+    desc: Install shell completions into the local Homebrew prefix
+    deps: [build]
+    cmds:
+      - bin/imapsync-go completion bash > {{.SHELL_COMP_PREFIX}}/share/bash-completion/completions/imapsync-go
+      - bin/imapsync-go completion zsh > {{.SHELL_COMP_PREFIX}}/share/zsh-completions/_imapsync-go
+    vars:
+      SHELL_COMP_PREFIX:
+        sh: |
+          if command -v brew >/dev/null 2>&1; then
+            brew --prefix
+          else
+            mkdir -p share/bash-completion/completions share/zsh-completions
+            echo .
+          fi
+
+  lint:
+    desc: Run golangci-lint
+    aliases: [l]
+    cmds:
+      - golangci-lint run ./...
+
+  lint:fix:
+    desc: Run golangci-lint with auto-fix
+    aliases: [lf]
+    cmds:
+      - golangci-lint run --fix ./...
+
+  test:
+    desc: Run tests
+    aliases: [t]
+    cmds:
+      - go test ./...
+
+  test:coverage:
+    desc: Run tests with coverage and write an HTML report
+    aliases: [tc]
+    cmds:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+    generates:
+      - coverage.out
+      - coverage.html
+
+  check:
+    desc: Run all checks (lint + test)
+    aliases: [ck]
+    cmds:
+      - task: lint
+      - task: test
+
+  all:
+    desc: Run everything (lint, build, test, complete)
+    aliases: [a]
+    cmds:
+      - task: lint
+      - task: build
+      - task: test
+      - task: complete
+
+  release-test:
+    desc: Build a goreleaser snapshot without publishing
+    cmds:
+      - goreleaser release --snapshot --clean --skip=publish,announce
+
+  release-check:
+    desc: Validate the goreleaser configuration
+    cmds:
+      - goreleaser check
+
+  clean:
+    desc: Remove build artifacts
+    aliases: [x]
+    cmds:
+      - rm -rf bin dist completions share
+      - rm -f coverage.out coverage.html
