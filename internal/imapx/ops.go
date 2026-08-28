@@ -77,6 +77,14 @@ type SyncOps interface {
 	FetchBody(ctx context.Context, uid uint32, w io.Writer) (int64, error)
 	Append(ctx context.Context, mailbox string, msg AppendMessage) (AppendResult, error)
 	SearchHeader(ctx context.Context, field, value string) ([]uint32, error)
+	FetchFlags(ctx context.Context, changedSince uint64) ([]FlagSet, error)
+	StoreFlags(ctx context.Context, uid uint32, flags []string) error
+}
+
+// FlagSet is one message's flags, as the server currently has them.
+type FlagSet struct {
+	UID   uint32
+	Flags []string
 }
 
 var _ SyncOps = (*conn)(nil)
@@ -208,6 +216,67 @@ func (c *conn) FetchMeta(ctx context.Context, uids []uint32, headerFields []stri
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// FetchFlags returns the flags of every message in the selected mailbox, or —
+// when changedSince is non-zero and the server supports CONDSTORE — only those
+// whose flags have changed since that modification sequence.
+//
+// The distinction is the difference between a command and a download. iCloud's
+// INBOX holds 414k messages, and asking for all of their flags on every run to
+// discover that three of them changed is the cost CONDSTORE exists to remove.
+// A caller that passes a modification sequence to a server that does not
+// support the extension would have it silently ignored and get everything, so
+// the option is only sent when the capability is there.
+func (c *conn) FetchFlags(ctx context.Context, changedSince uint64) ([]FlagSet, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("fetching flags: %w", err)
+	}
+
+	opts := &imap.FetchOptions{UID: true, Flags: true}
+	if changedSince != 0 && c.Caps().CondStore {
+		opts.ChangedSince = changedSince
+	}
+
+	all := imap.UIDSet{}
+	all.AddRange(1, 0)
+
+	buffers, err := c.c.Fetch(all, opts).Collect()
+	if err != nil {
+		return nil, fmt.Errorf("fetching flags: %w", err)
+	}
+
+	out := make([]FlagSet, 0, len(buffers))
+	for _, buf := range buffers {
+		fs := FlagSet{UID: uint32(buf.UID), Flags: make([]string, 0, len(buf.Flags))}
+		for _, f := range buf.Flags {
+			fs.Flags = append(fs.Flags, string(f))
+		}
+		out = append(out, fs)
+	}
+	return out, nil
+}
+
+// StoreFlags replaces one message's flags with the given set.
+//
+// Replacement rather than a computed add and remove: the destination is a copy
+// of the source, so what the source says is the answer, and a difference
+// arrived at by two commands is a difference that can be half-applied.
+func (c *conn) StoreFlags(ctx context.Context, uid uint32, flags []string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("storing flags on UID %d: %w", uid, err)
+	}
+
+	set := make([]imap.Flag, 0, len(flags))
+	for _, f := range flags {
+		set = append(set, imap.Flag(f))
+	}
+
+	store := &imap.StoreFlags{Op: imap.StoreFlagsSet, Silent: true, Flags: set}
+	if err := c.c.Store(toUIDSet([]uint32{uid}), store, nil).Close(); err != nil {
+		return fmt.Errorf("storing flags on UID %d: %w", uid, err)
+	}
+	return nil
 }
 
 // ErrMessageGone means the server returned no data for a UID that was expected

@@ -466,4 +466,96 @@ func TestOperationsRefuseACancelledContext(t *testing.T) {
 	if _, err := conn.SearchHeader(ctx, "Message-ID", "<x@y>"); !errors.Is(err, context.Canceled) {
 		t.Errorf("SearchHeader() error = %v, want context.Canceled", err)
 	}
+	if _, err := conn.FetchFlags(ctx, 0); !errors.Is(err, context.Canceled) {
+		t.Errorf("FetchFlags() error = %v, want context.Canceled", err)
+	}
+	if err := conn.StoreFlags(ctx, 1, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("StoreFlags() error = %v, want context.Canceled", err)
+	}
+}
+
+// TestStoreFlagsReplacesTheSet.
+//
+// Replacement rather than a computed add and remove: the destination is a copy
+// of the source, so a flag the source no longer has must come off, and a
+// difference applied as two commands is a difference that can be half-applied.
+func TestStoreFlagsReplacesTheSet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, rev2Caps())
+	conn := dialMem(t, addr)
+
+	body := testMessage("flagged", "flags@example.test")
+	res, err := conn.Append(ctx, "INBOX", imapx.AppendMessage{
+		Size:  int64(len(body)),
+		Body:  bytes.NewReader(body),
+		Flags: []string{"\\Seen", "\\Answered"},
+	})
+	if err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	if err := conn.StoreFlags(ctx, res.UID, []string{"\\Flagged"}); err != nil {
+		t.Fatalf("StoreFlags() error = %v", err)
+	}
+
+	got, err := conn.FetchFlags(ctx, 0)
+	if err != nil {
+		t.Fatalf("FetchFlags() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("FetchFlags() returned %d messages, want 1", len(got))
+	}
+	if !slices.Equal(got[0].Flags, []string{"\\Flagged"}) {
+		t.Errorf("flags = %v, want only \\Flagged: the old set was added to rather than replaced", got[0].Flags)
+	}
+}
+
+// TestFetchFlagsReadsTheWholeMailbox checks the enumeration a server without
+// CONDSTORE forces, which is the fallback the fast path exists to avoid.
+func TestFetchFlagsReadsTheWholeMailbox(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, rev2Caps())
+	conn := dialMem(t, addr)
+
+	want := map[uint32][]string{}
+	for i, flags := range [][]string{{"\\Seen"}, nil, {"\\Flagged", "\\Seen"}} {
+		body := testMessage(fmt.Sprintf("msg %d", i), fmt.Sprintf("f%d@example.test", i))
+		res, err := conn.Append(ctx, "INBOX", imapx.AppendMessage{
+			Size: int64(len(body)), Body: bytes.NewReader(body), Flags: flags,
+		})
+		if err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+		want[res.UID] = flags
+	}
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	got, err := conn.FetchFlags(ctx, 0)
+	if err != nil {
+		t.Fatalf("FetchFlags() error = %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("FetchFlags() returned %d messages, want %d", len(got), len(want))
+	}
+	for _, fs := range got {
+		wantFlags, ok := want[fs.UID]
+		if !ok {
+			t.Errorf("FetchFlags() returned unknown UID %d", fs.UID)
+			continue
+		}
+		slices.Sort(fs.Flags)
+		slices.Sort(wantFlags)
+		if !slices.Equal(fs.Flags, wantFlags) {
+			t.Errorf("UID %d flags = %v, want %v", fs.UID, fs.Flags, wantFlags)
+		}
+	}
 }

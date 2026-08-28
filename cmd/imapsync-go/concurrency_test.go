@@ -16,6 +16,9 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
+
+	"github.com/hilli/imapsync-go/internal/config"
+	"github.com/hilli/imapsync-go/internal/imapx"
 )
 
 func TestParseBytes(t *testing.T) {
@@ -367,5 +370,111 @@ func TestAnInterruptedRunStillSaysWhatItCopied(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "copied,") {
 		t.Fatalf("an interrupted run printed no report:\n%s", out.String())
+	}
+}
+
+// cliDial opens a connection to one of the in-process accounts, for the parts
+// of a test that need to act on a mailbox rather than observe it.
+func cliDial(t *testing.T, addr string) imapx.Conn {
+	t.Helper()
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("splitting %q: %v", addr, err)
+	}
+	var portNum int
+	if _, err := fmt.Sscanf(port, "%d", &portNum); err != nil {
+		t.Fatalf("parsing port %q: %v", port, err)
+	}
+
+	conn, err := imapx.Dial(context.Background(), imapx.DialOptions{
+		Addr:     config.Address{Host: host, Port: portNum, User: cliUser, TLS: config.TLSNone},
+		Password: cliPassword,
+	})
+	if err != nil {
+		t.Fatalf("dialling %q: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// unseenOn is the observable a person would use: how many messages a mailbox
+// says are unread.
+func unseenOn(t *testing.T, user *imapmemserver.User, mailbox string) uint32 {
+	t.Helper()
+
+	status, err := user.Status(mailbox, &imap.StatusOptions{NumUnseen: true})
+	if err != nil {
+		t.Fatalf("reading %q status: %v", mailbox, err)
+	}
+	if status.NumUnseen == nil {
+		t.Fatalf("server did not report unseen counts for %q", mailbox)
+	}
+	return *status.NumUnseen
+}
+
+// TestFlagsFollowTheSourceUnlessToldNotTo.
+//
+// Two things are under test and only one of them is the engine. The other is
+// that the flag reaches it: a --noresyncflags that the command accepts, prints
+// in its help and then ignores is worse than no option at all, because it
+// silently does the opposite of what it was asked.
+func TestFlagsFollowTheSourceUnlessToldNotTo(t *testing.T) {
+	srcAddr, srcUser, _ := startCountedAccount(t)
+	dstAddr, dstUser, _ := startCountedAccount(t)
+
+	for i := range 6 {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	run := func(extra ...string) string {
+		t.Helper()
+		return runCLI(t, append([]string{
+			"sync",
+			"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+			"--source-password-env", "TEST_IMAP_PASSWORD",
+			"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+			"--dest-password-env", "TEST_IMAP_PASSWORD",
+			"--state", statePath,
+			"--log-level", "error",
+		}, extra...))
+	}
+
+	if out := run(); !strings.Contains(out, "6 copied") {
+		t.Fatalf("did not copy everything:\n%s", out)
+	}
+	if got := unseenOn(t, dstUser, "INBOX"); got != 6 {
+		t.Fatalf("destination reports %d unread of 6 after the first copy", got)
+	}
+
+	// Somebody reads three messages on the source.
+	ctx := context.Background()
+	src := cliDial(t, srcAddr)
+	if _, err := src.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("selecting source: %v", err)
+	}
+	uids, err := src.AllUIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing source UIDs: %v", err)
+	}
+	for _, uid := range uids[:3] {
+		if err := src.StoreFlags(ctx, uid, []string{"\\Seen"}); err != nil {
+			t.Fatalf("marking %d seen: %v", uid, err)
+		}
+	}
+
+	run("--noresyncflags")
+	if got := unseenOn(t, dstUser, "INBOX"); got != 6 {
+		t.Errorf("destination reports %d unread of 6; --noresyncflags did not reach the engine", got)
+	}
+
+	run()
+	if got := unseenOn(t, dstUser, "INBOX"); got != 3 {
+		t.Errorf("destination reports %d unread, want 3; the flag resync did not run", got)
 	}
 }

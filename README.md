@@ -217,6 +217,41 @@ what the next run will not have to do again. Press Ctrl-C once and the run winds
 down: in-flight appends are recorded before it exits, so an interrupt costs a
 few seconds rather than a folder.
 
+### Skipping folders nothing has touched
+
+A second run over an account that has not changed should not have to look at
+every message to find that out. Where the server supports CONDSTORE — iCloud
+does — each folder is asked for one number at `SELECT` time, and a folder whose
+number has not moved is skipped in that single command: no message listing, no
+destination connection.
+
+The number is only recorded by a run that finished the folder with nothing
+failed, so a message that could not be copied is always tried again rather than
+being silently written off.
+
+What this cannot see is the destination. A message deleted at the far end, or a
+mailbox renumbered there, leaves the source's number untouched. `--full` ignores
+the shortcut and compares every folder properly:
+
+```sh
+imapsync-go sync ... --full
+```
+
+### Flags
+
+Read, answered, flagged and your own keywords are copied with each message, and
+kept in step afterwards: a message you read on the source is marked read on the
+destination on the next run, and one you mark unread again comes back unread.
+This is on by default, as it is in imapsync. `--noresyncflags` turns it off.
+
+Finding out what changed is the expensive part, and CONDSTORE makes it cheap —
+the server is asked only for the flags that moved since the last run, rather than
+for all 414,000 of them. On a folder the shortcut above skipped, nothing is
+asked at all.
+
+Only flags travel. This is a one-way mirror, so a message you read on the
+*destination* will be marked unread again to match the source.
+
 ### Choosing folders
 
 | Flag | Effect |

@@ -93,6 +93,17 @@ type Options struct {
 	// discovering that one message at a time.
 	GiveUpAfter int
 
+	// Full ignores the CONDSTORE fast path and diffs every folder, however
+	// certain the source is that nothing has changed.
+	Full bool
+
+	// NoResyncFlags turns off copying flag changes onto messages that are
+	// already there. Negative, so that the zero Options is the default
+	// behaviour: imapsync resynchronises flags unless told not to, and a field
+	// whose zero value disagreed with the product's default would be a bug
+	// waiting for someone to construct Options without thinking about it.
+	NoResyncFlags bool
+
 	// ProgressEvery is how often the run says what it has done so far. Zero
 	// silences it, which is the right default for a caller that has its own
 	// idea of what to report; the command line sets its own interval.
@@ -170,6 +181,9 @@ type FolderReport struct {
 	// AlreadyDone is how many the state database had already recorded. On a
 	// second run of an unchanged account this is everything.
 	AlreadyDone int
+	// Reflagged is how many had their flags brought back into line on the
+	// destination without being copied again.
+	Reflagged int
 	// Failed is how many were abandoned; see Errors.
 	Failed int
 
@@ -624,6 +638,12 @@ func (l *live) adopted(n int) {
 	l.health.progress(0, n)
 }
 
+func (l *live) reflagged() {
+	l.mu.Lock()
+	l.report.Reflagged++
+	l.mu.Unlock()
+}
+
 // failed records an abandoned message. Only the first few reasons are kept:
 // a folder that fails ten thousand times has one problem, not ten thousand.
 func (l *live) failed(uid uint32, reason string) {
@@ -651,6 +671,19 @@ type prepared struct {
 	src, dst imapx.Mailbox
 	// todo is the source UIDs still to copy, in the order the server gave them.
 	todo []uint32
+	// since is the modification sequence the last completed sync earned, which
+	// is what a flag delta is asked for relative to. Zero means ask for
+	// everything.
+	since uint64
+	// skipped means the fast path recognised the folder and nothing below the
+	// SELECT ran, so there is no destination mailbox here — and, because there
+	// is none, no lease on it either. It is a barrier rather than an
+	// optimisation: no test can distinguish it today, since the zero
+	// destination mailbox already makes the flag resync find no mapping to work
+	// through. What it prevents is a later change to that query turning a
+	// skipped folder into STOREs issued on a connection that never selected the
+	// mailbox.
+	skipped bool
 }
 
 // syncFolder copies one mailbox.
@@ -664,13 +697,203 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	if err != nil {
 		return lv.snapshot(), err
 	}
+	// A folder the fast path recognised arrives here with nothing to copy, and
+	// copyFolder is a no-op on an empty list, so the two paths need no
+	// distinguishing beyond that.
 	if err := s.copyFolder(ctx, pair, p, lv); err != nil {
 		return lv.snapshot(), err
 	}
-	if err := s.db.MarkSynced(ctx, p.folderID, p.src.HighestModSeq, time.Now()); err != nil {
+
+	if err := s.resyncFlags(ctx, pair, p, lv); err != nil {
+		return lv.snapshot(), err
+	}
+
+	// The stored modseq is what the next run's fast path trusts, and it means
+	// one specific thing: everything the source held at that point is on the
+	// destination. Advancing it after a folder that left messages behind would
+	// turn a failure into a tombstone — the folder would be skipped from then
+	// on and those messages would never be tried again. So a folder that
+	// failed anything keeps its old watermark and gets diffed properly next
+	// time.
+	fr := lv.snapshot()
+	modseq := p.src.HighestModSeq
+	if fr.Failed > 0 {
+		modseq = 0
+	}
+	if err := s.db.MarkSynced(ctx, p.folderID, modseq, time.Now()); err != nil {
 		return lv.snapshot(), fmt.Errorf("recording folder completion: %w", err)
 	}
-	return lv.snapshot(), nil
+	return fr, nil
+}
+
+// watermark is the modification sequence a flag delta can be asked for relative
+// to.
+//
+// A sequence only means anything within one UIDVALIDITY. After a renumbering
+// the stored one describes a mailbox the server no longer has, and asking what
+// changed since it invites an answer that is wrong in the quiet direction:
+// nothing comes back, so nothing is updated, and the flags the fence has just
+// made the state forget stay forgotten.
+func watermark(row state.Folder, kept bool) uint64 {
+	if !kept {
+		return 0
+	}
+	return row.SrcHighestModSeq
+}
+
+// resyncFlags brings the destination's flags back into line with the source's
+// for messages that are already copied.
+//
+// imapsync does this by default, and the reason is that a mailbox is not just
+// its messages: read, answered and flagged are the state a person built up over
+// years, and a mirror that loses them has lost something that cannot be
+// recomputed. So the default is on.
+//
+// The expensive part is finding out what changed. Asking a 414k-message INBOX
+// for every flag on every run, to learn that three of them moved, is the cost
+// CONDSTORE removes: with a watermark from the last completed sync the server
+// is asked only for what has changed since, and on a quiet folder that is an
+// empty response. Without CONDSTORE the fallback is the full enumeration, which
+// is what imapsync has always paid.
+//
+// Note what does not reach here at all: a folder the fast path recognised. An
+// unchanged modification sequence means no flag moved either, so the cheapest
+// flag resync is the one that is never started.
+func (s *Syncer) resyncFlags(ctx context.Context, pair folder.Pair, p *prepared, lv *live) (err error) {
+	if s.opts.NoResyncFlags || p.skipped {
+		return nil
+	}
+
+	// The destination UIDVALIDITY is part of this question. If it moved, every
+	// dst_uid we hold names a message that no longer exists, and a STORE
+	// against one would land on whatever occupies that number now. Mirrored
+	// returns nothing in that case, which ends the work here.
+	mirrors, err := s.db.Mirrored(ctx, p.folderID, p.src.UIDValidity, p.dst.UIDValidity)
+	if err != nil {
+		return err
+	}
+	if len(mirrors) == 0 {
+		return nil
+	}
+	byUID := make(map[uint32]state.Mirror, len(mirrors))
+	for _, m := range mirrors {
+		byUID[m.SrcUID] = m
+	}
+
+	current, err := s.sourceFlags(ctx, pair.Source, p.since)
+	if err != nil {
+		return err
+	}
+
+	type change struct {
+		srcUID, dstUID uint32
+		flags          []string
+		text           string
+	}
+	var changes []change
+	for _, fs := range current {
+		m, ok := byUID[fs.UID]
+		if !ok {
+			continue
+		}
+		flags := copyableFlags(fs.Flags)
+		text := flagText(flags)
+		if text == flagText(strings.Fields(m.Flags)) {
+			continue
+		}
+		changes = append(changes, change{srcUID: fs.UID, dstUID: m.DstUID, flags: flags, text: text})
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+
+	// One destination connection for the whole batch, held across the STOREs.
+	// STORE needs the mailbox selected, unlike APPEND, so this cannot borrow
+	// the pool per message the way the copy path does. Serial is deliberate:
+	// the delta a CONDSTORE server hands back is normally a handful of
+	// messages, and spending several connections on it would take them from
+	// folders that have real work.
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	dst := lease.Conn()
+
+	if _, err = dst.Select(ctx, pair.Dest, imapx.SelectOptions{}); err != nil {
+		return fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+
+	for _, c := range changes {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if err = dst.StoreFlags(ctx, c.dstUID, c.flags); err != nil {
+			if errors.Is(err, imapx.ErrConnectionBroken) {
+				return fmt.Errorf("storing flags on UID %d: %w", c.dstUID, err)
+			}
+			// One message's flags failing is not the folder's problem, but it
+			// must count: a folder that failed anything keeps its old
+			// watermark, so this will be tried again rather than lost.
+			lv.failed(c.srcUID, fmt.Sprintf("storing flags: %v", err))
+			err = nil
+			continue
+		}
+		// Detached for the same reason the copy path detaches: the flags are
+		// on the destination by now, and an interrupt must not leave the state
+		// disagreeing with the server about what was already done.
+		settled, done := context.WithTimeout(context.WithoutCancel(ctx), stateWriteGrace)
+		err = s.db.RecordFlags(settled, p.folderID, p.src.UIDValidity, c.srcUID, c.text)
+		done()
+		if err != nil {
+			return fmt.Errorf("recording flags of message %d: %w", c.srcUID, err)
+		}
+		lv.reflagged()
+	}
+
+	s.log.Info("flags resynchronised", "source", pair.Source, "dest", pair.Dest, "messages", len(changes))
+	return nil
+}
+
+// sourceFlags reads the flags the source currently holds, on a borrowed
+// connection, asking only for what changed since the given sequence when the
+// server can answer that question.
+func (s *Syncer) sourceFlags(ctx context.Context, name string, since uint64) (_ []imapx.FlagSet, err error) {
+	lease, err := s.src.Acquire(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring source connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	if _, err = lease.Conn().Select(ctx, name, imapx.SelectOptions{ReadOnly: true}); err != nil {
+		return nil, fmt.Errorf("selecting source mailbox: %w", err)
+	}
+	return lease.Conn().FetchFlags(ctx, since)
+}
+
+// flagText is the canonical form of a flag set, for storing and for comparing.
+//
+// Sorted, because servers are free to list flags in any order and an unsorted
+// join would report a change every run for a message nobody touched.
+func flagText(flags []string) string {
+	out := slices.Clone(flags)
+	slices.Sort(out)
+	return strings.Join(out, " ")
+}
+
+// unchanged reports whether the fast path applies to this folder.
+//
+// Every condition here is load-bearing. A watermark of zero is a server that
+// does not report modification sequences, or a folder that has never completed;
+// a UIDVALIDITY that has moved means the stored sequence describes a mailbox
+// that no longer exists; and --full is how someone who suspects the destination
+// has drifted asks for everything to be checked, since nothing about the source
+// can reveal a message deleted at the far end.
+func (s *Syncer) unchanged(row state.Folder, src imapx.Mailbox) bool {
+	if s.opts.Full || row.SrcHighestModSeq == 0 || src.HighestModSeq == 0 {
+		return false
+	}
+	return row.SrcUIDValidity == src.UIDValidity && row.SrcHighestModSeq == src.HighestModSeq
 }
 
 // prepareFolder works out what has to be copied, on one connection per side.
@@ -693,6 +916,27 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	}
 	lv.report.Messages = int(srcBox.NumMessages)
 
+	row, err := s.db.EnsureFolder(ctx, s.opts.PairID, pair.Source, pair.Dest)
+	if err != nil {
+		return nil, fmt.Errorf("recording folder: %w", err)
+	}
+
+	// The fast path. A modification sequence that has not moved means nothing
+	// in this mailbox has been added, deleted or reflagged since the watermark
+	// was earned, and that watermark is only written when a folder finished
+	// with every message copied. So there is nothing to do, and finding that
+	// out cost one SELECT rather than a UID listing of the whole mailbox.
+	//
+	// On an account of 144 folders and 776k messages this is most of a repeat
+	// run: without it every folder pays for enumerating every UID it holds,
+	// against a server that is charging by the round trip.
+	if s.unchanged(row, srcBox) {
+		lv.report.AlreadyDone = int(srcBox.NumMessages)
+		s.log.Info("folder unchanged", "source", pair.Source, "dest", pair.Dest,
+			"messages", srcBox.NumMessages, "modseq", srcBox.HighestModSeq)
+		return &prepared{folderID: row.ID, src: srcBox, skipped: true}, nil
+	}
+
 	dstLease, err := s.dst.Acquire(ctx, pair.Dest)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring destination connection: %w", err)
@@ -706,11 +950,6 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	}
 	if dstBox.ReadOnly {
 		return nil, fmt.Errorf("destination mailbox %q is read-only", pair.Dest)
-	}
-
-	row, err := s.db.EnsureFolder(ctx, s.opts.PairID, pair.Source, pair.Dest)
-	if err != nil {
-		return nil, fmt.Errorf("recording folder: %w", err)
 	}
 
 	kept, err := s.db.FenceUIDValidity(ctx, row.ID, srcBox.UIDValidity, dstBox.UIDValidity)
@@ -744,7 +983,7 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 		return nil, fmt.Errorf("enumerating source messages: %w", err)
 	}
 
-	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox}
+	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox, since: watermark(row, kept)}
 	for _, uid := range uids {
 		if known[uid] == state.StateDone {
 			lv.report.AlreadyDone++
@@ -1068,7 +1307,7 @@ func (s *Syncer) fetchOne(
 		SrcUID:         meta.UID,
 		IdentHash:      id.Digest,
 		Size:           meta.Size,
-		Flags:          strings.Join(flags, " "),
+		Flags:          flagText(flags),
 		InternalDate:   meta.InternalDate,
 	}
 	if id.NeedsStamp() {
