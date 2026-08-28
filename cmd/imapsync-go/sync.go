@@ -566,11 +566,11 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	// it says which folders and what to do about it rather than leaving a
 	// number in a column to be noticed.
 	if refused > 0 {
-		p.printf("\nREFUSED to delete %d %s. That is a larger share of a folder's copied\nmessages than --delete2-ceiling allows to go in one run, and the usual cause is a\nsource that answered a listing with less than the truth.\n",
+		p.printf("\nREFUSED to delete %d %s. That is a larger share of the destination folder\nthan --delete2-ceiling allows to go in one run, and the usual cause is a source\nthat answered a listing with less than the truth.\n",
 			refused, plural(refused, "message"))
 		for _, fr := range report.Folders {
 			if fr.Refused > 0 {
-				p.printf("  %s: %d of %d\n", fr.Dest, fr.Refused, fr.Refused+fr.AlreadyDone+fr.Copied)
+				p.printf("  %s: %d of %d\n", fr.Dest, fr.Refused, fr.DestMessages)
 			}
 		}
 		p.println("\nCheck the source, then pass --force to go ahead, or raise --delete2-ceiling.")

@@ -378,6 +378,45 @@ type Mirror struct {
 	Flags  string
 }
 
+// Ident pairs a source message with the digest that identifies it.
+type Ident struct {
+	SrcUID    uint32
+	IdentHash string
+}
+
+// Idents returns what is known about the identity of each recorded source
+// message in a folder.
+//
+// Deliberately not scoped by destination UIDVALIDITY, unlike Mirrored. This
+// answers "what does the source hold", and the answer does not stop being true
+// because the destination was renumbered. Scoping it would empty the set
+// exactly when the destination is full of messages that need matching against
+// it, and every one of them would look like a stranger.
+func (d *DB) Idents(ctx context.Context, folderID int64, srcUIDValidity uint32) ([]Ident, error) {
+	const query = `
+SELECT src_uid, ident_hash FROM messages
+WHERE folder_id = ? AND src_uidvalidity = ? AND state = ?`
+
+	rows, err := d.db.QueryContext(ctx, query, folderID, srcUIDValidity, StateDone)
+	if err != nil {
+		return nil, fmt.Errorf("reading identities for folder %d: %w", folderID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Ident
+	for rows.Next() {
+		var id Ident
+		if err := rows.Scan(&id.SrcUID, &id.IdentHash); err != nil {
+			return nil, fmt.Errorf("reading identities for folder %d: %w", folderID, err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading identities for folder %d: %w", folderID, err)
+	}
+	return out, nil
+}
+
 // Mirrored returns the messages of a folder that are known to exist on both
 // sides, with the destination UID that names each one.
 //

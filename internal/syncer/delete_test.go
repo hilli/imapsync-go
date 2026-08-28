@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -139,55 +140,67 @@ func TestDeletingFollowsTheSourceWhenAskedFor(t *testing.T) {
 	}
 }
 
-// TestDeletingNeverTouchesWhatItDidNotPut is the promise that makes this safe to
-// point at a destination that is not empty.
+// TestDeletingReachesMailItDidNotCopy is imapsync's --delete2, and the reason
+// it is worth the extra care: somebody moving over from imapsync expects a
+// destination that ends up looking like the source. A tool that quietly left
+// behind every message it had not personally copied would be a worse surprise
+// than one that deletes, because the surprise arrives silently and only shows
+// up as a mailbox that never quite matches.
 //
-// The state database is the only record of what this tool is responsible for. A
-// message it never copied has no row, and so can never be nominated however
-// long the source goes without mentioning anything like it.
-//
-// The strangers have to be genuinely unlike anything on the source. A
-// destination message identical to a source one is adopted on the first run —
-// recorded as the copy that would otherwise have been made — and from then on it
-// is ours, so following the source in deleting it is right.
-func TestDeletingNeverTouchesWhatItDidNotPut(t *testing.T) {
+// The handle on mail nobody recorded copying is its identity — the same digest
+// adoption matches on. If the source has nothing that looks like it, it goes.
+func TestDeletingReachesMailItDidNotCopy(t *testing.T) {
 	t.Parallel()
 
 	h := newDeleteHarness(t)
 	fill(t, h.src, "INBOX", 10)
 
 	// Mail that was on the destination first, and has no counterpart anywhere.
-	var stranger []string
 	for i := range 4 {
-		subject := fmt.Sprintf("stranger-%04d", i)
-		h.dst.stuff(t, "INBOX", testMessage(subject, fmt.Sprintf("x%d@elsewhere.test", i)))
-		stranger = append(stranger, subject)
+		h.dst.stuff(t, "INBOX", testMessage(fmt.Sprintf("stranger-%04d", i), fmt.Sprintf("x%d@elsewhere.test", i)))
 	}
 
-	opts := syncer.Options{Delete2: true, Full: true}
+	opts := syncer.Options{Delete2: true, Full: true, Force: true}
 	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	// Empty the source of everything, and force past the ceiling, so the only
-	// thing standing between the strangers and deletion is that we never put
-	// them there.
-	for _, uid := range uidsIn(t, h.src, "INBOX") {
-		removeFrom(t, h.src, "INBOX", uid)
-	}
-
-	forced := syncer.Options{Delete2: true, Full: true, Force: true}
-	if _, err := syncFlaky(t, h, 1, 1, forced, nil, nil); err != nil {
-		t.Fatalf("second run: %v", err)
-	}
 
 	left := subjects(h.dst.contents(t, "INBOX"))
-	for _, s := range stranger {
-		if !slices.Contains(left, s) {
-			t.Errorf("deleted %q, which this tool never copied", s)
+	for _, name := range left {
+		if strings.HasPrefix(name, "stranger-") {
+			t.Errorf("%q is still there; the destination does not look like the source", name)
 		}
 	}
-	if len(left) != len(stranger) {
-		t.Errorf("destination holds %d messages, want only the %d strangers", len(left), len(stranger))
+	if len(left) != 10 {
+		t.Errorf("destination holds %d messages, want the source's 10", len(left))
+	}
+}
+
+// TestAMessageTooThinToIdentifyIsLeftAlone is where this stops short of
+// imapsync, deliberately.
+//
+// Identity is the only handle on mail nobody recorded copying, and some
+// messages carry too little header to be told apart from any other. Adoption
+// already refuses to match on those, because a wrong match drops mail. Deleting
+// on one is the same mistake with no way back: "the source has nothing like
+// this" cannot be concluded from a digest that could not tell the difference
+// either way.
+func TestAMessageTooThinToIdentifyIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 10)
+
+	// No Message-ID, no Date, no From — nothing to be sure with.
+	h.dst.stuff(t, "INBOX", []byte("Subject: thin\r\n\r\nbody\r\n"))
+
+	opts := syncer.Options{Delete2: true, Full: true, Force: true}
+	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if left := subjects(h.dst.contents(t, "INBOX")); !slices.Contains(left, "thin") {
+		t.Errorf("deleted a message it could not identify, on the strength of not recognising it")
 	}
 }
 
@@ -576,5 +589,134 @@ func TestARefusalDoesNotBecomePermanent(t *testing.T) {
 	}
 	if fr := folderReport(t, rep, "INBOX"); fr.Deleted != 20 {
 		t.Errorf("deleted %d, want 20: the refusal was never offered again", fr.Deleted)
+	}
+}
+
+// TestASecondCopyOfSomethingTheSourceHasIsKept guards the other direction.
+//
+// Identity is what decides, and a destination holding two copies of a message
+// the source holds once has one claimed copy and one nobody recorded. The
+// unrecorded one still matches something the source has, so it stays. The
+// source is not being mirrored message-for-message; it is being asked whether
+// it has anything like this.
+//
+// This also proves the identity set is actually populated. If it came back
+// empty — the failure mode where nothing on the destination can be recognised —
+// this message would be deleted and the test would say so.
+func TestASecondCopyOfSomethingTheSourceHasIsKept(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 10)
+	twin := testMessage("twin", "twin@example.test")
+	h.src.stuff(t, "INBOX", twin)
+
+	opts := syncer.Options{Delete2: true, Full: true, Force: true}
+	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// A second copy of one the source still holds, arriving by some other
+	// route. Same message, so the same identity.
+	h.dst.stuff(t, "INBOX", twin)
+
+	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	left := subjects(h.dst.contents(t, "INBOX"))
+	if got := len(left); got != 12 {
+		t.Errorf("destination holds %d messages, want 12: a copy of something the source has was deleted", got)
+	}
+}
+
+// TestBothCopiesGoWhenTheSourceLosesTheOriginal is where the two paths cross,
+// and the only place the difference between "the source holds this" and "the
+// source once held this" is visible.
+//
+// A destination with two copies of a message has one the state database knows
+// about and one it does not. When the source deletes the message, the recorded
+// copy goes because its UID is no longer listed. The unrecorded copy is judged
+// on identity — and if that judgement were made against every identity ever
+// recorded rather than the ones the source still holds, it would match a row
+// describing a message that no longer exists and stay behind for ever.
+func TestBothCopiesGoWhenTheSourceLosesTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 10)
+	twin := testMessage("twin", "twin@example.test")
+	h.src.stuff(t, "INBOX", twin)
+
+	opts := syncer.Options{Delete2: true, Full: true, Force: true}
+	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// A second copy nothing recorded, then the source loses the original.
+	h.dst.stuff(t, "INBOX", twin)
+	for _, uid := range uidsIn(t, h.src, "INBOX") {
+		if subjectOf(t, h.src, uid) == "twin" {
+			removeFrom(t, h.src, "INBOX", uid)
+		}
+	}
+
+	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	left := subjects(h.dst.contents(t, "INBOX"))
+	if slices.Contains(left, "twin") {
+		t.Errorf("a copy of a message the source no longer has is still there: %v", left)
+	}
+	if len(left) != 10 {
+		t.Errorf("destination holds %d messages, want 10", len(left))
+	}
+}
+
+// subjectOf reads one message's subject, so a test can name the message it
+// means rather than guessing at a UID.
+func subjectOf(t *testing.T, a account, uid uint32) string {
+	t.Helper()
+
+	ctx := context.Background()
+	c := a.dial(t)
+	if _, err := c.Select(ctx, "INBOX", imapx.SelectOptions{ReadOnly: true}); err != nil {
+		t.Fatalf("selecting: %v", err)
+	}
+	metas, err := c.FetchMeta(ctx, []uint32{uid}, []string{"SUBJECT"})
+	if err != nil || len(metas) == 0 {
+		t.Fatalf("reading subject of %d: %v", uid, err)
+	}
+	return strings.TrimSpace(strings.TrimPrefix(string(metas[0].Header), "Subject:"))
+}
+
+// TestTheShareIsOfTheWholeDestination pins the denominator of the safety valve.
+//
+// It is the destination folder, not the map of what was copied, because the
+// destination folder is what is at stake now that mail nobody recorded is in
+// scope. Measuring against the map instead would report a larger share than is
+// really going and refuse ordinary runs; measuring against a folder full of
+// mail from elsewhere is the honest fraction of what stands to be lost.
+func TestTheShareIsOfTheWholeDestination(t *testing.T) {
+	t.Parallel()
+
+	h := newDeleteHarness(t)
+	fill(t, h.src, "INBOX", 80)
+	for i := range 20 {
+		h.dst.stuff(t, "INBOX", testMessage(fmt.Sprintf("elsewhere-%04d", i), fmt.Sprintf("e%d@elsewhere.test", i)))
+	}
+
+	// Twenty of a hundred is a fifth; twenty of the eighty that were copied is
+	// a quarter. A ceiling between the two only holds if the denominator is the
+	// folder.
+	opts := syncer.Options{Delete2: true, Full: true, DeleteCeiling: 0.22}
+	rep, err := syncFlaky(t, h, 1, 1, opts, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	fr := folderReport(t, rep, "INBOX")
+	if fr.Deleted != 20 || fr.Refused != 0 {
+		t.Errorf("deleted %d and refused %d, want 20 and 0: the share was measured against the wrong population", fr.Deleted, fr.Refused)
 	}
 }

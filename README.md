@@ -275,13 +275,22 @@ destination to follow the source when mail leaves it.
 imapsync-go sync --source-url ... --dest-url ... --delete2
 ```
 
-It deletes **only messages this tool copied and recorded**. Mail that was on the
-destination before the first sync has no entry in the state database, so no
-amount of divergence makes it a candidate. This is deliberately narrower than
-imapsync's `--delete2`, which will empty a destination of anything the source
-lacks. The state database is the only record of what this tool is actually
-responsible for, and it will not delete mail it cannot account for putting
-there.
+This is imapsync's `--delete2`: the destination ends up looking like the source,
+including losing mail that got there some other way. Messages this tool copied
+are matched by UID, which is exact. Everything else on the destination is
+matched by identity — the same digest used to adopt messages already present —
+and deleted if the source has nothing like it.
+
+One thing is deliberately left alone: a message carrying too little header to
+identify. Adoption already refuses to match on those, because a wrong match
+drops mail, and "the source has nothing like this" is not a conclusion you can
+draw from a digest that could not have recognised it either way. They stay, and
+the count is logged.
+
+The cost falls where it should. On a mirror this tool built, every message is
+accounted for in the state database, so the check is one UID listing and no
+header reads at all. Only mail that arrived some other way is paid for, and only
+once.
 
 Deleting needs UIDPLUS, and the run stops rather than working around a server
 that lacks it. Plain `EXPUNGE` purges *every* message in the mailbox flagged
@@ -291,12 +300,12 @@ that lacks it. Plain `EXPUNGE` purges *every* message in the mailbox flagged
 There is a safety valve. A source that answers a UID listing with nothing, or
 with a fraction of the truth, looks exactly like a source whose mail has been
 deleted — and the response to those two is very different. So a run refuses to
-delete more than a tenth of a folder's copied messages at once:
+delete more than a tenth of a destination folder at once:
 
 ```
-REFUSED to delete 47 messages. That is a larger share of a folder's copied
-messages than --delete2-ceiling allows to go in one run, and the usual cause is a
-source that answered a listing with less than the truth.
+REFUSED to delete 47 messages. That is a larger share of the destination folder
+than --delete2-ceiling allows to go in one run, and the usual cause is a source
+that answered a listing with less than the truth.
   Archive: 47 of 312
 
 Check the source, then pass --force to go ahead, or raise --delete2-ceiling.
@@ -306,6 +315,9 @@ A refusal is not a failure and nothing is lost, but the run exits non-zero, so a
 scheduled sync cannot quietly stop mirroring a folder while still reporting
 success. `--force` carries out the deletions anyway, and `--delete2-ceiling`
 moves the line.
+
+The first `--delete2` run against a destination that has mail of its own will
+usually refuse for exactly this reason, which is the right way to find out.
 
 A handful of messages is always allowed through whatever share of the folder
 they are, because one message out of six is 16.7% and refusing that would mean

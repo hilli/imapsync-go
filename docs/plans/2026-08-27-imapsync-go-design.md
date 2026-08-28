@@ -684,18 +684,39 @@ opt-in **and** pass a safety valve: a run that would delete more than a threshol
 
 ### 7.1 What `--delete2` deletes — as built
 
-Only messages this tool copied and recorded. The state database is the sole
-record of what we are responsible for; destination mail with no row cannot be
-nominated however far it diverges from the source. This is narrower than
-imapsync's `--delete2`, which empties a destination of anything the source
-lacks. A strict mirror stays addable later — the narrow behaviour is a subset of
-it, so nothing is foreclosed.
+imapsync's semantics: the destination ends up looking like the source, including
+losing mail that arrived by some other route. A narrower version was built first
+— only messages this tool had copied and recorded — and rejected, on the
+grounds that somebody moving over from imapsync would find their destination
+quietly accumulating everything the tool declined to take responsibility for.
+A surprise that arrives silently and only shows up as a mailbox that never quite
+matches is worse than one that deletes.
 
-One nuance: a destination message byte-identical to a source message is
-*adopted* on the first run, recorded as the copy that would otherwise have been
-made. From then on it is ours, and deleting it when the source loses it is
-correct. The promise is about mail with no source counterpart, not about mail
-that arrived by another route.
+Two populations, one question:
+
+- **Messages we copied** are checked against the source's UID listing, which is
+  exact.
+- **Everything else on the destination** is checked by identity, the same digest
+  adoption matches on, against the identities the source currently holds.
+
+The source's identity set is read from the state database rather than from the
+source: every message the source holds has been identified once already, and
+writing that down was the cheaper half of doing it. Rows whose UID the source no
+longer lists are excluded — that message is gone, and its identity going with it
+is the entire point. Getting that filter wrong leaves a second copy of a deleted
+message behind for ever, which is what §9.7 records.
+
+**The one place this stops short of imapsync, deliberately.** A message carrying
+too little header to identify is left alone. Adoption already refuses to match
+on a weak digest because a wrong match drops mail; deleting on one is the same
+mistake with no way back, since "the source has nothing like this" cannot be
+concluded from a digest that could not have recognised it either way.
+
+**Cost falls where it should.** On a mirror this tool built, every destination
+message is claimed by a row, so the pass is one UID listing and no header reads.
+Only mail that arrived another way is paid for, and only once — after it is
+deleted or adopted there is nothing left to ask about. Measured against mox: a
+steady-state `--delete2` run over a 59-message folder took 19ms.
 
 **UIDPLUS is required, not preferred.** Plain `EXPUNGE` is defined to purge
 every `\Deleted` message in the mailbox, including ones the account owner
@@ -706,11 +727,16 @@ bystander's message.
 
 ### 7.2 The valve has a floor as well as a ceiling
 
-The denominator is what we manage, not what the destination folder holds. The
-failure being guarded against is a source that answers a UID listing with
-nothing or a fraction of the truth, which shows up as a large share of the
-*message map* going at once; a destination-sized denominator would dilute that
-into looking reasonable.
+The denominator is the destination folder, because the destination folder is
+what is at stake once mail nobody recorded is in scope. The failure being
+guarded against is a source that answers a UID listing with nothing or a
+fraction of the truth, and that arrives as a large share of the destination
+being nominated at once.
+
+A useful consequence: the first `--delete2` run against a destination holding
+mail of its own will usually refuse, which is the right way to find out. Verified
+against mox — a destination seeded with 12 foreign messages refused at 12 of 71,
+16.9%, exit status 1, and `--force` then produced an exact 59-to-59 mirror.
 
 A proportion alone is not enough. One message out of six is 16.7% and would trip
 a 10% ceiling, but that is the most ordinary thing that happens to mail. A guard
@@ -1034,6 +1060,30 @@ UIDVALIDITY argument survived, because fencing means two numberings never
 coexist in practice. Asserted anyway: the statement is a `DELETE`, and the cost
 of discovering later that it was scoped too widely is measured in other people's
 mail.
+
+### 9.7 What mutation testing found in the widening
+
+**The filter that only matters where the two paths cross.** Judging strangers
+against every identity ever recorded, rather than only the ones the source still
+holds, survived every test. It shows up in one situation: a destination with two
+copies of a message, one recorded and one not, when the source deletes the
+original. The recorded copy goes because its UID is no longer listed; the
+unrecorded copy matches a row describing a message that no longer exists and
+stays behind for ever. Tested now.
+
+**A fixture that tested the wrong thing twice.** The test that a second copy of
+something the source still holds is kept was written with the same subject but a
+different Message-ID — a different message, correctly deleted. It only means
+anything with a genuine twin, the same bytes on both sides.
+
+**The denominator needed its own test.** Nothing distinguished "a share of the
+destination folder" from "a share of what we copied" until a folder was given
+mail from elsewhere and a ceiling set between the two fractions.
+
+Two survivors are barriers. Skipping the header read when nothing is unclaimed
+is an optimisation with no behaviour to observe, and selecting the destination
+read-only in a dry run cannot be caught by a test that never writes.
+See also §9.6, whose findings still stand.
 
 ## 10. Milestones
 
