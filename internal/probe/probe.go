@@ -60,6 +60,13 @@ type Report struct {
 	// cap or the server error that ended it.
 	CeilingLimitedBy string `json:"ceiling_limited_by,omitempty"`
 
+	// Refused says the search ended because the server declined a connection,
+	// which is the only case in which MaxConnections is a real ceiling rather
+	// than a number we chose. Without it a probe that stopped at its own cap
+	// reads exactly like one that found a wall, and the advice that follows is
+	// the opposite in each case.
+	Refused bool `json:"refused"`
+
 	Elapsed time.Duration `json:"elapsed"`
 }
 
@@ -74,12 +81,18 @@ func (r *Report) TotalMessages() uint32 {
 	return total
 }
 
-// SuggestedConcurrency proposes a connection count for this endpoint, staying
-// one below the observed ceiling so a competing client does not push us over.
+// SuggestedConcurrency proposes a connection count for this endpoint.
+//
+// Where the server refused, the suggestion stays one below the wall so a
+// competing client does not push the sync over it. Where the search only ran
+// out of its own budget there is no wall to stay clear of, and subtracting one
+// would be advising against a limit nobody has observed.
 func (r *Report) SuggestedConcurrency() int {
 	switch {
 	case r.MaxConnections <= 0:
-		return 0 // unknown: leave it to the adaptive governor
+		return 0 // unknown: leave it to the pool to find out
+	case !r.Refused:
+		return r.MaxConnections
 	case r.MaxConnections <= 2:
 		return 1
 	default:
@@ -138,7 +151,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 
 	if opts.MaxConnections > 0 {
-		report.MaxConnections, report.CeilingLimitedBy = measureCeiling(ctx, dialOpts, opts.MaxConnections)
+		report.MaxConnections, report.CeilingLimitedBy, report.Refused = measureCeiling(ctx, dialOpts, opts.MaxConnections)
 	}
 
 	report.Elapsed = time.Since(started)
@@ -148,14 +161,14 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 // measureCeiling opens connections one at a time, holding each open, until the
 // server refuses or the cap is reached. It returns the highest count that
 // succeeded, including the connection the caller already holds.
-func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (int, string) {
+func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (held int, why string, refused bool) {
 	// The ceiling search is the same login repeated; tracing it would bury the
 	// interesting conversation in noise.
 	dialOpts.DebugWriter = nil
 
-	held := make([]imapx.Conn, 0, max)
+	open := make([]imapx.Conn, 0, max)
 	defer func() {
-		for _, c := range held {
+		for _, c := range open {
 			_ = c.Close()
 		}
 	}()
@@ -163,17 +176,18 @@ func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (i
 	// The caller's own connection counts toward the server's limit.
 	const alreadyOpen = 1
 
-	for len(held)+alreadyOpen < max {
+	for len(open)+alreadyOpen < max {
 		if err := ctx.Err(); err != nil {
-			return len(held) + alreadyOpen, "probe cancelled"
+			// A cancelled probe found nothing: it stopped because we stopped it.
+			return len(open) + alreadyOpen, "probe cancelled", false
 		}
 		c, err := imapx.Dial(ctx, dialOpts)
 		if err != nil {
-			return len(held) + alreadyOpen, refusalReason(err)
+			return len(open) + alreadyOpen, refusalReason(err), true
 		}
-		held = append(held, c)
+		open = append(open, c)
 	}
-	return max, fmt.Sprintf("reached configured cap of %d, server may allow more", max)
+	return max, fmt.Sprintf("reached configured cap of %d, server may allow more", max), false
 }
 
 func refusalReason(err error) string {

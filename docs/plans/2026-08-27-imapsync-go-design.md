@@ -230,17 +230,26 @@ share a folder is the number of chunks in it. It also amortises the one metadata
 A folder that fails does not cancel its siblings; the error is recorded against
 that folder and the run continues. Only the caller's context cancels.
 
-### 4.2 Governor (AIMD)
+### 4.2 Governor — superseded
 
-Per-side, per-host adaptive concurrency:
+This section specified a per-side AIMD governor, justified by iCloud throttling
+"aggressively and unpredictably" and expected to settle at 2–5 there and 30+ on
+mox. Measuring both servers overturned the premise:
 
-- **Additive increase** on sustained success.
-- **Multiplicative decrease** on `BYE`, `NO [OVERQUOTA]`, `[LIMIT]`,
-  `Too many simultaneous connections`, and dial/read timeouts.
-- Floor 1, ceiling from `--connections` (`auto` by default).
+| | predicted here | measured 2026-08-28 |
+|---|---|---|
+| iCloud (source) | throttles, settles 2–5 | **≥48; never refused** |
+| mox (destination) | 30+ | **exactly 30, a hard wall** |
 
-Expected settling points: iCloud 2–5, mox 30+. The governor exists primarily
-because iCloud throttles aggressively and unpredictably.
+The side that pushes back is the destination, and it does so with a stable count
+rather than a throttle. The measurement also found a real bug: mox refuses by
+hanging up mid-authentication, which `retry.Classify` reads as `unexpected EOF`
+and answers with a prompt retry into the same wall.
+
+Superseded by
+[the connection governor design](2026-08-28-connection-governor-design.md),
+which keeps the decrease, drops the increase, and shrinks to the width that
+demonstrably works rather than halving.
 
 ### 4.3 Backpressure
 
@@ -1208,9 +1217,13 @@ pure function, and the mutations that matter would stop being observable.
 - **M2** — pools, staged pipeline, byte budget. *Done.* Spooling was cut (§4.3).
 - **M3** — resilience: retry with backoff, a run-wide failure ceiling, a second
   pass over failed folders, progress reporting (§5.7). *Done.* The AIMD governor
-  was deferred: the throttling it exists to answer has not been observed, and a
+  was deferred: the throttling it exists to answer had not been observed, and a
   controller tuned against a server that is not pushing back is a controller
-  tuned against nothing.
+  tuned against nothing. Deferring it was right — when a wall was finally
+  measured it was on the destination, not the source, and it was a hard
+  connection count rather than a throttle, so §4.2's controller would have been
+  built against the wrong thing. A shrink-only governor was built afterwards;
+  see [its design](2026-08-28-connection-governor-design.md).
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
   `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder

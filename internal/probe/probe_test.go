@@ -129,7 +129,15 @@ func TestRunMeasuresConnectionCeiling(t *testing.T) {
 	if report.CeilingLimitedBy == "" {
 		t.Error("expected a reason for the ceiling result")
 	}
-	if got, want := report.SuggestedConcurrency(), cap-1; got != want {
+
+	// Nothing was refused, so no ceiling was found and there is nothing to
+	// stay clear of. Suggesting cap-1 here would be advising against a limit
+	// that was never observed, and would quietly recommend one fewer
+	// connection every time the probe is run with a larger cap.
+	if report.Refused {
+		t.Error("the in-memory server refuses nothing; Refused must be false")
+	}
+	if got, want := report.SuggestedConcurrency(), cap; got != want {
 		t.Errorf("SuggestedConcurrency() = %d, want %d", got, want)
 	}
 }
@@ -152,21 +160,32 @@ func TestRunRejectsBadCredentials(t *testing.T) {
 	}
 }
 
+// TestSuggestedConcurrency.
+//
+// The same count means two different things depending on how the search ended.
+// Thirty connections that the server then refused is a wall, and the advice is
+// to stay under it. Thirty connections that all succeeded is only the number we
+// asked for, and there is nothing there to stay under.
 func TestSuggestedConcurrency(t *testing.T) {
 	tests := []struct {
+		name    string
 		ceiling int
+		refused bool
 		want    int
 	}{
-		{ceiling: 0, want: 0},
-		{ceiling: 1, want: 1},
-		{ceiling: 2, want: 1},
-		{ceiling: 5, want: 4},
-		{ceiling: 30, want: 29},
+		{name: "not measured", ceiling: 0, want: 0},
+		{name: "refused at one", ceiling: 1, refused: true, want: 1},
+		{name: "refused at two", ceiling: 2, refused: true, want: 1},
+		{name: "refused at five", ceiling: 5, refused: true, want: 4},
+		{name: "refused at thirty", ceiling: 30, refused: true, want: 29},
+		{name: "our own cap of two", ceiling: 2, want: 2},
+		{name: "our own cap of thirty", ceiling: 30, want: 30},
+		{name: "our own cap of forty-eight", ceiling: 48, want: 48},
 	}
 	for _, tt := range tests {
-		r := probe.Report{MaxConnections: tt.ceiling}
+		r := probe.Report{MaxConnections: tt.ceiling, Refused: tt.refused}
 		if got := r.SuggestedConcurrency(); got != tt.want {
-			t.Errorf("ceiling %d: got %d, want %d", tt.ceiling, got, tt.want)
+			t.Errorf("%s: got %d, want %d", tt.name, got, tt.want)
 		}
 	}
 }

@@ -22,6 +22,11 @@ type fakeConn struct {
 	closed   int
 	loggedOu int
 
+	// onClose lets a fake server notice that one of its connections has gone,
+	// which is the only way to tell a pool that really released capacity from
+	// one that merely stopped counting it.
+	onClose func()
+
 	// busy is set while a caller holds this connection and cleared on release,
 	// so a second concurrent user is detectable rather than merely unlikely.
 	busy atomic.Bool
@@ -45,8 +50,14 @@ func (f *fakeConn) selected() []string {
 
 func (f *fakeConn) Close() error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.closed++
+	first := f.closed == 1
+	onClose := f.onClose
+	f.mu.Unlock()
+
+	if first && onClose != nil {
+		onClose()
+	}
 	return nil
 }
 

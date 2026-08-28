@@ -366,6 +366,17 @@ func (c *conn) FetchBody(ctx context.Context, uid uint32, w io.Writer) (int64, e
 // data as if it were commands and no tagged response will ever arrive.
 var ErrConnectionBroken = errors.New("connection desynchronised and closed")
 
+// ErrAtCapacity means a connection was refused because the server already holds
+// as many as it will allow.
+//
+// It is a judgement rather than something a server says. A server at its limit
+// may answer with NO [LIMIT] or a "too many connections" text, both of which
+// speak for themselves — but it may equally just hang up during authentication,
+// which arrives as an unexpected EOF and is byte-identical to a dropped network
+// connection. Nothing in the error distinguishes them, so whoever wraps this
+// has to have looked at the surroundings; see pool.Pool.
+var ErrAtCapacity = errors.New("server is at its connection limit")
+
 // Append writes a message to a mailbox and reports where it landed.
 //
 // msg.Size must be exact. IMAP declares a literal's length before its bytes, and

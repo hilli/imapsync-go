@@ -96,6 +96,14 @@ func Classify(err error) Kind {
 		return Again
 	}
 
+	// The pool has looked at the surroundings and concluded that a refused
+	// connection was the server's limit rather than the network. This has to
+	// come before classifyNetwork, which sees only an unexpected EOF and would
+	// answer a server asking for less load by reconnecting into it immediately.
+	if errors.Is(err, imapx.ErrAtCapacity) {
+		return Slower
+	}
+
 	if k, ok := classifyStatus(err); ok {
 		return k
 	}

@@ -156,12 +156,12 @@ func probeTargets(f probeFlags) ([]probeTarget, error) {
 		}
 
 		switch strings.ToLower(f.side) {
-		case "source":
-			return []probeTarget{{"source", pair.Source}}, nil
-		case "dest":
-			return []probeTarget{{"dest", pair.Dest}}, nil
+		case sideSource:
+			return []probeTarget{{sideSource, pair.Source}}, nil
+		case sideDest:
+			return []probeTarget{{sideDest, pair.Dest}}, nil
 		case "both":
-			return []probeTarget{{"source", pair.Source}, {"dest", pair.Dest}}, nil
+			return []probeTarget{{sideSource, pair.Source}, {sideDest, pair.Dest}}, nil
 		default:
 			return nil, fmt.Errorf("invalid --side %q, want source, dest or both", f.side)
 		}
@@ -336,9 +336,17 @@ func writeReport(p *printer, label string, r *probe.Report) {
 	flushList()
 
 	if r.MaxConnections > 0 {
-		p.printf("\nConnection ceiling: %d simultaneous (%s)\n", r.MaxConnections, r.CeilingLimitedBy)
-		if s := r.SuggestedConcurrency(); s > 0 {
-			p.printf("Suggested concurrency: %d (one below the ceiling, leaving headroom for other clients)\n", s)
+		if r.Refused {
+			p.printf("\nConnection ceiling: %d simultaneous (%s)\n", r.MaxConnections, r.CeilingLimitedBy)
+			if s := r.SuggestedConcurrency(); s > 0 {
+				p.printf("Suggested concurrency: %d (one below the ceiling, leaving headroom for other clients)\n", s)
+			}
+		} else {
+			// The number here is one we chose, not one the server gave, and
+			// calling it a ceiling would invite someone to write it into a
+			// config as though it had been measured.
+			p.printf("\nConnections opened: %d simultaneous, none refused (%s)\n", r.MaxConnections, r.CeilingLimitedBy)
+			p.printf("Suggested concurrency: at least %d — no ceiling was found, so raise\n--max-connections to look for one.\n", r.SuggestedConcurrency())
 		}
 	} else {
 		p.println("\nConnection ceiling: not measured (pass --max-connections to probe it)")
