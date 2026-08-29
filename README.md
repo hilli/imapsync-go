@@ -10,7 +10,8 @@ work across them — folder-parallel *and* intra-folder parallel, so a single
 
 > **Status:** M0–M5 complete. `probe` reports what a server supports, `sync`
 > performs a correct, resumable, concurrent one-way copy across many
-> connections, `--delete2` mirrors deletions, and `compat` runs imapsync
+> connections, `--delete2` mirrors deletions, `--max-size`/`--max-age` and
+> their opposites select which messages move, and `compat` runs imapsync
 > command lines. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
 
 ## Install
@@ -381,6 +382,64 @@ Virtual mailboxes are **skipped by default**, which differs from imapsync.
 Gmail's All Mail is a view over every other folder, so copying it duplicates the
 account.
 
+### Choosing messages
+
+Within the folders it copies, `sync` can leave out messages by size or age.
+
+| Flag | Effect |
+| --- | --- |
+| `--max-size SIZE` | skip messages of `SIZE` or larger |
+| `--min-size SIZE` | skip messages of `SIZE` or smaller |
+| `--max-age AGE` | skip messages older than `AGE` |
+| `--min-age AGE` | skip messages newer than `AGE` |
+
+Sizes take the same spellings as `--memory-limit` (`25MiB`, `2GB`). Ages take
+days or any Go duration (`30d`, `0.5d`, `36h`).
+
+```bash
+# everything from the last month, nothing over 25 MiB
+imapsync-go sync --source-url ... --dest-url ... --max-age 30d --max-size 25MiB
+```
+
+The size bounds are **strict** and the age bounds are **inclusive**: `--max-size
+25MiB` skips a message of exactly 25 MiB, while `--max-age 30d` keeps one of
+exactly thirty days. That asymmetry is imapsync's, and it is reproduced here on
+purpose — a drop-in that quietly moved a boundary would copy a different set of
+messages than the tool it replaces.
+
+Giving both age bounds does something surprising, and it is imapsync's own
+behaviour, described in its help as "magic!":
+
+- `--max-age 30d --min-age 7d` keeps a **window** — between one and four weeks old.
+- `--max-age 7d --min-age 30d` keeps the **union** — newer than a week *or*
+  older than a month.
+
+When the two zones overlap you get their intersection; when they do not, you get
+both ends rather than nothing.
+
+Age is measured from the message's INTERNALDATE — when the server received it —
+not from its `Date:` header. imapsync uses the header by default. The two agree
+for almost all mail and differ for messages that were themselves migrated, which
+carry an INTERNALDATE from the migration rather than from delivery.
+
+The report counts what was left out in a `FILTERED` column, separately from
+failures, so a run that copies less than expected says so. A `--dry-run` with a
+filter set fetches message metadata in order to give a real answer, which costs
+more than an unfiltered dry run does.
+
+Nothing is recorded in the state database for a filtered message, so raising a
+bound later picks it up. The cost is that a permanently-excluded message is
+re-examined on every run — the same cost imapsync pays, having no state database
+at all. For the same reason a run that filtered anything does not record a
+"folder fully mirrored" watermark, and so cannot use the fast path described
+under [Skipping folders nothing has touched](#skipping-folders-nothing-has-touched).
+Without that, `--min-age 7d` would skip a folder for ever rather than pick up
+messages as they aged into range.
+
+If the destination advertises `APPENDLIMIT`, it is enforced as a `--max-size`
+the server itself asked for, and combined with yours by taking whichever is
+smaller.
+
 ### Self-signed servers
 
 TLS verification is controlled **per side**: `--source-insecure` and
@@ -428,18 +487,19 @@ into a bug report or kept as the native version of a script you are migrating.
 ### It refuses rather than guesses
 
 A flag that changes **which messages move, or what becomes of them** is refused
-if this tool cannot honour it exactly. `--maxage`, `--regextrans2`,
-`--minsize`, `--gmail1` and the rest stop the run and say so, all of them at
-once rather than one per attempt.
+if this tool cannot honour it exactly. `--regextrans2`, `--truncmess`,
+`--gmail1` and the rest stop the run and say so, all of them at once rather
+than one per attempt.
 
 The alternative — accepting a flag and quietly not applying it — fails in the
 worst possible way. `--maxage 30` silently ignored copies twelve years of mail
-instead of a month, and you find out from a full disk.
+instead of a month, and you find out from a full disk. (`--maxage` is now
+translated; it is named here because it is the clearest example of the damage.)
 
 ```
 error: 2 imapsync options cannot be honoured:
-  --maxage: it changes which messages are copied, and this tool would copy all
-            of them instead
+  --regextrans2: folder-name rewriting by regular expression is not
+            implemented; --map renames folders one at a time
   --justfolders: copying folders without their messages is not implemented;
             --dry-run reports the plan instead
 ```
