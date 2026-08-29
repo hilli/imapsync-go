@@ -268,7 +268,8 @@ func messageOptions() []*option {
 			offIgnores("messages with a Message-ID are never stamped; ones without it cannot be found again any other way"),
 		ig("skipsize!", "message sizes are never compared").offIgnores("message sizes are never compared"),
 		ig("allowsizemismatch!", "message sizes are never compared").offIgnores("message sizes are never compared"),
-		ig("appendlimit=i", "the server's APPENDLIMIT is obeyed as reported"),
+		ig("appendlimit=i", "the server's own APPENDLIMIT is read and obeyed, so there is nothing to state by hand; "+
+			"use --max-size to be stricter than the server is"),
 		ig("maxlinelength=i", "messages are copied byte for byte, whatever their lines look like"),
 		ig("checkmessageexists!", "an interrupted append is always looked for before it is copied again").
 			offRefuses("an interrupted append is always looked for before it is copied again, and skipping that check duplicates mail"),
@@ -285,10 +286,10 @@ func messageOptions() []*option {
 		ig("sanitize!", "output is already safe to redirect to a file").offIgnores(alreadyTheCase),
 		ig("showpasswords!", "this tool never prints passwords").offIgnores(alreadyTheCase),
 
-		no("minsize=i", changesSelection),
-		no("maxsize=i", changesSelection),
-		no("maxage=f", changesSelection),
-		no("minage=f", changesSelection),
+		tr("minsize=i", "--min-size"),
+		tr("maxsize=i", "--max-size"),
+		tr("maxage=f", "--max-age"),
+		tr("minage=f", "--min-age"),
 		no("search=s", changesSelection),
 		no("search1=s", changesSelection),
 		no("search2=s", changesSelection),

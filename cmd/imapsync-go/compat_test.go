@@ -74,16 +74,16 @@ func TestCompatRefusesRatherThanGuessing(t *testing.T) {
 
 	root := newRootCmd()
 	root.SetArgs([]string{"compat", "--host1", "a", "--user1", "u", "--passfile1", "/dev/null",
-		"--host2", "b", "--user2", "u", "--passfile2", "/dev/null", "--maxage", "30"})
+		"--host2", "b", "--user2", "u", "--passfile2", "/dev/null", "--truncmess", "1000"})
 	out := &strings.Builder{}
 	root.SetOut(out)
 	root.SetErr(out)
 
 	err := root.Execute()
 	if err == nil {
-		t.Fatal("compat accepted --maxage, which changes which messages are copied")
+		t.Fatal("compat accepted --truncmess, which would make the copy differ from the original")
 	}
-	if !strings.Contains(err.Error(), "maxage") {
-		t.Errorf("error = %v, want it to name --maxage", err)
+	if !strings.Contains(err.Error(), "truncmess") {
+		t.Errorf("error = %v, want it to name --truncmess", err)
 	}
 }

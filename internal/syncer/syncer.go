@@ -34,6 +34,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/retry"
+	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
 )
 
@@ -97,6 +98,13 @@ type Options struct {
 	// certain the source is that nothing has changed.
 	Full bool
 
+	// Filter narrows which messages are copied, by size and by age. The zero
+	// value copies everything.
+	//
+	// A run carrying an active filter never records a folder as fully
+	// mirrored, because it is not: see syncFolder.
+	Filter selection.Filter
+
 	// NoResyncFlags turns off copying flag changes onto messages that are
 	// already there. Negative, so that the zero Options is the default
 	// behaviour: imapsync resynchronises flags unless told not to, and a field
@@ -149,6 +157,17 @@ type Syncer struct {
 	db       *state.DB
 	opts     Options
 	log      *slog.Logger
+
+	// filter is opts.Filter once the destination's APPENDLIMIT has been folded
+	// in. Written by Run before any folder starts and only read afterwards.
+	filter selection.Filter
+	// started is the instant every age comparison in the run is made against.
+	//
+	// One instant, not the clock as it moves: a sync that runs for six hours
+	// would otherwise apply --maxage differently to the first folder and the
+	// last, and two messages a second apart could fall on opposite sides of the
+	// same bound. imapsync fixes its own start time for the same reason.
+	started time.Time
 }
 
 // New returns a syncer over two connection pools.
@@ -169,7 +188,10 @@ func New(src, dst *pool.Pool, db *state.DB, bytes *budget.Budget, opts Options) 
 	if opts.GiveUpAfter == 0 {
 		opts.GiveUpAfter = 50
 	}
-	return &Syncer{src: src, dst: dst, bytes: bytes, db: db, opts: opts, log: log}
+	return &Syncer{
+		src: src, dst: dst, bytes: bytes, db: db, opts: opts, log: log,
+		filter: opts.Filter, started: time.Now(),
+	}
 }
 
 // Report is the outcome of a run.
@@ -215,6 +237,11 @@ type FolderReport struct {
 	// Not a failure: there is nothing at that number to copy, and there never
 	// will be.
 	Vanished int
+	// Filtered is how many the message selection left out. Like Vanished this
+	// is neither work done nor work failed, but unlike Vanished it can change
+	// its mind: a message excluded by --minage today is copied once it is old
+	// enough, which is why a run that filtered anything records no watermark.
+	Filtered int
 	// Reflagged is how many had their flags brought back into line on the
 	// destination without being copied again.
 	Reflagged int
@@ -258,6 +285,19 @@ func (r Report) Vanished() int {
 	n := 0
 	for _, f := range r.Folders {
 		n += f.Vanished
+	}
+	return n
+}
+
+// Filtered is how many messages the selection left out.
+//
+// Reported apart from Vanished because the two mean different things to
+// someone reading a summary: a vanished message is settled for good, while a
+// filtered one is a message the run chose not to copy and may copy later.
+func (r Report) Filtered() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Filtered
 	}
 	return n
 }
@@ -358,6 +398,10 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 	defer stop(nil)
 	hp := &health{ceiling: int64(s.opts.GiveUpAfter), stop: stop}
 
+	if err := s.resolveFilter(ctx); err != nil {
+		return Report{}, err
+	}
+
 	plan, err := s.plan(ctx)
 	if err != nil {
 		return Report{}, err
@@ -410,6 +454,42 @@ func (s *Syncer) Run(ctx context.Context) (Report, error) {
 		return report, err
 	}
 	return report, ctx.Err()
+}
+
+// resolveFilter folds the destination's APPENDLIMIT into the message selection.
+//
+// It is asked once per run rather than once per folder because a capability is
+// a property of the server, and because the answer is needed before anything is
+// fetched: a message above the limit cannot be appended by any means, so
+// fetching its body to have the APPEND refused spends the bandwidth twice over
+// and files a failure that reads like a fault rather than like a rule.
+//
+// This also makes true a claim the compatibility layer has been making all
+// along, that "the server's APPENDLIMIT is obeyed as reported".
+//
+// A destination that cannot be reached is not this function's problem to
+// report: the planning that follows will fail on the same connection with a
+// better message, so an error here is logged and the run carries on unfiltered.
+func (s *Syncer) resolveFilter(ctx context.Context) error {
+	if err := s.opts.Filter.Validate(); err != nil {
+		return err
+	}
+	s.filter = s.opts.Filter
+
+	lease, err := s.dst.Acquire(ctx, "")
+	if err != nil {
+		s.log.Debug("could not read destination capabilities for APPENDLIMIT", "error", err)
+		return nil //nolint:nilerr // the planner reports this failure properly.
+	}
+	limit := lease.Conn().Caps().AppendLimit
+	lease.Release(nil)
+
+	if limit == nil {
+		return nil
+	}
+	s.filter = s.filter.CapSize(int64(*limit))
+	s.log.Info("destination limits message size", "appendlimit", *limit)
+	return nil
 }
 
 // announce reports what the run has done so far, at intervals, and returns the
@@ -732,6 +812,12 @@ func (l *live) vanished(n int) {
 	l.mu.Unlock()
 }
 
+func (l *live) filtered(n int) {
+	l.mu.Lock()
+	l.report.Filtered += n
+	l.mu.Unlock()
+}
+
 func (l *live) deleted(n int) {
 	l.mu.Lock()
 	l.report.Deleted += n
@@ -852,6 +938,22 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	fr := lv.snapshot()
 	modseq := p.src.HighestModSeq
 	if fr.Failed > 0 {
+		modseq = 0
+	}
+	// A filtered run has the same problem for a different reason, and it is the
+	// subtler of the two. The watermark claims the folder is fully mirrored
+	// through this modification sequence; a folder that left messages out
+	// because they did not match --maxage or --minsize is not. Worse, the thing
+	// that changes is not the message but the calendar: a message excluded
+	// today by --minage 7 becomes eligible in four days without anything about
+	// it moving, so the source's modseq will not have advanced and the fast
+	// path would skip the folder for ever. imapsync cannot be bitten by this
+	// because it keeps no state and re-enumerates everything every run.
+	//
+	// So a run that filtered anything keeps its old watermark and pays for a
+	// full diff next time. Filtering nothing costs nothing: if the selection
+	// excluded no message here, the folder really is mirrored.
+	if fr.Filtered > 0 {
 		modseq = 0
 	}
 	// Deletions are watermarked separately, because they are a separate
@@ -1308,9 +1410,16 @@ func (s *Syncer) fetchChunk(
 	if err != nil {
 		return err
 	}
+	// Before the filter, and this order is not arbitrary. markGone works out
+	// which UIDs the server had no message for by seeing which of the chunk
+	// are missing from the response, and records those as gone for good.
+	// Filtering first would hide selected-out messages from it, and every one
+	// of them would be written off as vanished — permanently, so that raising
+	// --maxage later would never bring them back.
 	if err := s.markGone(ctx, p, chunk, metas, lv); err != nil {
 		return err
 	}
+	metas = s.selected(metas, lv)
 
 	attempt := 0
 	for done := 0; done < len(metas); {
@@ -1390,6 +1499,34 @@ func (s *Syncer) markGone(ctx context.Context, p *prepared, chunk []uint32, meta
 		lv.vanished(n)
 	}
 	return nil
+}
+
+// selected drops the messages the run's filter excludes, counting them.
+//
+// Nothing is written to the state database for a filtered message. That is the
+// whole design: a message left out is left in exactly the condition it was
+// already in, unrecorded, so the next run diffs it again and copies it the
+// moment it qualifies. Recording it as done would lose it, and recording it as
+// gone would lose it more thoroughly.
+//
+// The cost is that a permanently excluded message — everything older than
+// --maxage, say — is re-enumerated and its metadata re-fetched on every run,
+// for ever. imapsync pays the same cost for the same reason, having no state
+// database to consult at all.
+func (s *Syncer) selected(metas []imapx.MessageMeta, lv *live) []imapx.MessageMeta {
+	if !s.filter.Active() {
+		return metas
+	}
+	kept := metas[:0]
+	for _, m := range metas {
+		if s.filter.Wants(m.Size, m.InternalDate, s.started) {
+			kept = append(kept, m)
+		}
+	}
+	if n := len(metas) - len(kept); n > 0 {
+		lv.filtered(n)
+	}
+	return kept
 }
 
 // defaultDeleteCeiling is the fraction of a folder's recorded messages that may
@@ -2038,12 +2175,64 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 		}
 	}
 
+	if err := s.dryRunFilter(ctx, src, known, uids, &fr); err != nil {
+		return fr, err
+	}
+
 	if s.opts.Delete2 {
 		if err := s.dryRunDeletions(ctx, pair, row.ID, srcBox, uids, &fr); err != nil {
 			return fr, err
 		}
 	}
 	return fr, nil
+}
+
+// dryRunFilter moves the messages the selection excludes out of the "to copy"
+// count and into the filtered one.
+//
+// This costs a metadata pass the rest of the dry run does not need, and it is
+// the only thing that makes the preview worth reading when a filter is on: the
+// question somebody runs --dry-run --max-age to have answered is precisely how
+// much the bound leaves out, and a count that ignored the bound would answer a
+// different question while looking like an answer to theirs.
+//
+// The real run pays for the same fetch, so this is not extra work so much as
+// work brought forward.
+func (s *Syncer) dryRunFilter(
+	ctx context.Context,
+	src imapx.Conn,
+	known map[uint32]state.State,
+	uids []uint32,
+	fr *FolderReport,
+) error {
+	if !s.filter.Active() || fr.Copied == 0 {
+		return nil
+	}
+
+	todo := make([]uint32, 0, fr.Copied)
+	for _, uid := range uids {
+		// The same test the count above made, so the two cannot disagree about
+		// which messages this folder would copy.
+		if st := known[uid]; st != state.StateDone && st != state.StateGone {
+			todo = append(todo, uid)
+		}
+	}
+
+	for chunk := range slices.Chunk(todo, copyChunk) {
+		// No header fields: the filter reads only size and internal date, and
+		// a dry run has no digests to compute.
+		metas, err := src.FetchMeta(ctx, chunk, nil)
+		if err != nil {
+			return fmt.Errorf("fetching message metadata: %w", err)
+		}
+		for _, m := range metas {
+			if !s.filter.Wants(m.Size, m.InternalDate, s.started) {
+				fr.Copied--
+				fr.Filtered++
+			}
+		}
+	}
+	return nil
 }
 
 // dryRunDeletions works out what a real run would remove, and says so without

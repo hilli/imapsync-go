@@ -19,6 +19,7 @@ import (
 
 	"github.com/hilli/imapsync-go/internal/config"
 	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/selection"
 )
 
 func TestParseBytes(t *testing.T) {
@@ -476,5 +477,92 @@ func TestFlagsFollowTheSourceUnlessToldNotTo(t *testing.T) {
 	run()
 	if got := unseenOn(t, dstUser, "INBOX"); got != 3 {
 		t.Errorf("destination reports %d unread, want 3; the flag resync did not run", got)
+	}
+}
+
+func TestParseAgeReadsDaysAndDurations(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		in   string
+		want time.Duration
+	}{
+		{"30d", 30 * 24 * time.Hour},
+		{"1d", 24 * time.Hour},
+		// imapsync declares these options as floats, so half a day is legal.
+		{"0.5d", 12 * time.Hour},
+		{" 7d ", 7 * 24 * time.Hour},
+		// Go's own syntax still works, for anyone who prefers it.
+		{"720h", 720 * time.Hour},
+		{"90m", 90 * time.Minute},
+	} {
+		got, err := parseAge(tc.in)
+		if err != nil {
+			t.Errorf("parseAge(%q) error = %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseAge(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+
+	// Zero and negative ages select nothing or everything depending on how you
+	// read them, which is reason enough not to guess.
+	for _, in := range []string{"", "30", "d", "0d", "-5d", "0s", "-1h", "tomorrow"} {
+		if got, err := parseAge(in); err == nil {
+			t.Errorf("parseAge(%q) = %v, want an error", in, got)
+		}
+	}
+}
+
+func TestTheMessageFilterIsBuiltFromTheFlagsThatDescribeIt(t *testing.T) {
+	t.Parallel()
+
+	f := syncFlags{maxSize: "10MiB", minSize: "1KiB", maxAge: "30d", minAge: "7d"}
+	got, err := messageFilter(f)
+	if err != nil {
+		t.Fatalf("messageFilter() error = %v", err)
+	}
+	want := selection.Filter{
+		MaxSize: 10 << 20, MinSize: 1 << 10,
+		MaxAge: 30 * selection.Day, MinAge: 7 * selection.Day,
+	}
+	if got != want {
+		t.Errorf("messageFilter() = %+v, want %+v", got, want)
+	}
+
+	if got, err := messageFilter(syncFlags{}); err != nil || got.Active() {
+		t.Errorf("no flags gave %+v, %v; want an inactive filter and no error", got, err)
+	}
+}
+
+// A bad value has to name the flag it came from. "invalid size" on a command
+// line carrying both --max-size and --min-size says nothing useful.
+func TestABadSelectionValueNamesItsFlag(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		flags syncFlags
+		want  string
+	}{
+		{syncFlags{maxSize: "lots"}, "--max-size"},
+		{syncFlags{minSize: "-1"}, "--min-size"},
+		{syncFlags{maxAge: "soon"}, "--max-age"},
+		{syncFlags{minAge: "0d"}, "--min-age"},
+	} {
+		_, err := messageFilter(tc.flags)
+		if err == nil {
+			t.Errorf("%+v was accepted", tc.flags)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("error %q does not name %s", err, tc.want)
+		}
+	}
+
+	// A window with no room in it is caught here rather than after a run that
+	// copied nothing and reported success.
+	if _, err := messageFilter(syncFlags{minSize: "10MiB", maxSize: "1MiB"}); err == nil {
+		t.Error("a size window that can select nothing was accepted")
 	}
 }

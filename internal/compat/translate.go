@@ -152,7 +152,8 @@ func (t *translator) emit(g given, out outcome) error {
 	}
 
 	value := g.value
-	if g.opt.name() == "timeout" {
+	switch g.opt.name() {
+	case "timeout":
 		// imapsync counts timeouts in seconds; this tool takes a duration, and
 		// a bare number is not one.
 		secs, err := strconv.ParseFloat(value, 64)
@@ -160,6 +161,13 @@ func (t *translator) emit(g given, out outcome) error {
 			return fmt.Errorf("%q is not a number of seconds", value)
 		}
 		value = strconv.FormatFloat(secs, 'f', -1, 64) + "s"
+	case "maxage", "minage":
+		// imapsync counts ages in days, as a bare number.
+		days, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("%q is not a number of days", value)
+		}
+		value = strconv.FormatFloat(days, 'f', -1, 64) + "d"
 	}
 	t.append(append(words, value)...)
 	return nil

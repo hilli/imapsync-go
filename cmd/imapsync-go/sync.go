@@ -21,6 +21,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
+	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
 	"github.com/hilli/imapsync-go/internal/syncer"
 )
@@ -57,6 +58,11 @@ type syncFlags struct {
 	subfolder      string
 	automap        bool
 	includeVirtual bool
+
+	maxSize string
+	minSize string
+	maxAge  string
+	minAge  string
 
 	dialTimeout time.Duration
 	insecureSrc bool
@@ -134,6 +140,11 @@ watch for authentication failures.`,
 	cmd.Flags().BoolVar(&f.automap, "automap", true, "map special folders such as Sent and Trash onto the destination's own names")
 	cmd.Flags().BoolVar(&f.includeVirtual, "include-virtual", false, "copy virtual mailboxes such as Gmail's All Mail, which duplicate the account")
 
+	cmd.Flags().StringVar(&f.maxSize, "max-size", "", "skip messages this large or larger, for example 25MiB")
+	cmd.Flags().StringVar(&f.minSize, "min-size", "", "skip messages this small or smaller")
+	cmd.Flags().StringVar(&f.maxAge, "max-age", "", "skip messages older than this, for example 30d")
+	cmd.Flags().StringVar(&f.minAge, "min-age", "", "skip messages newer than this")
+
 	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
 	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once")
@@ -168,6 +179,11 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	}
 
 	opts, err := folderOptions(f, folders)
+	if err != nil {
+		return err
+	}
+
+	messages, err := messageFilter(f)
 	if err != nil {
 		return err
 	}
@@ -233,6 +249,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		Folders:       opts,
 		DryRun:        f.dryRun,
 		Full:          f.full,
+		Filter:        messages,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
 		NoSubscribe:   !f.subscribe,
 		Delete2:       f.delete2,
@@ -295,6 +312,16 @@ func writeFolderTable(p *printer, report syncer.Report, dryRun bool) {
 	if vanished > 0 {
 		gone = "\tVANISHED"
 	}
+	// Filtered is its own column rather than being folded into vanished. The
+	// two are both "not copied and not a failure", but a vanished message is
+	// settled for good while a filtered one is a message the run declined and
+	// may take later, and a reader deciding whether their --max-age is doing
+	// what they meant needs to see it apart from everything else.
+	filtered := report.Filtered()
+	left := ""
+	if filtered > 0 {
+		left = "\tFILTERED"
+	}
 	// Likewise deletion: the column appears when the run was allowed to delete,
 	// not only when it did, because "--delete2 and nothing went" is itself the
 	// answer to the question the flag asks.
@@ -310,7 +337,8 @@ func writeFolderTable(p *printer, report syncer.Report, dryRun bool) {
 	if dryRun {
 		deletedHeading = strings.Replace(removals, "\tDELETED", "\tTO DELETE", 1)
 	}
-	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY%s%s\tFAILED\n", copiedHeading, gone, deletedHeading)
+	t.printf("SOURCE\tDESTINATION\tMESSAGES\t%s\tADOPTED\tALREADY%s%s%s\tFAILED\n",
+		copiedHeading, gone, left, deletedHeading)
 	for _, fr := range report.Folders {
 		status := ""
 		if fr.Err != nil {
@@ -319,16 +347,37 @@ func writeFolderTable(p *printer, report syncer.Report, dryRun bool) {
 		if vanished > 0 {
 			gone = fmt.Sprintf("\t%d", fr.Vanished)
 		}
+		if filtered > 0 {
+			left = fmt.Sprintf("\t%d", fr.Filtered)
+		}
 		if removals != "" {
 			removals = fmt.Sprintf("\t%d", fr.Deleted)
 			if refused > 0 {
 				removals += fmt.Sprintf("\t%d", fr.Refused)
 			}
 		}
-		t.printf("%s\t%s\t%d\t%d\t%d\t%d%s%s\t%d%s\n",
-			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone, gone, removals, fr.Failed, status)
+		t.printf("%s\t%s\t%d\t%d\t%d\t%d%s%s%s\t%d%s\n",
+			fr.Source, fr.Dest, fr.Messages, fr.Copied, fr.Adopted, fr.AlreadyDone,
+			gone, left, removals, fr.Failed, status)
 	}
 	flush()
+}
+
+// writeUncopiedNotes explains the messages that were neither copied nor failed.
+//
+// Both counts sit in columns of their own, and a column is not enough. Someone
+// reading "0 failed" and stopping there would conclude the account is mirrored,
+// which is exactly what neither of these means — so each says in words what it
+// is and whether anything is expected of the reader.
+func writeUncopiedNotes(p *printer, report syncer.Report) {
+	if vanished := report.Vanished(); vanished > 0 {
+		p.printf("\n%d %s the source listed but had no message for. Nothing was lost:\nthere is nothing at those numbers to copy, and they will not be asked for again.\n",
+			vanished, plural(vanished, "UID"))
+	}
+	if filtered := report.Filtered(); filtered > 0 {
+		p.printf("\n%d %s left out by the message selection. They are not on the destination\nand are not recorded as copied, so they will be picked up by a later run whose\nselection admits them.\n",
+			filtered, plural(filtered, "message"))
+	}
 }
 
 // syncEndpoints resolves the two sides, from a config file or from flags.
@@ -505,6 +554,71 @@ func parseBytes(s string) (int64, error) {
 	return n * mult, nil
 }
 
+// parseAge reads an age written the way people write ages.
+//
+// Go's own duration syntax stops at hours, because a day is not a fixed number
+// of them once daylight saving is involved. That objection does not apply here:
+// these bounds are compared against message dates months or years old, where
+// an hour either way is noise, and the unit imapsync takes — and therefore the
+// unit anybody arriving from it will type — is days. So "30d" is accepted, and
+// so is anything time.ParseDuration understands.
+func parseAge(s string) (time.Duration, error) {
+	t := strings.TrimSpace(s)
+	if days, ok := strings.CutSuffix(t, "d"); ok {
+		n, err := strconv.ParseFloat(strings.TrimSpace(days), 64)
+		if err == nil {
+			if n <= 0 {
+				return 0, fmt.Errorf("%q must be greater than zero", s)
+			}
+			return time.Duration(n * float64(selection.Day)), nil
+		}
+	}
+	d, err := time.ParseDuration(t)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not an age such as 30d", s)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%q must be greater than zero", s)
+	}
+	return d, nil
+}
+
+// messageFilter builds the message selection from the flags that describe it.
+func messageFilter(f syncFlags) (selection.Filter, error) {
+	var sel selection.Filter
+	var err error
+
+	size := func(flag, value string) int64 {
+		if err != nil || value == "" {
+			return 0
+		}
+		var n int64
+		if n, err = parseBytes(value); err != nil {
+			err = fmt.Errorf("invalid --%s: %w", flag, err)
+		}
+		return n
+	}
+	age := func(flag, value string) time.Duration {
+		if err != nil || value == "" {
+			return 0
+		}
+		var d time.Duration
+		if d, err = parseAge(value); err != nil {
+			err = fmt.Errorf("invalid --%s: %w", flag, err)
+		}
+		return d
+	}
+
+	sel.MaxSize = size("max-size", f.maxSize)
+	sel.MinSize = size("min-size", f.minSize)
+	sel.MaxAge = age("max-age", f.maxAge)
+	sel.MinAge = age("min-age", f.minAge)
+	if err != nil {
+		return selection.Filter{}, err
+	}
+	return sel, sel.Validate()
+}
+
 // derivePairID names this migration in the state database.
 //
 // The name has to depend on both endpoints. One database holding two migrations
@@ -601,6 +715,9 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	if vanished > 0 {
 		goneWord = fmt.Sprintf("%d vanished, ", vanished)
 	}
+	if filtered := report.Filtered(); filtered > 0 {
+		goneWord += fmt.Sprintf("%d filtered out, ", filtered)
+	}
 	if deleted > 0 {
 		verb := "deleted"
 		if dryRun {
@@ -612,11 +729,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 		len(report.Folders), plural(len(report.Folders), "folder"), copied, copiedWord, adopted, goneWord, failed,
 		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
 
-	if vanished > 0 {
-		p.printf("\n%d %s the source listed but had no message for. Nothing was lost:\nthere is nothing at those numbers to copy, and they will not be asked for again.\n",
-			vanished, plural(vanished, "UID"))
-	}
-
+	writeUncopiedNotes(p, report)
 	writeConnectionNote(p, conns)
 
 	// A refusal is the one thing here that asks the reader to do something, so

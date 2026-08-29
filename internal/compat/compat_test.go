@@ -185,7 +185,7 @@ func TestEveryRefusalIsReportedAtOnce(t *testing.T) {
 	_, err := Translate([]string{
 		"--host1", "a.example.test", "--user1", "u", "--password1", "p", "--ssl1",
 		"--host2", "b.example.test", "--user2", "u", "--password2", "p", "--ssl2",
-		"--maxage", "30", "--regextrans2", "s/a/b/", "--delete1", "--synclabels",
+		"--truncmess", "1000", "--regextrans2", "s/a/b/", "--delete1", "--synclabels",
 	})
 
 	var refused *RefusedError
@@ -195,7 +195,7 @@ func TestEveryRefusalIsReportedAtOnce(t *testing.T) {
 	if len(refused.Refusals) != 4 {
 		t.Fatalf("reported %d refusals, want 4: %v", len(refused.Refusals), refused.Refusals)
 	}
-	for _, want := range []string{"--maxage", "--regextrans2", "--delete1", "--synclabels"} {
+	for _, want := range []string{"--truncmess", "--regextrans2", "--delete1", "--synclabels"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not mention %s:\n%s", want, err)
 		}
@@ -520,5 +520,77 @@ func TestTheExplanationCanBePastedBackIntoAShell(t *testing.T) {
 
 	if !strings.Contains(p.Explain("imapsync-go"), "'Sent Items'") {
 		t.Errorf("a folder with a space was not quoted:\n%s", p.Explain("imapsync-go"))
+	}
+}
+
+// TestTheSelectionOptionsCarryTheirUnitsAcross.
+//
+// imapsync takes sizes as bare bytes and ages as bare days. This tool's own
+// flags take human-readable values, which is the house style everywhere else —
+// --memory-limit "256MiB" — so the numbers have to be given their units on the
+// way through. A bare "30" reaching --max-age would be refused as unparseable,
+// and a bare "30" reaching --max-size would silently mean thirty bytes.
+func TestTheSelectionOptionsCarryTheirUnitsAcross(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--maxsize", "10485760", "--minsize", "1024",
+		"--maxage", "30", "--minage", "7",
+	)
+
+	for _, want := range []string{
+		"--max-size 10485760", "--min-size 1024",
+		"--max-age 30d", "--min-age 7d",
+	} {
+		if !strings.Contains(joined(p), want) {
+			t.Errorf("translated line does not contain %q:\n  %s", want, joined(p))
+		}
+	}
+}
+
+// imapsync declares --maxage and --minage as floats, so a fraction of a day is
+// a command line somebody can legitimately type.
+func TestAFractionalAgeSurvivesTranslation(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--maxage", "0.5",
+	)
+	if !strings.Contains(joined(p), "--max-age 0.5d") {
+		t.Errorf("a half-day age did not survive:\n  %s", joined(p))
+	}
+}
+
+// TestStatingAnAppendLimitByHandIsAcceptedAndExplained.
+//
+// The reason this is worth a test is that the explanation used to be false. It
+// said "the server's APPENDLIMIT is obeyed as reported" while nothing read the
+// capability at all, so an oversized message was fetched, appended, refused and
+// filed as a failure. The capability is obeyed now, and the note has to say
+// what is actually true and what to reach for instead.
+func TestStatingAnAppendLimitByHandIsAcceptedAndExplained(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--appendlimit", "10485760",
+	)
+
+	var why string
+	for _, note := range p.Ignored {
+		if note.Option == "--appendlimit" {
+			why = note.Why
+		}
+	}
+	if why == "" {
+		t.Fatalf("--appendlimit was not reported as ignored: %v", p.Ignored)
+	}
+	if !strings.Contains(why, "--max-size") {
+		t.Errorf("the note does not say what to use instead: %q", why)
 	}
 }
