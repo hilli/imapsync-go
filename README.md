@@ -384,7 +384,8 @@ account.
 
 ### Choosing messages
 
-Within the folders it copies, `sync` can leave out messages by size or age.
+Within the folders it copies, `sync` can leave out messages by size, by age,
+or by asking the server an IMAP `SEARCH` question.
 
 | Flag | Effect |
 | --- | --- |
@@ -455,6 +456,73 @@ messages as they aged into range.
 If the destination advertises `APPENDLIMIT`, it is enforced as a `--max-size`
 the server itself asked for, and combined with yours by taking whichever is
 smaller.
+
+#### Choosing messages with IMAP SEARCH
+
+For anything the size and age bounds cannot express, the server can be asked
+directly:
+
+| Flag | Effect |
+| --- | --- |
+| `--source-search KEY` | copy only source messages the search matches |
+| `--dest-search KEY` | let `--delete2` remove only destination messages the search matches |
+
+```bash
+# only unread mail under 100 kB
+imapsync-go sync --source-url ... --dest-url ... \
+  --source-search "UNSEEN SMALLER 100000"
+
+# only mail from one sender, sent this decade
+imapsync-go sync --source-url ... --dest-url ... \
+  --source-search 'FROM "billing@example.com" SENTSINCE 1-Jan-2020'
+```
+
+The search runs on the server before anything is fetched, so a key that
+excludes most of a folder makes the run proportionately cheaper — unlike
+`--max-size`, which has to see a message's metadata to know its size.
+
+Several keys in a row mean **all** of them: `SEEN SMALLER 10000` is both
+conditions, not either. `OR` takes exactly two keys and `NOT` takes one, as in
+`OR (FROM "a@example.com") (FROM "b@example.com")`. Dates are written the way
+IMAP writes them — `1-Feb-2020` — and strings that contain spaces are quoted.
+
+Supported keys: `ALL` `ANSWERED` `UNANSWERED` `DELETED` `UNDELETED` `DRAFT`
+`UNDRAFT` `FLAGGED` `UNFLAGGED` `SEEN` `UNSEEN` `KEYWORD` `UNKEYWORD`
+`FROM` `TO` `CC` `BCC` `SUBJECT` `HEADER` `BODY` `TEXT` `LARGER` `SMALLER`
+`SINCE` `BEFORE` `ON` `SENTSINCE` `SENTBEFORE` `SENTON` `UID` `NOT` `OR`.
+
+Three things are refused rather than approximated, each because accepting them
+would quietly search for something other than what was asked:
+
+- **`RECENT`, `NEW` and `OLD`** rest on `\Recent`, which means "arrived since
+  another client last looked". The server clears it for whichever client gets
+  there first, so two runs against one mailbox disagree and the second is
+  wrong. IMAP4rev2 removed the flag.
+- **A bare sequence set** such as `1:5` names positions in the mailbox rather
+  than messages, and positions shift whenever anything is expunged. Write
+  `UID 1:5` to name messages.
+- **`LARGER 0` and `SMALLER 0`**, which would be dropped on the way to the
+  wire, leaving `SMALLER 0` — a search matching nothing — as a search matching
+  the entire mailbox.
+
+A run carrying a search does not record a folder as fully mirrored, for the
+same reason a filtered run does not: `UNSEEN` stops being true when somebody
+reads their mail, and a watermark would skip the folder for ever.
+
+##### `--dest-search` is narrower here than imapsync's `--search2`
+
+In imapsync, `--search2` hides destination messages from *everything*, so a
+message it hides is not recognised as already copied and is copied a second
+time; imapsync's own documentation warns about this.
+
+Here the search is applied to the deletion candidates alone. It cannot reach
+the check that recognises a message as already present, so it can only ever
+delete **fewer** messages — never copy more, and never duplicate anything. It
+also cannot nominate a message the source still holds: a search is a
+narrowing, and only a narrowing.
+
+Because it narrows nothing but deletion, `--dest-search` without `--delete2`
+does nothing at all, and says so.
 
 ### Self-signed servers
 
