@@ -299,6 +299,20 @@ you cannot read is not a measurement. Width belongs in the run's log at the
 point it settles, and until it is there, every future run wastes the same
 opportunity this one did.
 
+The cause was narrower than "no instrumentation", and worth naming because it
+is a trap any reporting code can fall into: `writeConnectionNote` did report the
+settled width, but only when it was *lower* than the width asked for. Neither
+side shrank, so it said nothing — and silence from a reporter that only speaks
+on bad news is indistinguishable from silence from a reporter that was never
+wired up. The measurement wanted here is not "did it shrink"; it is "what did
+the server hold", and a side that kept all 24 connections answers that question
+just as well as one that gave up 6. Both outcomes are now reported. The test
+covering it had asserted, in as many words, that "a side that got what it asked
+for has nothing to say" — the premise, not the assertion, was the bug.
+
+That closes questions 1–3 for the *next* run rather than this one. They stay
+open here, honestly unanswered.
+
 ### What did degrade at scale: idle connections
 
 The two largest folders both failed, and with the same error:
@@ -354,7 +368,8 @@ messages are being considered, which is the right shape.
   way through diffing 413,934 messages. Folder-level retry is earning its place.
 - **The completed counter passed its own denominator** — `folders: 142/141` —
   because a retried folder increments it twice. Cosmetic, but it is the kind of
-  thing that makes a progress line untrustworthy.
+  thing that makes a progress line untrustworthy. Fixed by clamping the numerator
+  to the total.
 
 ### The rate figure measures the wrong thing
 
@@ -364,6 +379,13 @@ adoptions, so the pass this design recommended running *first* — the adoption
 pass — is the pass whose progress line understates it thirteenfold. An operator
 watching "5.2 msg/s" against 776,791 messages would reasonably conclude it had
 hung.
+
+Fixed on the progress line only. The summary's rate still excludes adoptions,
+and deliberately: that number answers "how fast does this tool copy", and
+counting a header comparison alongside a transfer would flatter a re-run into
+looking like a fast migration. The progress line answers "is it alive and how
+far in". Two questions, two answers, and the copied and adopted counts sit
+beside the rate so a reader can see which one they are looking at.
 
 ### Two messages the destination refused
 
