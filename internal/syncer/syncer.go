@@ -543,11 +543,25 @@ func (s *Syncer) announce(ctx context.Context, hp *health, folders int) func() {
 			case <-t.C:
 				elapsed := time.Since(start)
 				copied := hp.copied.Load()
+				adopted := hp.adopted.Load()
 				s.log.Info("still going",
-					"folders", fmt.Sprintf("%d/%d", hp.folders.Load(), folders),
+					// Never past the total. A folder that failed and is
+					// retried is worked twice but is still one folder, and a
+					// progress line reading "142/141" is one nobody trusts
+					// again.
+					"folders", fmt.Sprintf("%d/%d", min(hp.folders.Load(), int64(folders)), folders),
 					"copied", copied,
-					"adopted", hp.adopted.Load(),
-					"rate", fmt.Sprintf("%.1f msg/s", float64(copied)/elapsed.Seconds()),
+					"adopted", adopted,
+					// Copies and adoptions both settle a message, and this
+					// line answers "is it alive and how far in", not "how
+					// fast does it copy" — the summary's rate answers that
+					// one and deliberately excludes adoptions. Counting only
+					// copies here made an adoption pass over 776,791 messages
+					// report 5.2/s while it was settling 68.6/s, which reads
+					// exactly like a run that has hung. The copied and
+					// adopted counts sit beside it, so what the rate covers
+					// is readable rather than assumed.
+					"rate", fmt.Sprintf("%.1f msg/s", float64(copied+adopted)/elapsed.Seconds()),
 					// A duration is rendered as a bare nanosecond count by
 					// the JSON handler, which is unreadable in exactly the
 					// place this line is meant to be read.

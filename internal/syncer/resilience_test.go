@@ -3,6 +3,7 @@ package syncer_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -575,6 +576,139 @@ func TestALongRunSaysWhatItIsDoing(t *testing.T) {
 	if said[len(said)-1] == "0" {
 		t.Fatalf("progress reported %v: the count never moved", said)
 	}
+}
+
+// refusingFolder fails the first enumeration of each mailbox, so the folder is
+// abandoned once and succeeds on the retry pass.
+type refusingFolder struct {
+	imapx.Conn
+	mu      *sync.Mutex
+	burned  map[string]bool
+	current *string
+}
+
+func (r refusingFolder) Select(ctx context.Context, mailbox string, opts imapx.SelectOptions) (imapx.Mailbox, error) {
+	r.mu.Lock()
+	*r.current = mailbox
+	r.mu.Unlock()
+	return r.Conn.Select(ctx, mailbox, opts)
+}
+
+func (r refusingFolder) AllUIDs(ctx context.Context) ([]uint32, error) {
+	r.mu.Lock()
+	name := *r.current
+	first := !r.burned[name]
+	r.burned[name] = true
+	r.mu.Unlock()
+
+	if first {
+		return nil, fmt.Errorf("enumerating %q: server said no", name)
+	}
+	return r.Conn.AllUIDs(ctx)
+}
+
+// TestProgressCannotCountMoreFoldersThanThereAre.
+//
+// A folder that fails is tried again, and the retry pass increments the same
+// counter the first pass did — so a run of 141 folders reported "142/141".
+// A fraction that can exceed one is worse than no fraction: it is the number
+// people read to decide whether a run that has been going for two hours is
+// nearly done.
+func TestProgressCannotCountMoreFoldersThanThereAre(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps(), "Archive")
+	fill(t, h.src, "INBOX", 4)
+	fill(t, h.src, "Archive", 4)
+
+	log := &records{}
+	var mu sync.Mutex
+	burned := map[string]bool{}
+	report, err := syncFlaky(t, h, 1, 1, syncer.Options{
+		ProgressEvery: time.Millisecond,
+		Logger:        slog.New(log),
+	}, func(c imapx.Conn) imapx.Conn {
+		// burned is shared across connections so a mailbox is refused once
+		// for the run; current is per-connection, because that is what a
+		// SELECT sets.
+		return refusingFolder{Conn: c, mu: &mu, burned: burned, current: new(string)}
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The premise: every folder must have failed once and been retried, or
+	// this test proves nothing about double counting.
+	if _, _, failed := report.Totals(); failed != 0 {
+		t.Fatalf("the retry pass did not rescue the folders: %d still failed", failed)
+	}
+
+	said := log.find("still going", "folders")
+	if len(said) == 0 {
+		t.Fatal("the run said nothing while it worked")
+	}
+	for _, frac := range said {
+		var done, total int
+		if _, err := fmt.Sscanf(frac, "%d/%d", &done, &total); err != nil {
+			t.Fatalf("progress reported %q, which is not a fraction: %v", frac, err)
+		}
+		if done > total {
+			t.Errorf("progress reported %q: more folders finished than exist", frac)
+		}
+	}
+}
+
+// TestProgressRateCountsAdoptionsNotJustCopies.
+//
+// Adoption is a real outcome — the message is accounted for and will not be
+// looked at again — and on a first run against a populated destination it is
+// nearly the only outcome. Counting only copies made a pass that settled 68.6
+// messages a second report 5.2, which is indistinguishable from a hang.
+//
+// The summary's rate deliberately excludes adoptions, because that number
+// answers "how fast does this copy". This one answers "is it alive", and the
+// two questions want different arithmetic.
+func TestProgressRateCountsAdoptionsNotJustCopies(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+
+	// The same messages on both sides: nothing to copy, everything to adopt.
+	want := fill(t, h.src, "INBOX", 40)
+	fill(t, h.dst, "INBOX", 40)
+
+	log := &records{}
+	report, err := syncFlaky(t, h, 1, 1, syncer.Options{
+		ProgressEvery: time.Millisecond,
+		Logger:        slog.New(log),
+	}, func(c imapx.Conn) imapx.Conn {
+		return slowSource{Conn: c, delay: 2 * time.Millisecond}
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The premise: this has to be an adoption run, or the rate would be
+	// non-zero for the ordinary reason and the test would prove nothing.
+	copied, adopted, _ := report.Totals()
+	if copied != 0 || adopted != len(want) {
+		t.Fatalf("copied %d and adopted %d, want 0 copied and %d adopted", copied, adopted, len(want))
+	}
+
+	said := log.find("still going", "rate")
+	if len(said) == 0 {
+		t.Fatal("the run said nothing while it worked")
+	}
+	for _, r := range said {
+		var msgs float64
+		if _, err := fmt.Sscanf(r, "%f msg/s", &msgs); err != nil {
+			t.Fatalf("progress reported %q, which is not a rate: %v", r, err)
+		}
+		if msgs > 0 {
+			return
+		}
+	}
+	t.Errorf("progress reported %v: an adoption run looks stalled", said)
 }
 
 // TestASilentRunCanBeAsked checks the reporting can be turned off, since a

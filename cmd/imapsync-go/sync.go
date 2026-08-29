@@ -722,19 +722,29 @@ func statePath(override string) (string, error) {
 	return filepath.Join(dir, "state.db"), nil
 }
 
-// writeConnectionNote reports any side that ended narrower than it started.
+// writeConnectionNote reports the width each side settled on.
 //
 // The width a run settles on is worth more than the run: it is the only
 // measurement of what a server will actually hold, and it is what the next
 // run's connection flag should say. Putting it here means nobody has to infer
 // it from a throughput number.
+//
+// Both outcomes are reported, not just the narrowing one. A run of 776,791
+// messages was unable to answer whether the pool ever shrinks at a realistic
+// width, because it did not shrink and therefore said nothing at all — leaving
+// "held its width" and "said nothing" indistinguishable from the outside. A
+// side that kept every connection it asked for is evidence that the server
+// tolerated that many, which is precisely the question, and it is worth as much
+// as the shrink.
 func writeConnectionNote(p *printer, conns connections) {
 	for _, c := range conns {
-		if c.got >= c.asked {
-			continue
+		switch {
+		case c.got < c.asked:
+			p.printf("\nThe %s server would not hold %d connections; the run settled on %d.\nPass --%s=%d next time to start there and skip the refusals.\n",
+				c.side, c.asked, c.got, c.flag, c.got)
+		default:
+			p.printf("\nThe %s server held all %d connections.\n", c.side, c.got)
 		}
-		p.printf("\nThe %s server would not hold %d connections; the run settled on %d.\nPass --%s=%d next time to start there and skip the refusals.\n",
-			c.side, c.asked, c.got, c.flag, c.got)
 	}
 }
 

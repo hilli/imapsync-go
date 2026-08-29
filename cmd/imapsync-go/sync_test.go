@@ -452,13 +452,19 @@ func TestDryRunReportDoesNotClaimToHaveCopied(t *testing.T) {
 	}
 }
 
-// TestReportSaysWhenAServerWouldNotHoldTheConnectionsAsked.
+// TestReportSaysWhatWidthEachSideSettledOn.
 //
 // The width a run settles on outlives the run: it is the only measurement
 // anyone has of what a server will actually hold, and if it is not written down
-// the next run asks for too many again. A side that got what it asked for has
-// nothing to say.
-func TestReportSaysWhenAServerWouldNotHoldTheConnectionsAsked(t *testing.T) {
+// the next run asks for too many again.
+//
+// This test used to assert that a side which got what it asked for has nothing
+// to say. A run of 776,791 messages proved that wrong: neither side shrank, so
+// the report was silent, and "the server held 24 connections" was
+// indistinguishable from "the pool is not instrumented". Holding the full width
+// is the measurement that says a server tolerates that many, so both outcomes
+// are reported.
+func TestReportSaysWhatWidthEachSideSettledOn(t *testing.T) {
 	t.Parallel()
 
 	report := syncer.Report{
@@ -481,7 +487,13 @@ func TestReportSaysWhenAServerWouldNotHoldTheConnectionsAsked(t *testing.T) {
 	if !strings.Contains(got, "--dest-connections=5") {
 		t.Errorf("the report must name the flag to set next time, got:\n%s", got)
 	}
+	if !strings.Contains(got, "source server held all 16 connections") {
+		t.Errorf("a side that held its full width is a measurement too, got:\n%s", got)
+	}
 	if strings.Contains(got, "source server would not hold") {
-		t.Errorf("a side that got what it asked for has nothing to report, got:\n%s", got)
+		t.Errorf("the side that kept its width must not be reported as a shrink, got:\n%s", got)
+	}
+	if strings.Contains(got, "destination server held all") {
+		t.Errorf("the side that shrank must not be reported as holding, got:\n%s", got)
 	}
 }
