@@ -11,6 +11,7 @@ import (
 
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
+	"github.com/hilli/imapsync-go/internal/searchkey"
 )
 
 // fakeConn records what was done to it and can be told to fail on demand.
@@ -99,6 +100,8 @@ func (f *fakeConn) Append(context.Context, string, imapx.AppendMessage) (imapx.A
 	return imapx.AppendResult{}, nil
 }
 func (f *fakeConn) SearchHeader(context.Context, string, string) ([]uint32, error) { return nil, nil }
+
+func (f *fakeConn) Search(context.Context, searchkey.Key) ([]uint32, error) { return nil, nil }
 
 func (f *fakeConn) FetchFlags(context.Context, uint64) ([]imapx.FlagSet, error) { return nil, nil }
 

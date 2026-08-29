@@ -9,6 +9,8 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+
+	"github.com/hilli/imapsync-go/internal/searchkey"
 )
 
 // Mailbox is the state of a selected mailbox.
@@ -78,6 +80,7 @@ type SyncOps interface {
 	FetchBody(ctx context.Context, uid uint32, w io.Writer) (int64, error)
 	Append(ctx context.Context, mailbox string, msg AppendMessage) (AppendResult, error)
 	SearchHeader(ctx context.Context, field, value string) ([]uint32, error)
+	Search(ctx context.Context, key searchkey.Key) ([]uint32, error)
 	FetchFlags(ctx context.Context, changedSince uint64) ([]FlagSet, error)
 	StoreFlags(ctx context.Context, uid uint32, flags []string) error
 	DeleteMessages(ctx context.Context, uids []uint32) error
@@ -453,6 +456,30 @@ func (c *conn) SearchHeader(ctx context.Context, field, value string) ([]uint32,
 	}
 	if data == nil {
 		return nil, fmt.Errorf("searching for header %s: server returned no search data", field)
+	}
+	return toUint32s(data.AllUIDs()), nil
+}
+
+// Search runs a UID SEARCH in the selected mailbox and returns what matched.
+//
+// A search that matches nothing returns no UIDs and no error. That is not the
+// same as a failure and must not be treated as one: "no message here matches"
+// is a perfectly good answer, and the only wrong thing to do with it is to
+// fall back to copying everything.
+func (c *conn) Search(ctx context.Context, key searchkey.Key) ([]uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("searching for %s: %w", key, err)
+	}
+	if key.IsZero() {
+		return nil, errors.New("searching: no search key was given")
+	}
+
+	data, err := c.c.UIDSearch(key.Criteria(), nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("searching for %s: %w", key, err)
+	}
+	if data == nil {
+		return nil, fmt.Errorf("searching for %s: server returned no search data", key)
 	}
 	return toUint32s(data.AllUIDs()), nil
 }
