@@ -1,8 +1,10 @@
 package ident
 
 import (
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func header(lines ...string) []byte {
@@ -318,5 +320,105 @@ func TestTheStampIsNotPartOfTheDigest(t *testing.T) {
 
 	if before.Digest != after.Digest {
 		t.Errorf("stamping changed the digest:\n before %s\n after  %s", before.Digest, after.Digest)
+	}
+}
+
+// TestSentDateReadsTheDateHeader covers the age filter's default basis.
+func TestSentDateReadsTheDateHeader(t *testing.T) {
+	t.Parallel()
+
+	got := SentDate([]byte("Subject: hi\r\nDate: Mon, 27 Aug 2026 12:00:00 +0000\r\n\r\n"))
+	want := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("SentDate = %v, want %v", got, want)
+	}
+}
+
+// A date carrying an offset is the same instant as its UTC equivalent, and must
+// not be read as a different one: an hour's error at a --max-age boundary is a
+// message copied or skipped wrongly.
+func TestSentDateKeepsTheZoneOffset(t *testing.T) {
+	t.Parallel()
+
+	got := SentDate([]byte("Date: Mon, 27 Aug 2026 14:00:00 +0200\r\n\r\n"))
+	want := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("SentDate = %v, want the same instant as %v", got, want)
+	}
+}
+
+// Missing and unparseable dates are reported the same way, as the zero time,
+// because the caller's remedy for both is to fall back to the internal date.
+func TestSentDateReportsNothingItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, header := range map[string]string{
+		"no date header":     "Subject: hi\r\nFrom: a@b.test\r\n\r\n",
+		"empty header block": "",
+		"unparseable date":   "Date: some time last Tuesday\r\n\r\n",
+		"empty date":         "Date: \r\n\r\n",
+	} {
+		if got := SentDate([]byte(header)); !got.IsZero() {
+			t.Errorf("%s: SentDate = %v, want the zero time", name, got)
+		}
+	}
+}
+
+// The header block a FETCH of selected fields returns often has no closing
+// blank line. Parse already tolerates that; so must this, or every message on
+// such a server would silently fall back to its internal date.
+func TestSentDateToleratesAnUnterminatedHeader(t *testing.T) {
+	t.Parallel()
+
+	got := SentDate([]byte("Subject: hi\r\nDate: Mon, 27 Aug 2026 12:00:00 +0000\r\n"))
+	if got.IsZero() {
+		t.Error("SentDate found no date in a header with no closing blank line")
+	}
+}
+
+// Date is in Fields, and age filtering works only because it is: the header
+// reaches the filter as a side effect of being digested. An edit that dropped
+// it would break selection somewhere far from here.
+func TestTheDigestCoversTheDateHeader(t *testing.T) {
+	t.Parallel()
+
+	if !slices.Contains(Fields, "Date") {
+		t.Error("Fields does not cover Date, so age filtering would see no sent date")
+	}
+}
+
+// Real mail does not restrict itself to one date format, and every form here is
+// legal under RFC 5322 or common enough to be worth accepting anyway.
+//
+// The consequence of failing to parse one is quiet rather than loud: the age
+// filter falls back to the internal date, so the message is judged by when it
+// arrived instead of when it was written. That is a wrong answer that looks
+// exactly like a right one, which is why this pins the permissive parser rather
+// than trusting the one format the other tests happen to use.
+func TestSentDateAcceptsTheDateFormsRealMailUses(t *testing.T) {
+	t.Parallel()
+
+	want := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	for name, raw := range map[string]string{
+		"the usual form":     "Mon, 27 Aug 2026 12:00:00 +0000",
+		"no day of week":     "27 Aug 2026 12:00:00 +0000",
+		"obsolete zone name": "Mon, 27 Aug 2026 12:00:00 GMT",
+		"trailing comment":   "Mon, 27 Aug 2026 12:00:00 +0000 (UTC)",
+		"no seconds":         "Mon, 27 Aug 2026 12:00 +0000",
+	} {
+		got := SentDate([]byte("Date: " + raw + "\r\n\r\n"))
+		if got.IsZero() {
+			t.Errorf("%s: %q was not parsed at all", name, raw)
+			continue
+		}
+		if !got.Equal(want) {
+			t.Errorf("%s: %q gave %v, want %v", name, raw, got, want)
+		}
+	}
+
+	// A day without zero padding is the same date, on a different day of the
+	// month from the cases above.
+	if got := SentDate([]byte("Date: Mon, 7 Aug 2026 12:00:00 +0000\r\n\r\n")); got.Day() != 7 {
+		t.Errorf("an unpadded day gave %v", got)
 	}
 }

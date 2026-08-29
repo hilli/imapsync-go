@@ -1519,7 +1519,7 @@ func (s *Syncer) selected(metas []imapx.MessageMeta, lv *live) []imapx.MessageMe
 	}
 	kept := metas[:0]
 	for _, m := range metas {
-		if s.filter.Wants(m.Size, m.InternalDate, s.started) {
+		if s.filter.Wants(m.Size, ident.SentDate(m.Header), m.InternalDate, s.started) {
 			kept = append(kept, m)
 		}
 	}
@@ -2218,15 +2218,22 @@ func (s *Syncer) dryRunFilter(
 		}
 	}
 
+	// The copy path fetches these fields anyway, to digest them. A dry run has
+	// no digests to compute, so it asks only for what the filter reads — which
+	// is nothing at all unless the age bounds are measured from the Date:
+	// header.
+	var fields []string
+	if s.filter.NeedsSentDate() {
+		fields = []string{"Date"}
+	}
+
 	for chunk := range slices.Chunk(todo, copyChunk) {
-		// No header fields: the filter reads only size and internal date, and
-		// a dry run has no digests to compute.
-		metas, err := src.FetchMeta(ctx, chunk, nil)
+		metas, err := src.FetchMeta(ctx, chunk, fields)
 		if err != nil {
 			return fmt.Errorf("fetching message metadata: %w", err)
 		}
 		for _, m := range metas {
-			if !s.filter.Wants(m.Size, m.InternalDate, s.started) {
+			if !s.filter.Wants(m.Size, ident.SentDate(m.Header), m.InternalDate, s.started) {
 				fr.Copied--
 				fr.Filtered++
 			}

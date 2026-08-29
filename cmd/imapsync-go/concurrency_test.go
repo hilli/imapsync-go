@@ -566,3 +566,42 @@ func TestABadSelectionValueNamesItsFlag(t *testing.T) {
 		t.Error("a size window that can select nothing was accepted")
 	}
 }
+
+// --age-basis picks which date --max-age and --min-age read. The default is the
+// Date: header, matching imapsync, whose --noabletosearch selects the other one.
+func TestTheAgeBasisDefaultsToTheSentDate(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		basis string
+		want  selection.Basis
+	}{
+		{"", selection.BasisSent},
+		{"sent", selection.BasisSent},
+		{"internal", selection.BasisInternal},
+	} {
+		got, err := messageFilter(syncFlags{maxAge: "30d", ageBasis: tc.basis})
+		if err != nil {
+			t.Fatalf("--age-basis %q: %v", tc.basis, err)
+		}
+		if got.Basis != tc.want {
+			t.Errorf("--age-basis %q gave basis %v, want %v", tc.basis, got.Basis, tc.want)
+		}
+	}
+}
+
+// An unrecognised basis is refused rather than silently treated as the default,
+// which would measure ages from a date the user did not ask for.
+func TestAnUnknownAgeBasisIsRefused(t *testing.T) {
+	t.Parallel()
+
+	_, err := messageFilter(syncFlags{maxAge: "30d", ageBasis: "arrival"})
+	if err == nil {
+		t.Fatal("--age-basis arrival was accepted")
+	}
+	for _, want := range []string{"age-basis", "arrival", "sent", "internal"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}

@@ -59,10 +59,11 @@ type syncFlags struct {
 	automap        bool
 	includeVirtual bool
 
-	maxSize string
-	minSize string
-	maxAge  string
-	minAge  string
+	maxSize  string
+	minSize  string
+	maxAge   string
+	minAge   string
+	ageBasis string
 
 	dialTimeout time.Duration
 	insecureSrc bool
@@ -144,6 +145,7 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.minSize, "min-size", "", "skip messages this small or smaller")
 	cmd.Flags().StringVar(&f.maxAge, "max-age", "", "skip messages older than this, for example 30d")
 	cmd.Flags().StringVar(&f.minAge, "min-age", "", "skip messages newer than this")
+	cmd.Flags().StringVar(&f.ageBasis, "age-basis", "sent", `which date --max-age and --min-age measure from: "sent" (the Date: header) or "internal" (arrival in the mailbox)`)
 
 	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
@@ -616,6 +618,16 @@ func messageFilter(f syncFlags) (selection.Filter, error) {
 	if err != nil {
 		return selection.Filter{}, err
 	}
+
+	switch f.ageBasis {
+	case "", "sent":
+		sel.Basis = selection.BasisSent
+	case "internal":
+		sel.Basis = selection.BasisInternal
+	default:
+		return selection.Filter{}, fmt.Errorf("invalid --age-basis %q: want %q or %q", f.ageBasis, "sent", "internal")
+	}
+
 	return sel, sel.Validate()
 }
 

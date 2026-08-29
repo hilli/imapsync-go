@@ -13,8 +13,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/mail"
 	"net/textproto"
 	"strings"
+	"time"
 )
 
 // StampHeader marks a copy whose source had no usable Message-ID, so it can be
@@ -119,6 +121,34 @@ func readHeader(header []byte) textproto.MIMEHeader {
 		return textproto.MIMEHeader{}
 	}
 	return fields
+}
+
+// SentDate returns the message's Date: header, or the zero time if it has none
+// that parses.
+//
+// This lives here, next to the digest, because the two are bound together by
+// Fields: the Date: header reaches a caller only because digesting asks for it,
+// and a future edit that dropped "Date" from Fields would silently stop age
+// filtering from seeing anything. Keeping both in one file makes that visible.
+//
+// Sharing readHeader matters too. Real mailboxes are full of headers that no
+// strict parser will accept, and the tolerance worked out there is exactly the
+// tolerance needed here.
+//
+// A failure is reported as the zero time rather than as an error because the
+// caller's remedy is the same either way: fall back to the internal date. Mail
+// with no Date:, or with one no parser accepts, is common enough that treating
+// it as a fault would be noise.
+func SentDate(header []byte) time.Time {
+	raw := firstValue(readHeader(header), "Date")
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := mail.ParseDate(raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func firstValue(fields textproto.MIMEHeader, name string) string {

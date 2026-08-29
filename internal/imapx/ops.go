@@ -190,6 +190,13 @@ func (c *conn) AllUIDs(ctx context.Context) ([]uint32, error) {
 // FetchMeta returns metadata for the given UIDs, plus the raw bytes of the
 // requested header fields for identity digesting.
 //
+// An empty headerFields asks for no header at all. It is emphatically not a
+// request for the whole of it: BODY.PEEK[HEADER] downloads every header byte of
+// every message named, which is the most expensive thing this function can do,
+// and a caller that named no fields is a caller that wants none. The one caller
+// in that position — a dry run counting what a filter would leave out — needs
+// only sizes and dates, and used to pay for complete headers to get them.
+//
 // The fetch is a peek: a synchronisation must not mark the source as read.
 func (c *conn) FetchMeta(ctx context.Context, uids []uint32, headerFields []string) ([]MessageMeta, error) {
 	if len(uids) == 0 {
@@ -206,11 +213,13 @@ func (c *conn) FetchMeta(ctx context.Context, uids []uint32, headerFields []stri
 		RFC822Size:   true,
 		ModSeq:       c.Caps().CondStore,
 	}
-	section := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, Peek: true}
 	if len(headerFields) > 0 {
-		section.HeaderFields = headerFields
+		opts.BodySection = []*imap.FetchItemBodySection{{
+			Specifier:    imap.PartSpecifierHeader,
+			Peek:         true,
+			HeaderFields: headerFields,
+		}}
 	}
-	opts.BodySection = []*imap.FetchItemBodySection{section}
 
 	buffers, err := c.c.Fetch(toUIDSet(uids), opts).Collect()
 	if err != nil {

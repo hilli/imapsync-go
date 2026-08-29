@@ -392,6 +392,7 @@ Within the folders it copies, `sync` can leave out messages by size or age.
 | `--min-size SIZE` | skip messages of `SIZE` or smaller |
 | `--max-age AGE` | skip messages older than `AGE` |
 | `--min-age AGE` | skip messages newer than `AGE` |
+| `--age-basis BASIS` | which date the age bounds read: `sent` (default) or `internal` |
 
 Sizes take the same spellings as `--memory-limit` (`25MiB`, `2GB`). Ages take
 days or any Go duration (`30d`, `0.5d`, `36h`).
@@ -417,10 +418,25 @@ behaviour, described in its help as "magic!":
 When the two zones overlap you get their intersection; when they do not, you get
 both ends rather than nothing.
 
-Age is measured from the message's INTERNALDATE — when the server received it —
-not from its `Date:` header. imapsync uses the header by default. The two agree
-for almost all mail and differ for messages that were themselves migrated, which
-carry an INTERNALDATE from the migration rather than from delivery.
+Age is measured from the message's `Date:` header — when the sender says it was
+written — which is what imapsync does. Pass `--age-basis internal` to measure
+from INTERNALDATE instead, the arrival time in the mailbox; that is imapsync's
+`--noabletosearch`, and `compat` translates it for you.
+
+| Basis | Reads | Notes |
+| --- | --- | --- |
+| `sent` (default) | the `Date:` header | belongs to the message, so it survives a migration |
+| `internal` | INTERNALDATE | belongs to the mailbox, and cannot be forged by a sender |
+
+The two agree for almost all mail. They diverge for anything that has itself
+been moved between servers, which arrives carrying the date of the migration
+rather than of its delivery — so on a mailbox that was migrated last week,
+`--age-basis internal --max-age 30d` selects everything, while the default
+selects what was actually written in the last month.
+
+A message with no `Date:` header, or one no parser accepts, falls back to its
+INTERNALDATE rather than being dropped. Drafts and script-generated mail are
+routinely undated, and excluding them silently would be the worse answer.
 
 The report counts what was left out in a `FILTERED` column, separately from
 failures, so a run that copies less than expected says so. A `--dry-run` with a

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,8 +17,12 @@ import (
 	"github.com/hilli/imapsync-go/internal/syncer"
 )
 
-// stuffAt puts a message in a mailbox with an internal date of the caller's
-// choosing, which is the only thing the age filter reads.
+// stuffAt puts a message in a mailbox with a chosen age.
+//
+// Both of the message's dates are set from when, because a message whose Date:
+// header agrees with its internal date is the ordinary case and keeps these
+// tests independent of which one the filter reads. The tests that are about
+// that choice use stuffDated and set the two apart.
 //
 // Dates are given relative to time.Now rather than as absolutes, because the
 // run measures age against its own start and a fixed calendar date in a test
@@ -25,9 +30,29 @@ import (
 func stuffAt(t *testing.T, a account, mailbox string, when time.Time, body []byte) {
 	t.Helper()
 
-	if _, err := a.user.Append(mailbox, bytes.NewReader(body), &imap.AppendOptions{Time: when}); err != nil {
+	stuffDated(t, a, mailbox, when, when, body)
+}
+
+// stuffDated puts a message in a mailbox whose two dates may disagree, which is
+// the only way to see which of them the age bounds are measuring.
+func stuffDated(t *testing.T, a account, mailbox string, internal, sent time.Time, body []byte) {
+	t.Helper()
+
+	if _, err := a.user.Append(mailbox, bytes.NewReader(withSentDate(body, sent)), &imap.AppendOptions{Time: internal}); err != nil {
 		t.Fatalf("stuffing %q: %v", mailbox, err)
 	}
+}
+
+// sentDateLine matches the fixed Date: header testMessage writes.
+var sentDateLine = regexp.MustCompile(`(?m)^Date: .*\r\n`)
+
+// withSentDate rewrites a message's Date: header, or removes it when sent is
+// the zero time, so a test can build a message that has none.
+func withSentDate(body []byte, sent time.Time) []byte {
+	if sent.IsZero() {
+		return sentDateLine.ReplaceAllLiteral(body, nil)
+	}
+	return sentDateLine.ReplaceAllLiteral(body, []byte("Date: "+sent.Format(time.RFC1123Z)+"\r\n"))
 }
 
 // paddedMessage is a message of roughly the requested size.
@@ -526,5 +551,113 @@ func TestAnUnfilteredDryRunFetchesNoMetadata(t *testing.T) {
 	}
 	if got := fetched.Load(); got != 5 {
 		t.Errorf("a filtered dry run fetched metadata for %d messages, want 5", got)
+	}
+}
+
+// The age bounds read the Date: header, not the internal date.
+//
+// This is imapsync's default, and it is the reverse of the obvious guess. The
+// difference shows up in exactly the situation this tool is for: a migration
+// that did not preserve internal dates leaves every message looking as though
+// it arrived on the day it was copied, and --max-age measured that way would
+// select the whole mailbox.
+func TestAgeIsMeasuredFromTheSentDateByDefault(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	now := time.Now()
+	// Both arrived yesterday; they were written months apart.
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-2*selection.Day),
+		testMessage("written-recently", "recent@example.test"))
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-200*selection.Day),
+		testMessage("written-long-ago", "ancient@example.test"))
+
+	rep := h.run(t, withFilter(selection.Filter{MaxAge: 30 * selection.Day}))
+
+	fr := folderReport(t, rep, "INBOX")
+	if fr.Copied != 1 || fr.Filtered != 1 {
+		t.Errorf("copied %d and filtered %d, want 1 and 1", fr.Copied, fr.Filtered)
+	}
+	got := subjectsIn(t, h.dst, "INBOX")
+	if !got["written-recently"] {
+		t.Error("the recently written message was not copied")
+	}
+	if got["written-long-ago"] {
+		t.Error("a message written 200 days ago was copied; --max-age reads the Date: header")
+	}
+}
+
+// The same two messages, with --age-basis internal, both qualify — which is
+// what keeps the test above from passing for the wrong reason.
+func TestTheInternalBasisMeasuresArrivalInstead(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	now := time.Now()
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-2*selection.Day),
+		testMessage("written-recently", "recent@example.test"))
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-200*selection.Day),
+		testMessage("written-long-ago", "ancient@example.test"))
+
+	rep := h.run(t, withFilter(selection.Filter{
+		MaxAge: 30 * selection.Day,
+		Basis:  selection.BasisInternal,
+	}))
+
+	fr := folderReport(t, rep, "INBOX")
+	if fr.Copied != 2 || fr.Filtered != 0 {
+		t.Errorf("copied %d and filtered %d, want 2 and 0: both arrived yesterday", fr.Copied, fr.Filtered)
+	}
+}
+
+// A message with no Date: header is judged by when it arrived, not excluded.
+func TestAMessageWithNoSentDateIsJudgedByItsArrival(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	now := time.Now()
+	// No Date: header at all, and an arrival well inside the bound.
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), time.Time{},
+		testMessage("undated-recent", "undated-recent@example.test"))
+	stuffDated(t, h.src, "INBOX", now.Add(-200*selection.Day), time.Time{},
+		testMessage("undated-old", "undated-old@example.test"))
+
+	rep := h.run(t, withFilter(selection.Filter{MaxAge: 30 * selection.Day}))
+
+	fr := folderReport(t, rep, "INBOX")
+	if fr.Copied != 1 || fr.Filtered != 1 {
+		t.Errorf("copied %d and filtered %d, want 1 and 1", fr.Copied, fr.Filtered)
+	}
+	if !subjectsIn(t, h.dst, "INBOX")["undated-recent"] {
+		t.Error("an undated message that arrived yesterday was not copied")
+	}
+}
+
+// A dry run on the default basis must fetch the Date: header it measures with.
+//
+// The copy path gets that header free, because it digests it. The dry run
+// digests nothing and so asks for no headers at all — which would leave it
+// measuring every message against a zero Date: and falling back to arrival,
+// quietly previewing a different run from the one that would happen.
+func TestADryRunPreviewsTheSameMessagesTheRealRunWouldCopy(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	now := time.Now()
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-2*selection.Day),
+		testMessage("written-recently", "recent@example.test"))
+	stuffDated(t, h.src, "INBOX", now.Add(-1*selection.Day), now.Add(-200*selection.Day),
+		testMessage("written-long-ago", "ancient@example.test"))
+
+	filter := withFilter(selection.Filter{MaxAge: 30 * selection.Day})
+
+	preview := folderReport(t, h.run(t, filter, func(o *syncer.Options) { o.DryRun = true }), "INBOX")
+	if preview.Copied != 1 || preview.Filtered != 1 {
+		t.Fatalf("previewed %d to copy and %d filtered, want 1 and 1", preview.Copied, preview.Filtered)
+	}
+
+	real := folderReport(t, h.run(t, filter), "INBOX")
+	if real.Copied != preview.Copied || real.Filtered != preview.Filtered {
+		t.Errorf("previewed %d/%d but copied %d/%d", preview.Copied, preview.Filtered, real.Copied, real.Filtered)
 	}
 }

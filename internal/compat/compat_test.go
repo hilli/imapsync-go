@@ -594,3 +594,82 @@ func TestStatingAnAppendLimitByHandIsAcceptedAndExplained(t *testing.T) {
 		t.Errorf("the note does not say what to use instead: %q", why)
 	}
 }
+
+// TestNoabletosearchSelectsTheInternalDateBasis.
+//
+// imapsync measures --maxage and --minage from the Date: header, and
+// --noabletosearch switches them to the internal date. This tool reads the
+// Date: header out of headers it already fetches, so it never has to ask
+// whether the server can search — but the choice of date is real, and dropping
+// --noabletosearch on the floor would measure ages from the wrong one while
+// reporting success.
+func TestNoabletosearchSelectsTheInternalDateBasis(t *testing.T) {
+	t.Parallel()
+
+	for _, option := range []string{"--noabletosearch", "--noabletosearch1"} {
+		p := translated(t,
+			"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+			"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+			"--maxage", "30", option,
+		)
+		if !strings.Contains(joined(p), "--age-basis internal") {
+			t.Errorf("%s did not select the internal basis:\n  %s", option, joined(p))
+		}
+	}
+}
+
+// The positive spelling asks for what already happens, so it is ignored — but
+// the note has to say so truthfully. It used to read "this is already what
+// happens" while ages were in fact measured from the internal date, which was
+// the exact opposite of what --abletosearch asks for.
+func TestAbletosearchIsIgnoredBecauseItIsTheDefault(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--abletosearch",
+	)
+	if strings.Contains(joined(p), "--age-basis") {
+		t.Errorf("--abletosearch emitted a flag; it is the default:\n  %s", joined(p))
+	}
+
+	var why string
+	for _, note := range p.Ignored {
+		if note.Option == "--abletosearch" {
+			why = note.Why
+		}
+	}
+	if !strings.Contains(why, "Date:") {
+		t.Errorf("the note does not name the basis it claims is already in use: %q", why)
+	}
+}
+
+// --noabletosearch2 asks for a destination-side age basis, and this tool never
+// selects destination messages by age. Saying so is better than translating it
+// into a source-side change the user did not ask for.
+func TestNoabletosearch2IsIgnoredBecauseTheDestinationIsNotAgeFiltered(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--noabletosearch2",
+	)
+	if strings.Contains(joined(p), "--age-basis") {
+		t.Errorf("--noabletosearch2 changed the source basis:\n  %s", joined(p))
+	}
+
+	var found bool
+	for _, note := range p.Ignored {
+		if note.Option == "--noabletosearch2" {
+			found = true
+			if !strings.Contains(note.Why, "destination") {
+				t.Errorf("the note does not explain which side is unaffected: %q", note.Why)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("--noabletosearch2 was not reported as ignored: %v", p.Ignored)
+	}
+}

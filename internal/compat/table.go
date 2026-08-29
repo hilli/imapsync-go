@@ -101,6 +101,13 @@ const (
 	logToStderr      = "this tool logs to stderr; redirect it, or use --log-json"
 	alreadyTheCase   = "this is already what happens"
 	changesSelection = "it changes which messages are copied, and this tool would copy all of them instead"
+
+	agesFromSentDate = "--max-age and --min-age already measure from the Date: header"
+	// Only the source listing is narrowed by age. Narrowing the destination
+	// view as well is what makes imapsync's own documentation warn about
+	// --search2: a hidden destination message is not adopted, so it is copied
+	// again. See selected() in the syncer for the whole of that argument.
+	destNotSelectedByAge = "only source messages are selected by age; narrowing the destination view would duplicate mail rather than skip it"
 )
 
 // table is every option imapsync accepts, in the order its own two GetOptions
@@ -274,10 +281,16 @@ func messageOptions() []*option {
 		ig("checkmessageexists!", "an interrupted append is always looked for before it is copied again").
 			offRefuses("an interrupted append is always looked for before it is copied again, and skipping that check duplicates mail"),
 		ig("expungeaftereach!", "deletions are expunged by UID as they are made").offIgnores(alreadyTheCase),
-		ig("abletosearch!", alreadyTheCase).offIgnores(alreadyTheCase),
-		ig("abletosearch1!", alreadyTheCase).offIgnores(alreadyTheCase),
-		ig("abletosearch2!", alreadyTheCase).offIgnores(alreadyTheCase),
-		ig("checknoabletosearch!", alreadyTheCase).offIgnores(alreadyTheCase),
+		// imapsync measures --maxage and --minage from the Date: header when it
+		// can search the server for one, and from the internal date when it
+		// cannot. This tool reads the Date: header out of the headers it
+		// already fetches to digest messages, so searching never comes into it
+		// — but which of the two dates to measure from is a real choice, and
+		// --noabletosearch is how imapsync spells the internal one.
+		ig("abletosearch!", agesFromSentDate).offTranslates("--age-basis internal"),
+		ig("abletosearch1!", agesFromSentDate).offTranslates("--age-basis internal"),
+		ig("abletosearch2!", destNotSelectedByAge).offIgnores(destNotSelectedByAge),
+		ig("checknoabletosearch!", "no search is made to check").offIgnores(alreadyTheCase),
 		ig("fixcolonbug!", "message bodies are copied byte for byte").offIgnores(alreadyTheCase),
 		ig("create_folder_old!", "folders are created the modern way").offIgnores(alreadyTheCase),
 		ig("fetch_hash_set=s", "an internal fetch tuning knob with no equivalent"),

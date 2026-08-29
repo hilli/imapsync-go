@@ -271,6 +271,49 @@ func TestFetchMetaReturnsHeadersForDigesting(t *testing.T) {
 	}
 }
 
+// TestFetchMetaAsksForNoHeaderWhenNoFieldsAreNamed.
+//
+// Naming no fields means wanting no header, not wanting all of it. The
+// distinction is worth a test because the expensive reading is the plausible
+// one: BODY.PEEK[HEADER] is what an empty field list used to produce, so the
+// caller that wanted least — a dry run counting what a filter excludes — paid
+// for every header byte of every message it previewed.
+func TestFetchMetaAsksForNoHeaderWhenNoFieldsAreNamed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	addr, _ := startMemServer(t, rev2Caps())
+	conn := dialMem(t, addr)
+
+	body := testMessage("no header wanted", "nohdr@example.test")
+	res, err := conn.Append(ctx, "INBOX", imapx.AppendMessage{
+		Size: int64(len(body)),
+		Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if _, err := conn.Select(ctx, "INBOX", imapx.SelectOptions{}); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	metas, err := conn.FetchMeta(ctx, []uint32{res.UID}, nil)
+	if err != nil {
+		t.Fatalf("FetchMeta() error = %v", err)
+	}
+	if len(metas[0].Header) != 0 {
+		t.Errorf("asked for no header fields but got %d bytes: %q", len(metas[0].Header), metas[0].Header)
+	}
+	// The rest of the metadata still has to arrive, or the caller gains
+	// nothing by asking for less.
+	if metas[0].Size != int64(len(body)) {
+		t.Errorf("Size = %d, want %d", metas[0].Size, len(body))
+	}
+	if metas[0].InternalDate.IsZero() {
+		t.Error("InternalDate was not fetched")
+	}
+}
+
 // TestAppendRejectsAWrongDeclaredSize guards the protocol stream. The literal
 // length goes out before the bytes do, and IMAP has no way to retract it, so a
 // mismatch leaves the server reading message content as commands. There is no
