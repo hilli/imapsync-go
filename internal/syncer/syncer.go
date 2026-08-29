@@ -34,6 +34,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/retry"
+	"github.com/hilli/imapsync-go/internal/searchkey"
 	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
 )
@@ -104,6 +105,26 @@ type Options struct {
 	// A run carrying an active filter never records a folder as fully
 	// mirrored, because it is not: see syncFolder.
 	Filter selection.Filter
+
+	// SourceSearch narrows what is copied to the messages an IMAP SEARCH
+	// matches on the source. The zero value copies everything.
+	//
+	// This is imapsync's --search1, and like the size and age bounds it
+	// attaches to what is copied and never to what the source is considered to
+	// hold. Narrowing the latter would make --delete2 remove every destination
+	// message the search excluded.
+	SourceSearch searchkey.Key
+
+	// DestSearch narrows which destination messages --delete2 may remove to
+	// those an IMAP SEARCH matches. The zero value considers all of them.
+	//
+	// This is imapsync's --search2, and it is deliberately narrower here. In
+	// imapsync the search hides destination messages from everything, so a
+	// message it hides is not recognised as already copied and is copied
+	// again — a duplication its own documentation warns about. This tool
+	// applies the search to the deletion candidates alone, so it can only ever
+	// delete fewer messages and never copy more.
+	DestSearch searchkey.Key
 
 	// NoResyncFlags turns off copying flag changes onto messages that are
 	// already there. Negative, so that the zero Options is the default
@@ -1236,6 +1257,9 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 
 	p := &prepared{folderID: row.ID, src: srcBox, dst: dstBox, since: watermark(row, kept)}
 	p.todo = triage(uids, known, lv)
+	if p.todo, err = s.searchedInto(ctx, src, p.todo, lv.filtered); err != nil {
+		return nil, err
+	}
 	if s.opts.Delete2 {
 		// Sorted so the deletion pass can ask "is this UID still there" by
 		// binary search rather than by building a second map the size of the
@@ -1501,6 +1525,62 @@ func (s *Syncer) markGone(ctx context.Context, p *prepared, chunk []uint32, meta
 	return nil
 }
 
+// keepMatching drops the UIDs a search did not return, and reports how many
+// went.
+//
+// The exclusions are counted as filtered rather than passed over quietly, for
+// the same two reasons the size and age bounds are: a summary that said a
+// folder held a thousand messages and copied three would otherwise leave the
+// reader to guess where the rest went, and the count is what stops the run
+// recording the folder as fully mirrored.
+//
+// That last point is worth stating plainly, because a search looks like it
+// should not need it. Most search keys test something immutable, and a change
+// to a flag moves the folder's modification sequence anyway, so the fast path
+// would usually notice. Usually is not a guarantee, the cost of being wrong is
+// mail that is never copied, and the cost of being careful is one extra diff
+// on the next filtered run.
+//
+// matched is sorted in place. It comes straight from the server, which is
+// entitled to return it in any order it likes.
+// searched narrows a copy list to the UIDs the source search matched, or
+// returns it untouched when there is no search.
+//
+// The narrowing happens before anything is fetched, which is the option's
+// whole economy: unlike --max-size, which has to see a message's metadata to
+// know its size, a search that excludes most of a folder makes the run
+// proportionately cheaper.
+//
+// It narrows the copy list and nothing else. Narrowing what the source is held
+// to hold would make every excluded message look to --delete2 like a message
+// the source had lost.
+func (s *Syncer) searchedInto(ctx context.Context, src imapx.SyncOps, todo []uint32, count func(int)) ([]uint32, error) {
+	if s.opts.SourceSearch.IsZero() {
+		return todo, nil
+	}
+	matched, err := src.Search(ctx, s.opts.SourceSearch)
+	if err != nil {
+		return nil, fmt.Errorf("searching source messages: %w", err)
+	}
+	kept, dropped := keepMatching(todo, matched)
+	if dropped > 0 {
+		count(dropped)
+		s.log.Debug("source search applied", "search", s.opts.SourceSearch, "excluded", dropped)
+	}
+	return kept, nil
+}
+
+func keepMatching(todo, matched []uint32) (kept []uint32, dropped int) {
+	slices.Sort(matched)
+	kept = todo[:0]
+	for _, uid := range todo {
+		if _, found := slices.BinarySearch(matched, uid); found {
+			kept = append(kept, uid)
+		}
+	}
+	return kept, len(todo) - len(kept)
+}
+
 // selected drops the messages the run's filter excludes, counting them.
 //
 // Nothing is written to the state database for a filtered message. That is the
@@ -1591,6 +1671,35 @@ func (s *Syncer) condemned(ctx context.Context, dst imapx.Conn, p *prepared, dst
 		return nil, 0, false, 0, err
 	}
 	victims = append(victims, strangers...)
+
+	// The destination search runs last, over both populations at once, and it
+	// can only ever shorten this list. That is the whole of its safety: a
+	// message it hides is a message that is not deleted, and nothing else
+	// about the run changes.
+	//
+	// It deliberately does not narrow what adoption sees. imapsync's --search2
+	// hides destination messages from everything, so one it hides is not
+	// recognised as already copied and is copied a second time; keeping the
+	// search away from the index means this tool cannot do that.
+	//
+	// Before the ceiling, so the ceiling measures what would actually be
+	// deleted rather than what was nominated before the search had its say.
+	if !s.opts.DestSearch.IsZero() && len(victims) > 0 {
+		matched, err := dst.Search(ctx, s.opts.DestSearch)
+		if err != nil {
+			return nil, 0, false, 0, fmt.Errorf("searching destination messages: %w", err)
+		}
+		slices.Sort(matched)
+		kept := victims[:0]
+		for _, v := range victims {
+			if _, found := slices.BinarySearch(matched, v.DstUID); found {
+				kept = append(kept, v)
+			}
+		}
+		s.log.Debug("destination search applied to deletion candidates",
+			"search", s.opts.DestSearch, "nominated", len(victims), "remaining", len(kept))
+		victims = kept
+	}
 
 	if len(victims) == 0 || population == 0 {
 		return victims, population, true, 0, nil
@@ -2164,6 +2273,8 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 	if err != nil {
 		return fr, fmt.Errorf("enumerating source messages: %w", err)
 	}
+
+	todo := make([]uint32, 0, len(uids))
 	for _, uid := range uids {
 		switch known[uid] {
 		case state.StateDone:
@@ -2171,11 +2282,16 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 		case state.StateGone:
 			fr.Vanished++
 		default:
-			fr.Copied++
+			todo = append(todo, uid)
 		}
 	}
+	todo, err = s.searchedInto(ctx, src, todo, func(n int) { fr.Filtered += n })
+	if err != nil {
+		return fr, err
+	}
+	fr.Copied = len(todo)
 
-	if err := s.dryRunFilter(ctx, src, known, uids, &fr); err != nil {
+	if err := s.dryRunFilter(ctx, src, todo, &fr); err != nil {
 		return fr, err
 	}
 
@@ -2198,24 +2314,13 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 //
 // The real run pays for the same fetch, so this is not extra work so much as
 // work brought forward.
-func (s *Syncer) dryRunFilter(
-	ctx context.Context,
-	src imapx.Conn,
-	known map[uint32]state.State,
-	uids []uint32,
-	fr *FolderReport,
-) error {
-	if !s.filter.Active() || fr.Copied == 0 {
+//
+// todo is the list the caller counted as Copied, handed over rather than
+// recomputed, so that the preview and the count it adjusts cannot come to
+// disagree about which messages this folder would copy.
+func (s *Syncer) dryRunFilter(ctx context.Context, src imapx.Conn, todo []uint32, fr *FolderReport) error {
+	if !s.filter.Active() || len(todo) == 0 {
 		return nil
-	}
-
-	todo := make([]uint32, 0, fr.Copied)
-	for _, uid := range uids {
-		// The same test the count above made, so the two cannot disagree about
-		// which messages this folder would copy.
-		if st := known[uid]; st != state.StateDone && st != state.StateGone {
-			todo = append(todo, uid)
-		}
 	}
 
 	// The copy path fetches these fields anyway, to digest them. A dry run has

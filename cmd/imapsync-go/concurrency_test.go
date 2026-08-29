@@ -605,3 +605,55 @@ func TestAnUnknownAgeBasisIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestABadSearchIsRefusedBeforeAnythingConnects.
+//
+// Parsing the search key here rather than at the first SELECT is the whole
+// justification for parsing it at all: a key this tool cannot express is a
+// typing mistake, and a typing mistake should cost a command line rather than
+// a connection, a login and one error per folder in the middle of a run.
+//
+// The flag has to be named, because a run can carry two searches and "invalid
+// search" says nothing about which one was wrong.
+func TestABadSearchIsRefusedBeforeAnythingConnects(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ flag, key string }{
+		{"source-search", "RECENT"},
+		{"dest-search", "NOT"},
+		{"source-search", "SINCE yesterday"},
+		{"dest-search", "1:5"},
+	} {
+		_, err := searchFlag(tc.flag, tc.key)
+		if err == nil {
+			t.Errorf("--%s %q was accepted", tc.flag, tc.key)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--"+tc.flag) {
+			t.Errorf("error %q does not name --%s", err, tc.flag)
+		}
+	}
+}
+
+// An absent search is the zero key, and the zero key means "no search" rather
+// than "search for everything" — the difference between listing a folder and
+// asking the server a question it was never given.
+func TestAnAbsentSearchIsTheZeroKey(t *testing.T) {
+	t.Parallel()
+
+	got, err := searchFlag("source-search", "")
+	if err != nil {
+		t.Fatalf("an empty search was refused: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("an empty search parsed to %q, want the zero key", got)
+	}
+
+	got, err = searchFlag("source-search", "UNSEEN")
+	if err != nil {
+		t.Fatalf("UNSEEN was refused: %v", err)
+	}
+	if got.IsZero() {
+		t.Error("UNSEEN parsed to the zero key, which would search for nothing")
+	}
+}

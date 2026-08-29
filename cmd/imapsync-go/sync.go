@@ -21,6 +21,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/imapx"
 	"github.com/hilli/imapsync-go/internal/pool"
+	"github.com/hilli/imapsync-go/internal/searchkey"
 	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
 	"github.com/hilli/imapsync-go/internal/syncer"
@@ -64,6 +65,9 @@ type syncFlags struct {
 	maxAge   string
 	minAge   string
 	ageBasis string
+
+	sourceSearch string
+	destSearch   string
 
 	dialTimeout time.Duration
 	insecureSrc bool
@@ -146,6 +150,8 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.maxAge, "max-age", "", "skip messages older than this, for example 30d")
 	cmd.Flags().StringVar(&f.minAge, "min-age", "", "skip messages newer than this")
 	cmd.Flags().StringVar(&f.ageBasis, "age-basis", "sent", `which date --max-age and --min-age measure from: "sent" (the Date: header) or "internal" (arrival in the mailbox)`)
+	cmd.Flags().StringVar(&f.sourceSearch, "source-search", "", `copy only source messages matching this IMAP SEARCH, for example "UNSEEN SMALLER 100000"`)
+	cmd.Flags().StringVar(&f.destSearch, "dest-search", "", "consider only destination messages matching this IMAP SEARCH for deletion by --delete2")
 
 	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
@@ -186,6 +192,11 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	}
 
 	messages, err := messageFilter(f)
+	if err != nil {
+		return err
+	}
+
+	sourceSearch, destSearch, err := searchFlags(f)
 	if err != nil {
 		return err
 	}
@@ -252,6 +263,8 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		DryRun:        f.dryRun,
 		Full:          f.full,
 		Filter:        messages,
+		SourceSearch:  sourceSearch,
+		DestSearch:    destSearch,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
 		NoSubscribe:   !f.subscribe,
 		Delete2:       f.delete2,
@@ -629,6 +642,44 @@ func messageFilter(f syncFlags) (selection.Filter, error) {
 	}
 
 	return sel, sel.Validate()
+}
+
+// searchFlags parses both IMAP SEARCH options.
+func searchFlags(f syncFlags) (source, dest searchkey.Key, err error) {
+	if source, err = searchFlag("source-search", f.sourceSearch); err != nil {
+		return source, dest, err
+	}
+	if dest, err = searchFlag("dest-search", f.destSearch); err != nil {
+		return source, dest, err
+	}
+	if !dest.IsZero() && !f.delete2 {
+		// Not an error, because --search sets both sides at once and its
+		// source half is doing real work. Not silent either: unlike imapsync,
+		// where --search2 narrows the whole destination view, here it narrows
+		// nothing but the deletion candidates, so without --delete2 it has no
+		// effect at all, and the user should hear that from us rather than
+		// infer it from a result that looks the same either way.
+		slog.Warn("--dest-search had no effect because this run does not delete anything; it only narrows what --delete2 would remove")
+	}
+	return source, dest, err
+}
+
+// searchFlag parses one of the IMAP SEARCH options, or returns the zero key
+// when it was not given.
+//
+// Parsing here rather than at the first SELECT is the point of parsing at all:
+// a search this tool cannot express is a mistake worth hearing about before
+// any connection is opened, rather than once per folder in the middle of a
+// run.
+func searchFlag(flag, value string) (searchkey.Key, error) {
+	if value == "" {
+		return searchkey.Key{}, nil
+	}
+	key, err := searchkey.Parse(value)
+	if err != nil {
+		return searchkey.Key{}, fmt.Errorf("invalid --%s: %w", flag, err)
+	}
+	return key, nil
 }
 
 // derivePairID names this migration in the state database.

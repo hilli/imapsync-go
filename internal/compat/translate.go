@@ -168,6 +168,13 @@ func (t *translator) emit(g given, out outcome) error {
 			return fmt.Errorf("%q is not a number of days", value)
 		}
 		value = strconv.FormatFloat(days, 'f', -1, 64) + "d"
+	case "search":
+		// One imapsync option that this tool spells as two, so the value goes
+		// to each flag rather than after the last of them.
+		for _, w := range words {
+			t.append(w, value)
+		}
+		return nil
 	}
 	t.append(append(words, value)...)
 	return nil

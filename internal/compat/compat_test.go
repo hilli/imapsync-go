@@ -673,3 +673,67 @@ func TestNoabletosearch2IsIgnoredBecauseTheDestinationIsNotAgeFiltered(t *testin
 		t.Errorf("--noabletosearch2 was not reported as ignored: %v", p.Ignored)
 	}
 }
+
+// TestSearchGoesToBothSidesAndTheHalvesGoToOne.
+//
+// imapsync spells one option where this tool spells two, so --search has to
+// arrive as a value on each of them rather than as a value after the last of
+// them. Getting that wrong is not a visible failure: "--source-search
+// --dest-search UNSEEN" parses, and leaves the source unfiltered while
+// silently swallowing the next flag as --source-search's value.
+func TestSearchGoesToBothSidesAndTheHalvesGoToOne(t *testing.T) {
+	t.Parallel()
+
+	base := []string{
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+	}
+
+	both := joined(translated(t, append(base, "--search", "UNSEEN")...))
+	if !strings.Contains(both, "--source-search UNSEEN") || !strings.Contains(both, "--dest-search UNSEEN") {
+		t.Errorf("--search did not reach both sides:\n  %s", both)
+	}
+
+	one := joined(translated(t, append(base, "--search1", "SEEN")...))
+	if !strings.Contains(one, "--source-search SEEN") {
+		t.Errorf("--search1 did not reach the source:\n  %s", one)
+	}
+	if strings.Contains(one, "--dest-search") {
+		t.Errorf("--search1 reached the destination as well:\n  %s", one)
+	}
+
+	two := joined(translated(t, append(base, "--search2", "DELETED")...))
+	if !strings.Contains(two, "--dest-search DELETED") {
+		t.Errorf("--search2 did not reach the destination:\n  %s", two)
+	}
+	if strings.Contains(two, "--source-search") {
+		t.Errorf("--search2 reached the source as well:\n  %s", two)
+	}
+}
+
+// A search key with spaces in it is one argument, and has to stay one across
+// the translation. This is the case that catches a translator which joins its
+// output by spaces and hands the result to a shell.
+func TestASearchKeyWithSpacesStaysOneArgument(t *testing.T) {
+	t.Parallel()
+
+	p := translated(t,
+		"--host1", "a.example.test", "--user1", "u", "--password1", "p",
+		"--host2", "b.example.test", "--user2", "u", "--password2", "p",
+		"--search1", "UNSEEN SMALLER 1000",
+	)
+
+	var found bool
+	for i, arg := range p.Args {
+		if arg != "--source-search" {
+			continue
+		}
+		if i+1 >= len(p.Args) || p.Args[i+1] != "UNSEEN SMALLER 1000" {
+			t.Fatalf("--source-search was not followed by the whole key: %q", p.Args)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("--source-search is absent from %q", p.Args)
+	}
+}

@@ -303,9 +303,17 @@ func messageOptions() []*option {
 		tr("maxsize=i", "--max-size"),
 		tr("maxage=f", "--max-age"),
 		tr("minage=f", "--min-age"),
-		no("search=s", changesSelection),
-		no("search1=s", changesSelection),
-		no("search2=s", changesSelection),
+		// --search is --search1 and --search2 given at once; emit splits it,
+		// because this tool spells the two sides separately.
+		tr("search=s", "--source-search --dest-search"),
+		tr("search1=s", "--source-search"),
+		// Narrower here than in imapsync, and deliberately: imapsync's
+		// --search2 hides destination messages from everything, so one it
+		// hides is not recognised as already copied and is copied again, which
+		// its own documentation warns about. This tool applies it to the
+		// deletion candidates alone, so it can only delete fewer messages and
+		// never copy more.
+		tr("search2=s", "--dest-search"),
 		no("skipmess=s", changesSelection),
 		no("regexmess=s", "rewriting messages in flight is not implemented, and would make the copy differ from the original"),
 		no("noregexmess", "--regexmess has no default here to cancel"),
