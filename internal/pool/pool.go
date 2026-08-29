@@ -256,7 +256,7 @@ func (p *Pool) Acquire(ctx context.Context, mailbox string) (*Lease, error) {
 // usable, so a SELECT that fails on a freshly dialled connection does not leave
 // that connection open and unreachable.
 func (p *Pool) ready(ctx context.Context, mailbox string) (*conn, error) {
-	c, err := p.take(ctx)
+	c, reused, err := p.take(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -268,38 +268,83 @@ func (p *Pool) ready(ctx context.Context, mailbox string) (*conn, error) {
 		return c, nil
 	}
 	mbox, err := c.c.Select(ctx, mailbox, p.sel)
-	if err != nil {
-		_ = c.c.Close()
+	if err == nil {
+		c.selected = mailbox
+		c.uidValidity = mbox.UIDValidity
+		return c, nil
+	}
+	_ = c.c.Close()
+
+	// A SELECT that fails on a connection just dialled is a real failure. One
+	// that fails on a connection taken from the idle list is more often a
+	// server that hung up while it sat there — mox drops long-idle connections,
+	// and the failure arrives as "use of closed network connection" against a
+	// pool that still believes it holds a working socket.
+	//
+	// This is not a rare edge. It killed the two largest folders of a 776,791
+	// message run, INBOX and Reklamer, at the point they had been going longest
+	// and their spare connections had been idle longest, leaving 68,755
+	// messages uncopied — while every short folder in the same run finished. So
+	// a reused connection gets exactly one fresh dial before the error stands.
+	if !reused {
 		return nil, fmt.Errorf("selecting %q: %w", mailbox, err)
 	}
-	c.selected = mailbox
-	c.uidValidity = mbox.UIDValidity
-	return c, nil
+
+	p.discard()
+
+	fresh, _, freshErr := p.take(ctx)
+	if freshErr != nil {
+		return nil, fmt.Errorf("selecting %q: %w", mailbox, err)
+	}
+	mbox, freshErr = fresh.c.Select(ctx, mailbox, p.sel)
+	if freshErr != nil {
+		_ = fresh.c.Close()
+		p.discard()
+		return nil, fmt.Errorf("selecting %q: %w", mailbox, freshErr)
+	}
+	fresh.selected = mailbox
+	fresh.uidValidity = mbox.UIDValidity
+	return fresh, nil
 }
 
-// take pops an idle connection, dialling only when there is none.
+// discard accounts for a connection this pool opened and has now closed
+// outside the normal lease path, so the open count does not drift upwards and
+// strand the pool below its own width.
+//
+// The count cannot go negative here: every caller has just closed a connection
+// that take handed it, and take either dialled it — incrementing open — or
+// popped it from the idle list, where only connections already counted live.
+func (p *Pool) discard() {
+	p.mu.Lock()
+	p.open--
+	p.mu.Unlock()
+}
+
+// take pops an idle connection, dialling only when there is none. The bool
+// reports whether the connection came from the idle list, which is what tells
+// a failure on it apart from a failure on a connection just proven to work.
 //
 // It does not re-check whether the pool has been closed. A caller that holds a
 // token has, by construction, prevented Close from finishing, so the idle list
 // is still intact and any connection dialled here is still closed by put once
 // the lease ends. Checking anyway would only save a pointless dial in a race
 // that no test can reach, at the cost of a branch nothing exercises.
-func (p *Pool) take(ctx context.Context) (*conn, error) {
+func (p *Pool) take(ctx context.Context) (*conn, bool, error) {
 	p.mu.Lock()
 	if n := len(p.idle); n > 0 {
 		c := p.idle[n-1]
 		p.idle = p.idle[:n-1]
 		p.mu.Unlock()
-		return c, nil
+		return c, true, nil
 	}
 	p.mu.Unlock()
 
 	c, err := p.dial(ctx)
 	if err != nil {
 		if p.refused(err) {
-			return nil, fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, err))
+			return nil, false, fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, err))
 		}
-		return nil, fmt.Errorf("dialling: %w", err)
+		return nil, false, fmt.Errorf("dialling: %w", err)
 	}
 
 	p.mu.Lock()
@@ -313,7 +358,7 @@ func (p *Pool) take(ctx context.Context) (*conn, error) {
 	// sit there being refused for the length of the run.
 	p.lastOK = p.now()
 	p.mu.Unlock()
-	return &conn{c: c}, nil
+	return &conn{c: c}, false, nil
 }
 
 // refused decides whether a failed dial was the server's connection limit, and

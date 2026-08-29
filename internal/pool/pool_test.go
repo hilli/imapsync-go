@@ -15,6 +15,10 @@ import (
 )
 
 // fakeConn records what was done to it and can be told to fail on demand.
+// fakeUIDValidity is non-zero so that a pool which forgets to record what a
+// SELECT returned is distinguishable from one that records it.
+const fakeUIDValidity = 4242
+
 type fakeConn struct {
 	mu sync.Mutex
 
@@ -40,7 +44,7 @@ func (f *fakeConn) Select(_ context.Context, mailbox string, _ imapx.SelectOptio
 		return imapx.Mailbox{}, f.selErr
 	}
 	f.selects = append(f.selects, mailbox)
-	return imapx.Mailbox{Name: mailbox}, nil
+	return imapx.Mailbox{Name: mailbox, UIDValidity: fakeUIDValidity}, nil
 }
 
 func (f *fakeConn) selected() []string {
@@ -115,6 +119,10 @@ type dialer struct {
 	conns  []*fakeConn
 	err    error
 	failAt int // dial number, 1-based, that returns err; 0 means always
+	// selErr is given to every connection dialled, so a SELECT can be made to
+	// fail on a connection the pool has just opened rather than on one it took
+	// from the idle list. The pool treats those two cases differently.
+	selErr error
 }
 
 func (d *dialer) dial(context.Context) (imapx.Conn, error) {
@@ -124,7 +132,7 @@ func (d *dialer) dial(context.Context) (imapx.Conn, error) {
 	if d.err != nil && (d.failAt == 0 || d.failAt == n) {
 		return nil, d.err
 	}
-	c := &fakeConn{}
+	c := &fakeConn{selErr: d.selErr}
 	d.conns = append(d.conns, c)
 	return c, nil
 }
@@ -382,39 +390,166 @@ func TestAnEmptyMailboxSelectsNothing(t *testing.T) {
 // A SELECT that fails on a freshly dialled connection must not leave that
 // connection open and unreachable: the pool would slowly leak its whole cap
 // against a server that counts connections.
-func TestAFailedSelectDoesNotLeakTheConnection(t *testing.T) {
+//
+// Freshly dialled is the whole point. A connection just opened has proven the
+// server is there, so a SELECT it refuses is the server refusing, and retrying
+// would only ask the same question again.
+func TestAFailedSelectOnAFreshConnectionSurfaces(t *testing.T) {
+	t.Parallel()
+
+	d := &dialer{selErr: errors.New("no such mailbox")}
+	p := newPool(t, 1, d)
+
+	if _, err := p.Acquire(context.Background(), "Nope"); err == nil {
+		t.Fatal("want the select failure to surface")
+	}
+	if d.count() != 1 {
+		t.Errorf("dialled %d times for one failed select on a fresh connection, want 1", d.count())
+	}
+	if closed, _ := d.conns[0].counts(); closed != 1 {
+		t.Errorf("connection closed %d times after a failed select, want 1", closed)
+	}
+
+	// The capacity must have come back, or the pool shrinks by one every time
+	// a select fails and eventually stops working altogether.
+	d.selErr = nil
+	next, err := p.Acquire(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Acquire after a failed select: %v", err)
+	}
+	defer next.Release(nil)
+}
+
+// TestAStaleIdleConnectionIsReplaced.
+//
+// A connection taken from the idle list has proven nothing recent. Servers hang
+// up on connections that sit, and mox does: in a run of 776,791 messages the
+// two largest folders both died with "use of closed network connection" on
+// SELECT, at the point they had been going longest and their spare connections
+// had been idle longest. 68,755 messages went uncopied while every short folder
+// in the same run finished.
+//
+// So a SELECT that fails on a reused connection buys one fresh dial.
+func TestAStaleIdleConnectionIsReplaced(t *testing.T) {
 	t.Parallel()
 
 	d := &dialer{}
-	// A cap of one, so the connection whose SELECT is about to fail is
-	// necessarily the one the next Acquire receives. With a larger cap the
-	// pool hands out an unused slot first and the test proves nothing.
 	p := newPool(t, 1, d)
 
 	l, err := p.Acquire(context.Background(), "INBOX")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	first := l.Conn().(*fakeConn)
-	first.setSelErr(errors.New("no such mailbox"))
+	stale := l.Conn().(*fakeConn)
 	l.Release(nil)
 
-	if _, err := p.Acquire(context.Background(), "Nope"); err == nil {
-		t.Fatal("want the select failure to surface")
-	}
-	if closed, _ := first.counts(); closed != 1 {
-		t.Errorf("connection closed %d times after a failed select, want 1", closed)
+	// The server hung up while the connection sat in the idle list.
+	stale.setSelErr(errors.New("use of closed network connection"))
+
+	next, err := p.Acquire(context.Background(), "Reklamer")
+	if err != nil {
+		t.Fatalf("Acquire over a stale connection: %v, want it replaced", err)
 	}
 
-	// The capacity must have come back, or the pool shrinks by one every time
-	// a select fails and eventually stops working altogether.
-	next, err := p.Acquire(context.Background(), "")
-	if err != nil {
-		t.Fatalf("Acquire after a failed select: %v", err)
+	if next.Conn() == stale {
+		t.Fatal("the stale connection was handed out again")
 	}
-	defer next.Release(nil)
-	if next.Conn() == first {
-		t.Error("the connection whose select failed was handed out again")
+	if closed, _ := stale.counts(); closed != 1 {
+		t.Errorf("stale connection closed %d times, want 1", closed)
+	}
+	if got := next.Conn().(*fakeConn).selected(); len(got) != 1 || got[0] != "Reklamer" {
+		t.Errorf("replacement selected %v, want [Reklamer]", got)
+	}
+
+	// The replacement's SELECT told the pool the mailbox's UIDVALIDITY, and
+	// that is the fence the whole sync is checked against. A replacement handed
+	// back with a zero there would have every UID compared against the wrong
+	// generation of the mailbox.
+	if next.UIDValidity() != fakeUIDValidity {
+		t.Errorf("replacement UIDValidity = %d, want %d; the pool did not record what the SELECT returned",
+			next.UIDValidity(), fakeUIDValidity)
+	}
+	next.Release(nil)
+
+	// And it must be remembered as already holding that mailbox, or every
+	// worker after the first on a chunked folder pays for a redundant SELECT.
+	again, err := p.Acquire(context.Background(), "Reklamer")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer again.Release(nil)
+	if got := again.Conn().(*fakeConn).selected(); len(got) != 1 {
+		t.Errorf("mailbox selected %d times, want 1; the replacement did not record it", len(got))
+	}
+}
+
+// TestAReplacementThatAlsoFailsSurfaces: one retry, not a loop. If the mailbox
+// is genuinely unselectable, a second failure is the answer and the caller must
+// hear it rather than have the pool keep dialling.
+func TestAReplacementThatAlsoFailsSurfaces(t *testing.T) {
+	t.Parallel()
+
+	d := &dialer{}
+	p := newPool(t, 1, d)
+
+	l, err := p.Acquire(context.Background(), "INBOX")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	stale := l.Conn().(*fakeConn)
+	l.Release(nil)
+
+	stale.setSelErr(errors.New("use of closed network connection"))
+	d.selErr = errors.New("no such mailbox")
+
+	if _, err := p.Acquire(context.Background(), "Nope"); err == nil {
+		t.Fatal("want the second select failure to surface")
+	}
+	if d.count() != 2 {
+		t.Errorf("dialled %d times, want 2: one original and one replacement", d.count())
+	}
+}
+
+// TestAStaleConnectionDoesNotLeakTheOpenCount.
+//
+// The pool stops pooling once it believes more connections are open than its
+// width allows: put closes what it is handed instead of idling it. So a
+// connection closed outside the lease path has to be uncounted, or a run that
+// hits a few stale connections silently degrades to dialling afresh every time.
+func TestAStaleConnectionDoesNotLeakTheOpenCount(t *testing.T) {
+	t.Parallel()
+
+	// A cap of one, so a single uncounted connection is enough to put the pool
+	// over its own width. That is the state the drift produces; a wider pool
+	// merely takes more stale connections to reach it.
+	d := &dialer{}
+	p := newPool(t, 1, d)
+
+	l, err := p.Acquire(context.Background(), "INBOX")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	stale := l.Conn().(*fakeConn)
+	l.Release(nil)
+	stale.setSelErr(errors.New("use of closed network connection"))
+
+	next, err := p.Acquire(context.Background(), "Reklamer")
+	if err != nil {
+		t.Fatalf("Acquire over a stale connection: %v", err)
+	}
+	replacement := next.Conn()
+	next.Release(nil)
+
+	// If the open count still counted the stale connection, the release above
+	// would have closed the replacement rather than idling it, and this would
+	// dial a third time.
+	again, err := p.Acquire(context.Background(), "Reklamer")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer again.Release(nil)
+	if again.Conn() != replacement {
+		t.Errorf("the replacement was not pooled; dialled %d times", d.count())
 	}
 }
 
