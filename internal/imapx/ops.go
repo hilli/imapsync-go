@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -187,7 +188,75 @@ func (c *conn) AllUIDs(ctx context.Context) ([]uint32, error) {
 	if data == nil {
 		return nil, errors.New("searching for all UIDs: server returned no search data")
 	}
-	return toUint32s(data.AllUIDs()), nil
+	uids := toUint32s(data.AllUIDs())
+
+	// A SEARCH index can disagree with the mailbox it indexes. iCloud's
+	// retains expunged messages: its Trash reports 487 EXISTS and answers
+	// SEARCH ALL with 100,184 UIDs, of which 99,697 fetch as nothing. INBOX
+	// answers 503,763 for 413,933 messages. Both were confirmed against an
+	// unrelated client, so this is the server and not our parsing of it.
+	//
+	// Trusting the larger number is not merely wasteful. Every phantom enters
+	// the copy list, is fetched, comes back empty, and is written to the state
+	// database as gone — a fifth of the work on that account, repeated every
+	// run. So the count is checked against EXISTS, which the same server got
+	// right, and a disagreement of any size demotes the answer.
+	mbox := c.c.Mailbox()
+	if mbox == nil || len(uids) == int(mbox.NumMessages) {
+		return uids, nil
+	}
+	return c.enumerateUIDs(ctx)
+}
+
+// enumerateUIDs lists the selected mailbox by walking it rather than searching
+// it, for servers whose SEARCH cannot be believed.
+//
+// It costs one untagged response per message where SEARCH costs one line in
+// total — 29 seconds against 2 on a mailbox of 414,000 — which is why it is the
+// fallback and not the rule. Against the hours such a mailbox takes to copy it
+// is not a cost worth avoiding, and it is only ever paid by a server that has
+// already been caught contradicting itself.
+//
+// The walk is by sequence number. UID FETCH 1:* returns the same messages but
+// makes the server cross the whole UID space to find them, which on the mailbox
+// above took three times as long.
+func (c *conn) enumerateUIDs(ctx context.Context) ([]uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("enumerating UIDs: %w", err)
+	}
+
+	all := imap.SeqSet{}
+	all.AddRange(1, 0)
+
+	// Streamed rather than collected: the mailboxes that need this are the
+	// large ones, and holding a buffer per message is how a fix for a bug
+	// becomes a memory-limit breach.
+	cmd := c.c.Fetch(all, &imap.FetchOptions{UID: true})
+	var uids []uint32
+	for {
+		msg := cmd.Next()
+		if msg == nil {
+			break
+		}
+		for {
+			item := msg.Next()
+			if item == nil {
+				break
+			}
+			if u, ok := item.(imapclient.FetchItemDataUID); ok {
+				uids = append(uids, uint32(u.UID))
+			}
+		}
+	}
+	if err := cmd.Close(); err != nil {
+		return nil, fmt.Errorf("enumerating UIDs: %w", err)
+	}
+
+	// Sequence order is UID order on every server that follows the spec, but
+	// the caller was promised ascending and this path exists precisely because
+	// a server was not following the spec.
+	slices.Sort(uids)
+	return uids, nil
 }
 
 // FetchMeta returns metadata for the given UIDs, plus the raw bytes of the
