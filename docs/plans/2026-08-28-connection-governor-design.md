@@ -272,6 +272,118 @@ increase half of AIMD. It is still not worth building on one measurement: the
 run is printed now, so the next few will say whether 23-of-30 is typical or was
 an artefact of forty workers starting in the same millisecond.
 
+## 8.1 What the full-scale run answered
+
+Run against the account the tool exists for, 2026-08-29: iCloud → mox, 776,791
+messages across 141 folders, both pools on `auto`. 2h49m1s. 52,591 copied,
+643,481 adopted, 2 folders failed. Peak RSS 104 MB against a 256 MiB limit.
+
+The four questions §8 set, answered honestly:
+
+1. **Does the destination pool shrink at a realistic width?** **Unknown, and the
+   run could not tell us.** Zero shrinks were logged — but the pool logs nothing
+   about its width either, so "never shrank" and "shrank silently" are not
+   distinguishable from the outside. `OnShrink` logs a shrink; nothing logs the
+   settled width, the cap, or the starting point.
+2. **Does it settle or ratchet?** Unanswerable for the same reason.
+3. **Is the settled width consistently short of the true limit?** Unanswerable.
+   The case for the increase half of AIMD is exactly where §8 left it, and one
+   more run has not moved it.
+4. **Does anything degrade non-linearly between 135 and 776,791 messages?**
+   Memory, no: 104 MB peak, flat. Connections, **yes** — see below.
+
+**The governor is unobservable, and that is the finding.** Three of the four
+questions this design set for itself cannot be answered by the largest run the
+tool has ever done, because the thing being asked about is silent. A measurement
+you cannot read is not a measurement. Width belongs in the run's log at the
+point it settles, and until it is there, every future run wastes the same
+opportunity this one did.
+
+### What did degrade at scale: idle connections
+
+The two largest folders both failed, and with the same error:
+
+    acquiring destination connection: selecting "INBOX":
+    use of closed network connection
+
+INBOX (413,934) and Reklamer (96,147) between them left 68,755 messages
+uncopied. All 139 shorter folders finished.
+
+This is non-linear in exactly the way question 4 was asking about, but not in a
+dimension the question anticipated. It is not that big folders move more data;
+it is that they *take longer*, so the pool's spare connections sit idle longer,
+and mox hangs up on a connection that sits. The failure scales with a folder's
+duration, not its size, and nothing below about half an hour reached it.
+
+`ready` then reported the dead socket as the folder's failure, which named the
+wrong thing entirely: the mailbox was fine and the server was fine. Fixed by
+spending one fresh dial on a reused connection whose SELECT fails, and never on
+a freshly dialled one — a connection just opened has proven the server is there,
+so a SELECT it refuses is the server refusing.
+
+The same path had been leaking its open count all along: a failed SELECT closed
+the connection without uncounting it, and once `open` passes `width`, `put`
+stops idling returned connections and closes them. A pool that met a few stale
+connections quietly stopped pooling.
+
+**Verified by re-running the same account**, 2h1m43s, 68,314 copied at 9.4/s,
+**zero folder failures**. INBOX and Reklamer both completed — 413,938 and 96,147
+— and the errors that had killed them arrived again and were absorbed:
+
+    WARN destination search failed: searching for header Message-ID:
+         use of closed network connection
+    WARN retrying append: Reklamer: appending message 69551: declared
+         37405 bytes but sent 0: connection desynchronised and closed
+
+Same server, same folders, same failures, now warnings instead of an abandoned
+folder. Every folder reconciles: 776,802 source messages against 776,807
+accounted, the five extra being advertising that arrived in Reklamer while the
+run was reading it.
+
+The second run also measured what the state database is worth: 139 of 141
+folders were settled in the first sixty seconds, because they were already done.
+
+Peak RSS was 239 MB against the 512 MiB in-flight budget, against 104 MB on the
+adoption-heavy first run — memory tracks what is being copied, not how many
+messages are being considered, which is the right shape.
+
+### Two folder-level observations worth keeping
+
+- **A failed folder is retried, and the retry works.** INBOX failed at 18:05 on
+  a mox EOF during destination enumeration, was retried at 19:00 and got all the
+  way through diffing 413,934 messages. Folder-level retry is earning its place.
+- **The completed counter passed its own denominator** — `folders: 142/141` —
+  because a retried folder increments it twice. Cosmetic, but it is the kind of
+  thing that makes a progress line untrustworthy.
+
+### The rate figure measures the wrong thing
+
+The run reported **5.2 messages/second**. It actually processed 696,072 messages
+in 10,141 seconds, which is 68.6/second. `rate` counts copies and ignores
+adoptions, so the pass this design recommended running *first* — the adoption
+pass — is the pass whose progress line understates it thirteenfold. An operator
+watching "5.2 msg/s" against 776,791 messages would reasonably conclude it had
+hung.
+
+### Two messages the destination refused
+
+    imap: NO APPEND delivering message: generating preview:
+    making preview from text part: bufio.Scanner: token too long
+
+A mox bug, not ours, and correctly reported as two named messages rather than a
+failed folder. Recorded because a drop-in replacement will meet servers that
+reject individual messages, and "2 failed, here are their UIDs" is the right
+shape for that.
+
+### Source enumeration could not be believed
+
+Found while preparing this run and fixed before it: iCloud's SEARCH index
+retains expunged messages, so `SEARCH ALL` answered 100,184 UIDs for a 487
+message Trash and 503,763 for a 413,933 message INBOX. 189,526 phantoms would
+have been fetched, come back empty, and been written to the state database as
+gone — a fifth of the run, every run. `AllUIDs` now checks its answer against
+EXISTS and walks the mailbox when the two disagree.
+
 ## 9. Related, separate — fixed
 
 `probe` reported *"Suggested concurrency: 47 (one below the ceiling, leaving
