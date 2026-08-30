@@ -25,3 +25,6 @@
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Sample messages captured from real accounts (personal mail, never commit)
+/samples/
