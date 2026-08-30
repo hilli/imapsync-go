@@ -85,6 +85,7 @@ type syncFlags struct {
 	srcConnsSet    bool
 	dstConnsSet    bool
 	memoryLimitSet bool
+	delete2Set     bool
 
 	progressEvery time.Duration
 	full          bool
@@ -128,6 +129,7 @@ watch for authentication failures.`,
 			f.srcConnsSet = cmd.Flags().Changed("source-connections")
 			f.dstConnsSet = cmd.Flags().Changed("dest-connections")
 			f.memoryLimitSet = cmd.Flags().Changed("memory-limit")
+			f.delete2Set = cmd.Flags().Changed("delete2")
 			return runSync(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
@@ -192,12 +194,13 @@ watch for authentication failures.`,
 }
 
 func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
-	source, dest, folders, conc, pairName, err := syncEndpoints(f)
+	pair, err := syncPair(f)
 	if err != nil {
 		return err
 	}
+	source, dest, pairName := pair.Source, pair.Dest, pair.Name
 
-	opts, err := folderOptions(f, folders)
+	opts, err := folderOptions(f, pair.Folders)
 	if err != nil {
 		return err
 	}
@@ -228,10 +231,11 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		trace = os.Stderr
 	}
 
-	srcConns, dstConns, limit, err := resolveConcurrency(f, conc)
+	srcConns, dstConns, limit, err := resolveConcurrency(f, pair.Concurrency)
 	if err != nil {
 		return err
 	}
+
 	bytesInFlight, err := budget.New(limit)
 	if err != nil {
 		return fmt.Errorf("invalid --memory-limit: %w", err)
@@ -278,7 +282,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		DestSearch:    destSearch,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
 		NoSubscribe:   !f.subscribe,
-		Delete2:       f.delete2,
+		Delete2:       resolveDelete2(f, pair),
 		DeleteCeiling: f.deleteCeiling,
 		Force:         f.force,
 		ProgressEvery: f.progressEvery,
@@ -426,6 +430,21 @@ func writeUncopiedNotes(p *printer, report syncer.Report) {
 // and put that number in the config where it will not have to be rediscovered.
 const autoConnections = 16
 
+// resolveDelete2 decides whether this run may delete destination messages.
+//
+// Same rule as the connection widths: a flag named on the command line wins,
+// and one that was not leaves the config to speak. This is the one option here
+// that destroys mail, so it has to be possible to say --delete2=false against a
+// config that says true — which is why it asks whether the flag was *given*
+// rather than what its value is. A plain boolean check could only ever turn
+// deletion on.
+func resolveDelete2(f syncFlags, pair config.Pair) bool {
+	if f.delete2Set {
+		return f.delete2
+	}
+	return pair.Delete2
+}
+
 // resolveConcurrency decides the two pool widths and the in-flight byte budget.
 //
 // Three sources of truth, in falling order of precedence: a flag named on the
@@ -462,46 +481,54 @@ func resolveConcurrency(f syncFlags, c config.Concurrency) (src, dst int, inflig
 	return src, dst, inflight, nil
 }
 
-// syncEndpoints resolves the two sides, from a config file or from flags.
-func syncEndpoints(f syncFlags) (source, dest config.Endpoint, folders config.Folders, conc config.Concurrency, pairName string, err error) {
+// syncPair resolves the whole pair, from a config file or from flags.
+//
+// It returns the pair itself rather than a handful of its fields. The previous
+// shape returned four of the five, and the two it left behind — `concurrency:`
+// and `delete2:` — were silently inert for the life of the tool. Handing back
+// the whole thing means a field added to config.Pair arrives here for free,
+// and the only way to ignore one is to visibly not use it.
+func syncPair(f syncFlags) (config.Pair, error) {
 	if f.configPath != "" {
-		cfg, loadErr := config.Load(f.configPath)
-		if loadErr != nil {
-			return source, dest, folders, conc, "", loadErr
+		cfg, err := config.Load(f.configPath)
+		if err != nil {
+			return config.Pair{}, err
 		}
 
 		pair := &cfg.Pairs[0]
 		if f.pair != "" {
 			if pair, err = cfg.Pair(f.pair); err != nil {
-				return source, dest, folders, conc, "", err
+				return config.Pair{}, err
 			}
 		} else if len(cfg.Pairs) > 1 {
-			return source, dest, folders, conc, "", fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
+			return config.Pair{}, fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
 		}
-		return pair.Source, pair.Dest, pair.Folders, pair.Concurrency, pair.Name, nil
+		return *pair, nil
 	}
 
 	if f.sourceURL == "" || f.destURL == "" {
-		return source, dest, folders, conc, "", errors.New("provide either --config or both --source-url and --dest-url")
+		return config.Pair{}, errors.New("provide either --config or both --source-url and --dest-url")
 	}
 
-	source = config.Endpoint{
-		URL:      f.sourceURL,
-		Password: config.Secret{Env: f.sourcePasswordEnv, File: f.sourcePasswordFile, Keychain: f.sourcePasswordKeychain},
+	pair := config.Pair{
+		Source: config.Endpoint{
+			URL:      f.sourceURL,
+			Password: config.Secret{Env: f.sourcePasswordEnv, File: f.sourcePasswordFile, Keychain: f.sourcePasswordKeychain},
+		},
+		Dest: config.Endpoint{
+			URL:      f.destURL,
+			Password: config.Secret{Env: f.destPasswordEnv, File: f.destPasswordFile, Keychain: f.destPasswordKeychain},
+		},
 	}
-	dest = config.Endpoint{
-		URL:      f.destURL,
-		Password: config.Secret{Env: f.destPasswordEnv, File: f.destPasswordFile, Keychain: f.destPasswordKeychain},
-	}
-	for label, ep := range map[string]config.Endpoint{sideSource: source, sideDest: dest} {
+	for label, ep := range map[string]config.Endpoint{sideSource: pair.Source, sideDest: pair.Dest} {
 		if err := ep.Password.Validate(); err != nil {
-			return source, dest, folders, conc, "", fmt.Errorf("%s password: %w", label, err)
+			return config.Pair{}, fmt.Errorf("%s password: %w", label, err)
 		}
 		if _, err := ep.Address(); err != nil {
-			return source, dest, folders, conc, "", fmt.Errorf("--%s-url: %w", label, err)
+			return config.Pair{}, fmt.Errorf("--%s-url: %w", label, err)
 		}
 	}
-	return source, dest, folders, conc, "", nil
+	return pair, nil
 }
 
 // folderOptions merges the configuration file's folder rules with the flags.

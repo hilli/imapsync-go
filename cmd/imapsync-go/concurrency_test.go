@@ -792,3 +792,95 @@ func TestConfigConcurrencyReachesTheRunItself(t *testing.T) {
 		t.Errorf("the report does not name the configured destination width:\n%s", out)
 	}
 }
+
+// TestConfigDelete2IsActuallyUsed.
+//
+// `delete2:` was the second field syncEndpoints dropped, and the one that
+// destroys mail. It failed safe — a config asking for deletion got none — but
+// safe is not the same as correct: somebody pruning a destination from a config
+// file was told it was happening and it was not.
+//
+// Both directions are tested. The config must be able to turn deletion on, and
+// `--delete2=false` must be able to turn it off again, which is why the flag is
+// consulted for whether it was *given* rather than for its value.
+func TestConfigDelete2IsActuallyUsed(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	for _, tc := range []struct {
+		name       string
+		configSays bool
+		extraFlags []string
+		wantGone   bool
+	}{
+		{name: "config turns deletion on", configSays: true, wantGone: true},
+		{name: "config leaves deletion off", configSays: false, wantGone: false},
+		{
+			name:       "an explicit flag overrides a config that says yes",
+			configSays: true,
+			extraFlags: []string{"--delete2=false"},
+			wantGone:   false,
+		},
+		{
+			name:       "an explicit flag overrides a config that says no",
+			configSays: false,
+			extraFlags: []string{"--delete2"},
+			wantGone:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcAddr, srcUser := startAccount(t)
+			dstAddr, dstUser := startAccount(t)
+
+			// One message on both sides, and a second only on the
+			// destination: a stranger, which is what --delete2 removes.
+			body := cliMessage("keeper", "keep@example.test")
+			for _, u := range []*imapmemserver.User{srcUser, dstUser} {
+				if _, err := u.Append("INBOX", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+					t.Fatalf("seeding: %v", err)
+				}
+			}
+			stranger := cliMessage("stranger", "gone@example.test")
+			if _, err := dstUser.Append("INBOX", bytes.NewReader(stranger), &imap.AppendOptions{}); err != nil {
+				t.Fatalf("seeding the stranger: %v", err)
+			}
+
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "imapsync.yaml")
+			cfg := fmt.Sprintf(`pairs:
+  - name: deleter
+    source:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    dest:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    delete2: %t
+`, cliUser, srcAddr, cliUser, dstAddr, tc.configSays)
+			if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+				t.Fatalf("writing config: %v", err)
+			}
+
+			args := append([]string{
+				"sync",
+				"--config", cfgPath,
+				"--state", filepath.Join(dir, "state.db"),
+				// The stranger is half the folder, well over the 10% ceiling
+				// that would otherwise refuse the deletion on its own.
+				"--force",
+				"--log-level", "error",
+			}, tc.extraFlags...)
+			out := runCLI(t, args)
+
+			// The server's own count, not the report's claim about it: a
+			// deletion test that trusted the listing would be trusting the
+			// very thing --delete2's ceiling exists to distrust.
+			want := uint32(2)
+			if tc.wantGone {
+				want = 1
+			}
+			if got := countOn(t, dstUser, "INBOX"); got != want {
+				t.Errorf("destination holds %d messages, want %d:\n%s", got, want, out)
+			}
+		})
+	}
+}

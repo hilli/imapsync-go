@@ -279,7 +279,7 @@ func TestDerivePairIDDependsOnBothEndpoints(t *testing.T) {
 func TestSyncEndpointsRequiresBothSides(t *testing.T) {
 	t.Parallel()
 
-	_, _, _, _, _, err := syncEndpoints(syncFlags{sourceURL: "imaps://a@src.example", sourcePasswordEnv: "X"})
+	_, err := syncPair(syncFlags{sourceURL: "imaps://a@src.example", sourcePasswordEnv: "X"})
 	if err == nil || !strings.Contains(err.Error(), "--dest-url") {
 		t.Errorf("error = %v, want one asking for the destination", err)
 	}
