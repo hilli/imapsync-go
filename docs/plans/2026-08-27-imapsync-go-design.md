@@ -592,9 +592,21 @@ several guesses the design rested on.
 
 Three things follow:
 
-**QRESYNC is worth implementing ourselves.** It was deferred post-v1 on the
-grounds that go-imap lacks it. iCloud supporting it changes the calculus: the
-slow, throttled, 414,022-message side is exactly where resync cost is felt.
+**QRESYNC is not worth implementing ourselves — measured, not assumed.** It was
+deferred post-v1 on the grounds that go-imap lacks it, and §10 asked for the
+cost of a full resync on the 414,022-message folder before reconsidering. That
+number now exists. A `--full` dry run over INBOX alone examined 413,954
+messages in **51.2 s**; a `--full` run over the whole account settled 776,802
+messages across 141 folders in **1 m 27 s**, 137 of them inside the first 30
+seconds.
+
+That is the worst case QRESYNC exists to remove, and it is under a minute and a
+half for three quarters of a million messages. The expensive part of a resync
+turned out to be neither the UID list nor the round trips but nothing at all:
+intra-folder chunking across a pool already hides it. Writing an extension that
+go-imap does not have, against the only server we know that advertises it,
+to save seconds on a run measured in hours of copying, is not a trade worth
+making. Revisit only if a folder appears whose reconcile is itself slow.
 
 **Folder enumeration costs 144 round trips — but only in `probe`.** Parallelising
 those `STATUS` calls was carried as an outstanding item from M2 to M4 and then
@@ -1231,14 +1243,18 @@ pure function, and the mutations that matter would stop being observable.
 - **M5** — `compat` shim (§8.1, §9.8), `--delete2` + safety valve
   (§7.1–7.4, §9.6). *Done.* Progress UI dropped: M3 already logs progress and a
   rate.
-- **Post-v1** — QRESYNC (implemented by us; upstream PR #423 was closed
-  unmerged), MULTIAPPEND batching, COMPRESS, and broader server support:
-  Dovecot, Gmail, Microsoft 365, Cyrus.
+- **Post-v1** — MULTIAPPEND batching, COMPRESS, and broader server support:
+  Dovecot, Gmail, Microsoft 365, Cyrus. QRESYNC was **dropped**, not deferred;
+  see below.
 
-QRESYNC's position is now the least settled part of this plan. It was placed
-post-v1 because go-imap lacks it, before we knew iCloud advertises it (§6.3).
-Reconsider once M1 shows what a resync actually costs on a 414,022-message
-folder.
+QRESYNC was the least settled part of this plan, and it is now settled against.
+It was placed post-v1 because go-imap lacks it, then argued back up on
+discovering iCloud advertises it (§6.3), with the deciding question left as:
+what does a resync actually cost on a 414,022-message folder? Measured, it is
+**51.2 s** for that folder and **1 m 27 s** for all 776,802 messages in the
+account. Intra-folder chunking across a pool already removed the cost QRESYNC
+targets. Implementing an extension the library does not have, to save seconds
+on runs measured in hours, is not worth it. See §6.3.
 
 M1 precedes M2 deliberately. Concurrency bugs layered on an unproven diff are
 undebuggable.
