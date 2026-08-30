@@ -21,8 +21,15 @@ pairs:
         keychain: mox-imap
 
     concurrency:
-      # "auto" lets the adaptive governor find the working limit. iCloud
-      # throttles aggressively and typically settles low; mox tolerates far more.
+      # "auto" opens 16 to each side and lets the governor shrink toward
+      # whatever the server will actually hold. It cannot find the limit from
+      # below — the governor only ever gives capacity up — so 16 is a safe
+      # starting guess rather than a measurement.
+      #
+      # For a real migration, measure it instead:
+      #     imapsync-go probe --url imaps://you@imap.mail.me.com
+      # and put the number it reports here. Measured ceilings so far: iCloud
+      # 48 or more, mox 30. Leave headroom for your own mail clients.
       source: auto
       dest: auto
       # Total bytes of in-flight message data. Backpressure is measured in

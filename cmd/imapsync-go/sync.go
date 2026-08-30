@@ -78,6 +78,14 @@ type syncFlags struct {
 	dstConns    int
 	memoryLimit string
 
+	// Whether the three above were named on the command line. A flag that was
+	// not given has no opinion, and the config file's answer stands; a flag
+	// that was given overrides it. Without this the flag defaults would be
+	// indistinguishable from a deliberate 4, and the config could never win.
+	srcConnsSet    bool
+	dstConnsSet    bool
+	memoryLimitSet bool
+
 	progressEvery time.Duration
 	full          bool
 	resyncFlags   bool
@@ -117,6 +125,9 @@ watch for authentication failures.`,
   imapsync-go sync --config imapsync.yaml --folder INBOX --map 'INBOX=Archive/Old'`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			f.srcConnsSet = cmd.Flags().Changed("source-connections")
+			f.dstConnsSet = cmd.Flags().Changed("dest-connections")
+			f.memoryLimitSet = cmd.Flags().Changed("memory-limit")
 			return runSync(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
@@ -153,9 +164,9 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.sourceSearch, "source-search", "", `copy only source messages matching this IMAP SEARCH, for example "UNSEEN SMALLER 100000"`)
 	cmd.Flags().StringVar(&f.destSearch, "dest-search", "", "consider only destination messages matching this IMAP SEARCH for deletion by --delete2")
 
-	cmd.Flags().IntVar(&f.srcConns, "source-connections", 4, "connections to open to the source")
-	cmd.Flags().IntVar(&f.dstConns, "dest-connections", 8, "connections to open to the destination")
-	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once")
+	cmd.Flags().IntVar(&f.srcConns, "source-connections", autoConnections, "connections to open to the source; overrides the config's concurrency.source")
+	cmd.Flags().IntVar(&f.dstConns, "dest-connections", autoConnections, "connections to open to the destination; overrides the config's concurrency.dest")
+	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once; overrides the config's concurrency.max_inflight")
 
 	cmd.Flags().BoolVar(&f.full, "full", false, "examine every folder, even ones the server says have not changed")
 	// Both spellings, because imapsync has both and this is meant to be a
@@ -181,7 +192,7 @@ watch for authentication failures.`,
 }
 
 func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
-	source, dest, folders, pairName, err := syncEndpoints(f)
+	source, dest, folders, conc, pairName, err := syncEndpoints(f)
 	if err != nil {
 		return err
 	}
@@ -217,9 +228,9 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		trace = os.Stderr
 	}
 
-	limit, err := parseBytes(f.memoryLimit)
+	srcConns, dstConns, limit, err := resolveConcurrency(f, conc)
 	if err != nil {
-		return fmt.Errorf("invalid --memory-limit: %w", err)
+		return err
 	}
 	bytesInFlight, err := budget.New(limit)
 	if err != nil {
@@ -229,7 +240,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	// EXAMINE on the source: reading a message must not mark it \Seen, which
 	// would rewrite an account this tool is only supposed to read.
 	srcPool, err := pool.New(pool.Options{
-		Cap:      f.srcConns,
+		Cap:      srcConns,
 		Dial:     dialer(source, f, f.insecureSrc, trace),
 		Select:   imapx.SelectOptions{ReadOnly: true},
 		OnShrink: shrinkLogger(sideSource),
@@ -240,7 +251,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	defer closePool(ctx, srcPool, sideSource)
 
 	dstPool, err := pool.New(pool.Options{
-		Cap:      f.dstConns,
+		Cap:      dstConns,
 		Dial:     dialer(dest, f, f.insecureDst, trace),
 		OnShrink: shrinkLogger(sideDest),
 	})
@@ -275,8 +286,8 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 	}).Run(ctx)
 
 	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun, connections{
-		{"source", sideSource + "-connections", f.srcConns, srcPool.Width()},
-		{"destination", sideDest + "-connections", f.dstConns, dstPool.Width()},
+		{"source", sideSource + "-connections", srcConns, srcPool.Width()},
+		{"destination", sideDest + "-connections", dstConns, dstPool.Width()},
 	})
 
 	// A run that ended badly still copied something, and after an interruption
@@ -395,27 +406,83 @@ func writeUncopiedNotes(p *printer, report syncer.Report) {
 	}
 }
 
+// autoConnections is the width each side opens when nobody has said otherwise.
+//
+// The governor can only ever give capacity up, so "auto" cannot discover a
+// limit from below — it has to start somewhere and be shrunk toward the wall.
+// That makes the starting number a judgement about strangers' servers, not
+// about any particular one: too low wastes a migration's time, too high spends
+// a burst of refused logins on every server that will not hold it, and some
+// servers count refused logins against you.
+//
+// Sixteen is four times the old source default and twice the old destination
+// one, and sits under every ceiling this tool has actually measured (mox 30,
+// iCloud 48), so it costs a well-provisioned server nothing. A server that
+// caps lower — Dovecot ships a limit of 10 per address — refuses the excess
+// once and the pool settles, which is the half of the governor that is proven.
+//
+// It is a floor on ambition rather than an answer. Anyone who cares about
+// throughput should run `imapsync-go probe`, which measures the real ceiling,
+// and put that number in the config where it will not have to be rediscovered.
+const autoConnections = 16
+
+// resolveConcurrency decides the two pool widths and the in-flight byte budget.
+//
+// Three sources of truth, in falling order of precedence: a flag named on the
+// command line, the pair's `concurrency:` block, and the built-in default.
+// A flag that was not given is not an opinion — otherwise its default would be
+// indistinguishable from a deliberate choice and the config could never win.
+//
+// The config block was parsed and then dropped on the floor for the whole of
+// this tool's life, so a pair asking for 40 connections got 4, and the 512 MiB
+// `max_inflight` was silently 256 MiB. A knob that does nothing is worse than
+// no knob: it is a setting people tune, and measure against, and believe.
+func resolveConcurrency(f syncFlags, c config.Concurrency) (src, dst int, inflight int64, err error) {
+	pick := func(flagSet bool, flagVal int, limit config.Limit) int {
+		switch {
+		case flagSet:
+			return flagVal
+		case !limit.Auto():
+			return int(limit)
+		default:
+			return autoConnections
+		}
+	}
+	src = pick(f.srcConnsSet, f.srcConns, c.Source)
+	dst = pick(f.dstConnsSet, f.dstConns, c.Dest)
+
+	switch {
+	case f.memoryLimitSet || c.MaxInflight == 0:
+		if inflight, err = parseBytes(f.memoryLimit); err != nil {
+			return 0, 0, 0, fmt.Errorf("invalid --memory-limit: %w", err)
+		}
+	default:
+		inflight = int64(c.MaxInflight)
+	}
+	return src, dst, inflight, nil
+}
+
 // syncEndpoints resolves the two sides, from a config file or from flags.
-func syncEndpoints(f syncFlags) (source, dest config.Endpoint, folders config.Folders, pairName string, err error) {
+func syncEndpoints(f syncFlags) (source, dest config.Endpoint, folders config.Folders, conc config.Concurrency, pairName string, err error) {
 	if f.configPath != "" {
 		cfg, loadErr := config.Load(f.configPath)
 		if loadErr != nil {
-			return source, dest, folders, "", loadErr
+			return source, dest, folders, conc, "", loadErr
 		}
 
 		pair := &cfg.Pairs[0]
 		if f.pair != "" {
 			if pair, err = cfg.Pair(f.pair); err != nil {
-				return source, dest, folders, "", err
+				return source, dest, folders, conc, "", err
 			}
 		} else if len(cfg.Pairs) > 1 {
-			return source, dest, folders, "", fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
+			return source, dest, folders, conc, "", fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
 		}
-		return pair.Source, pair.Dest, pair.Folders, pair.Name, nil
+		return pair.Source, pair.Dest, pair.Folders, pair.Concurrency, pair.Name, nil
 	}
 
 	if f.sourceURL == "" || f.destURL == "" {
-		return source, dest, folders, "", errors.New("provide either --config or both --source-url and --dest-url")
+		return source, dest, folders, conc, "", errors.New("provide either --config or both --source-url and --dest-url")
 	}
 
 	source = config.Endpoint{
@@ -428,13 +495,13 @@ func syncEndpoints(f syncFlags) (source, dest config.Endpoint, folders config.Fo
 	}
 	for label, ep := range map[string]config.Endpoint{sideSource: source, sideDest: dest} {
 		if err := ep.Password.Validate(); err != nil {
-			return source, dest, folders, "", fmt.Errorf("%s password: %w", label, err)
+			return source, dest, folders, conc, "", fmt.Errorf("%s password: %w", label, err)
 		}
 		if _, err := ep.Address(); err != nil {
-			return source, dest, folders, "", fmt.Errorf("--%s-url: %w", label, err)
+			return source, dest, folders, conc, "", fmt.Errorf("--%s-url: %w", label, err)
 		}
 	}
-	return source, dest, folders, "", nil
+	return source, dest, folders, conc, "", nil
 }
 
 // folderOptions merges the configuration file's folder rules with the flags.

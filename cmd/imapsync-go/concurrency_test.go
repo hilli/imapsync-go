@@ -657,3 +657,138 @@ func TestAnAbsentSearchIsTheZeroKey(t *testing.T) {
 		t.Error("UNSEEN parsed to the zero key, which would search for nothing")
 	}
 }
+
+// TestConfigConcurrencyIsActuallyUsed.
+//
+// The `concurrency:` block was parsed, validated, defaulted — and then dropped
+// on the floor by syncEndpoints, which returned four of the pair's five fields.
+// Every run this tool has ever done used the flag defaults: a 776,791-message
+// migration asked for "auto" on both sides and got 4 and 8, against servers
+// measured at 48 and 30. The knob was not merely ineffective, it was
+// misleading, because the report then printed the number nobody had chosen.
+func TestConfigConcurrencyIsActuallyUsed(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                string
+		conc                config.Concurrency
+		flags               syncFlags
+		wantSrc, wantDst    int
+		wantInflightInBytes int64
+	}{{
+		name:                "config numbers are obeyed",
+		conc:                config.Concurrency{Source: 40, Dest: 24, MaxInflight: 512 << 20},
+		flags:               syncFlags{srcConns: 4, dstConns: 8, memoryLimit: "256MiB"},
+		wantSrc:             40,
+		wantDst:             24,
+		wantInflightInBytes: 512 << 20,
+	}, {
+		name:                "auto falls back to the built-in width",
+		conc:                config.Concurrency{Source: 0, Dest: 0, MaxInflight: 512 << 20},
+		flags:               syncFlags{srcConns: 4, dstConns: 8, memoryLimit: "256MiB"},
+		wantSrc:             autoConnections,
+		wantDst:             autoConnections,
+		wantInflightInBytes: 512 << 20,
+	}, {
+		name: "a flag named on the command line beats the config",
+		conc: config.Concurrency{Source: 40, Dest: 24, MaxInflight: 512 << 20},
+		flags: syncFlags{
+			srcConns: 3, srcConnsSet: true,
+			dstConns:    8,
+			memoryLimit: "32MiB", memoryLimitSet: true,
+		},
+		wantSrc:             3,
+		wantDst:             24,
+		wantInflightInBytes: 32 << 20,
+	}, {
+		name:                "no config at all still works",
+		conc:                config.Concurrency{},
+		flags:               syncFlags{srcConns: 4, dstConns: 8, memoryLimit: "256MiB"},
+		wantSrc:             autoConnections,
+		wantDst:             autoConnections,
+		wantInflightInBytes: 256 << 20,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst, inflight, err := resolveConcurrency(tc.flags, tc.conc)
+			if err != nil {
+				t.Fatalf("resolveConcurrency: %v", err)
+			}
+			if src != tc.wantSrc || dst != tc.wantDst {
+				t.Errorf("resolved %d source and %d destination connections, want %d and %d",
+					src, dst, tc.wantSrc, tc.wantDst)
+			}
+			if inflight != tc.wantInflightInBytes {
+				t.Errorf("resolved a budget of %d bytes, want %d", inflight, tc.wantInflightInBytes)
+			}
+		})
+	}
+}
+
+// TestConfigConcurrencyReachesTheRunItself is the end-to-end half.
+//
+// resolveConcurrency being right is worth nothing if syncEndpoints goes back to
+// discarding the block, which is the bug that actually happened. This drives a
+// real config file through the CLI and counts the connections the servers see.
+func TestConfigConcurrencyReachesTheRunItself(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	srcAddr, srcUser, srcConns := startCountedAccount(t, "Work")
+	dstAddr, _, dstConns := startCountedAccount(t)
+	for i := range 40 {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("Work", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	const wantSrc, wantDst = 3, 5
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "imapsync.yaml")
+	cfg := fmt.Sprintf(`pairs:
+  - name: counted
+    source:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    dest:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    concurrency:
+      source: %d
+      dest: %d
+`, cliUser, srcAddr, cliUser, dstAddr, wantSrc, wantDst)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	out := runCLI(t, []string{
+		"sync",
+		"--config", cfgPath,
+		"--state", filepath.Join(dir, "state.db"),
+		"--log-level", "error",
+	})
+
+	for _, side := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"source", int(srcConns.n.Load()), wantSrc},
+		{"destination", int(dstConns.n.Load()), wantDst},
+	} {
+		if side.got > side.want {
+			t.Errorf("the %s server saw %d connections, more than the config's %d:\n%s",
+				side.name, side.got, side.want, out)
+		}
+	}
+
+	// The report must name what was asked for, not the flag default that used
+	// to be printed regardless of the config.
+	if !strings.Contains(out, fmt.Sprintf("held all %d connections", wantSrc)) {
+		t.Errorf("the report does not name the configured source width:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("held all %d connections", wantDst)) {
+		t.Errorf("the report does not name the configured destination width:\n%s", out)
+	}
+}

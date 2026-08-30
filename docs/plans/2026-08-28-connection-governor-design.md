@@ -357,9 +357,37 @@ run was reading it.
 The second run also measured what the state database is worth: 139 of 141
 folders were settled in the first sixty seconds, because they were already done.
 
-Peak RSS was 239 MB against the 512 MiB in-flight budget, against 104 MB on the
+Peak RSS was 239 MB against a 256 MiB in-flight budget, against 104 MB on the
 adoption-heavy first run — memory tracks what is being copied, not how many
 messages are being considered, which is the right shape.
+
+That 256 MiB is itself a correction: this was first written up as "against the
+512 MiB in-flight budget", because that is what `imapsync.yaml` asks for. The
+config was not being read. See below.
+
+### Both runs used a fraction of the concurrency they were configured for
+
+The `concurrency:` block — `source`, `dest` and `max_inflight` alike — was
+parsed, validated, defaulted, and then dropped on the floor: `syncEndpoints`
+returned four of the pair's five fields and never passed the fifth to anyone.
+
+So a tool whose entire reason to exist is concurrency ran its largest migration
+at **4 source and 8 destination connections**, the CLI flag defaults, against
+servers `probe` had already measured at 48 and 30. The config said `auto` on
+both sides and the report dutifully printed the number nobody had chosen.
+
+This also explains, deflatingly, why neither pool ever shrank. Question 1 asks
+whether the destination pool shrinks "at a realistic width", and 8 is not a
+realistic width against a server that refuses at 30. The pools were never
+anywhere near a wall, so of course they held. Questions 1–3 were not merely
+unobservable; they were being asked of a run that could not have answered them
+even with perfect instrumentation.
+
+A knob that does nothing is worse than no knob: it is a setting people tune,
+and measure against, and believe. The block is now honoured, with an explicit
+flag beating it and `auto` starting at 16 — a starting guess, not a
+measurement, because a governor that only ever gives capacity up cannot find a
+limit from below. `probe` measures; the config records what was measured.
 
 ### Two folder-level observations worth keeping
 
