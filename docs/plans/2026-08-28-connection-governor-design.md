@@ -461,6 +461,33 @@ failed folder. Recorded because a drop-in replacement will meet servers that
 reject individual messages, and "2 failed, here are their UIDs" is the right
 shape for that.
 
+**Diagnosed, since it will not go away on its own.** It is mjl-/mox#426, open
+since 2026-04-17 with no comments and no fix; still present in `main` and in
+v0.0.17, the current release. `message/preview.go` builds a `bufio.Scanner` with
+no `Buffer()` call, so it keeps Go's default 64 KiB token limit, and
+`previewText` returns `scanner.Err()` to a caller that treats any error other
+than `moxio.ErrLimit` as fatal to the whole APPEND.
+
+Both of our messages fit the issue's description exactly, and only just:
+
+| uid | part | encoding | longest raw line | longest **decoded** line |
+|---|---|---|---|---|
+| 9083 | text/plain | quoted-printable | 78 | **65,572** |
+| 9227 | text/plain | quoted-printable | 78 | **65,569** |
+
+The raw messages are wrapped correctly at 78 columns; it is the soft line breaks
+disappearing on decode that produces one enormous logical line, 36 and 33 bytes
+past the limit. Both messages also carry a `text/html` alternative that decodes
+to under 6 KB — and mox would have tolerated a failure there, because the HTML
+branch logs and returns an empty preview while the plain-text branch aborts. The
+messages are rejected over an asymmetry in error handling, for a preview the
+RFC treats as advisory.
+
+Nothing here is fixable from this side: the server refuses the APPEND. What it
+does settle is that these two will fail on every run until upstream changes,
+which makes the missing permanent-failure state a standing cost rather than a
+hypothetical one — every scheduled run exits non-zero.
+
 ### Source enumeration could not be believed
 
 Found while preparing this run and fixed before it: iCloud's SEARCH index
