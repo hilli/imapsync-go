@@ -84,17 +84,20 @@ an extension. The colon is its own problem: Finder renders `:` as `/`, so
 maildir names are actively misleading in the one interface this is meant to
 serve.
 
-That compatibility was already spent. §8's first decision mirrors the IMAP
-hierarchy as ordinary nested directories rather than Maildir++, which mbsync
-cannot read either. Half-honouring a convention nothing can use is worse than
-declaring the format, so:
+That compatibility is not wanted. The store is a waypoint between IMAP servers,
+not a format for other mail tools to read: what it has to do is hand every
+message back to an arbitrary IMAP server intact. Being legible to mutt or
+mbsync was never the goal, and §8's second decision had already mirrored the
+IMAP hierarchy as ordinary nested directories rather than Maildir++, which
+mbsync cannot read either. Half-honouring a convention nothing can use is worse
+than declaring the format, so:
 
 ```
-Archive/                       a folder
-Archive/.imapsync-folder.json  its metadata, hidden from Finder
-Archive/.tmp/                  staging, same filesystem, for atomic rename
-Archive/0000009083.eml         a message
-Archive/2024/                  a subfolder
+Archive/                      a folder
+Archive/.imapsync-folder.db   flags, dates, UID bookkeeping; hidden
+Archive/.tmp/                 staging, same filesystem, for atomic rename
+Archive/0000009083.eml        a message
+Archive/2024/                 a subfolder
 ```
 
 A directory is a folder; a `.eml` is a message. Opening `Archive` in Finder
@@ -107,7 +110,8 @@ the colon, and flags in the filename.
 
 ### 2.2 Message files are immutable
 
-Flags do not go in the filename. They go in the folder's metadata file.
+Flags do not go in the filename. They go in a SQLite database in the folder,
+`.imapsync-folder.db`.
 
 Maildir changes flags by renaming, which means a message read once is a
 different filename for ever after. For a store whose point is to be backed up
@@ -115,14 +119,25 @@ incrementally that is the wrong trade: `\Seen` sweeping a folder would rename
 thousands of files, and a backup tool without rename detection would copy every
 one of them again. Content-addressed tools survive it; `rsync` does not.
 
-With flags in the index, **a message file is written exactly once and never
-touched again.** The only file that changes as flags move is one small JSON
-document per folder. That is the property that makes an incremental backup of
-this store proportional to the mail that actually arrived.
+With flags in a database, **a message file is written exactly once and never
+touched again.** That is the property that makes an incremental backup of this
+store proportional to the mail that actually arrived.
+
+SQLite rather than a JSON document, and the reason is the argument of §2 one
+level up: a JSON index has to be re-serialised in full to change one entry, so
+marking a single message read would rewrite all 413,954 entries — the mbox
+problem again, in the file that was supposed to avoid it. SQLite updates one
+row, and the project already runs it under forty concurrent writers in
+`internal/state`, including the WAL settings and the lessons about SQLITE_BUSY.
 
 It costs a lock the filename approach did not need, and that cost is small:
 flags arrive with `Append` for almost every message, so `StoreFlags` is a
 second-run correction rather than the common path.
+
+This database is **not** `state.db` and must never be merged with it. `state.db`
+records the relationship between two endpoints for one sync; this records what
+this store contains, and has to be readable by someone who knows nothing about
+any sync that produced it.
 
 ## 3. Architecture: implement `imapx.Conn`
 
@@ -160,53 +175,134 @@ do the right thing without knowing why.
 | --- | --- |
 | `Caps` | fixed, minimal set |
 | `Namespaces` | unsupported; empty prefix |
-| `ListFolders` | walk the tree for directories holding the metadata file |
-| `Select` | read the folder's metadata file |
-| `CreateFolder` | `mkdir` the folder and `.tmp/`, write metadata |
-| `SubscribeFolder` | a flag in the folder's metadata |
-| `AllUIDs` | read the directory, parse the leading digits |
+| `ListFolders` | walk the tree for directories holding the folder database |
+| `Select` | reconcile the directory against the database (§4.1) |
+| `CreateFolder` | `mkdir` the folder and `.tmp/`, create the database |
+| `SubscribeFolder` | a column in the folder's single-row table |
+| `AllUIDs` | `readdir`, parse the leading digits — never the database |
 | `FetchMeta` | read headers only, stop at the blank line |
 | `FetchBody` | copy the file |
-| `Append` | `.tmp/` → `fsync` → `rename` to `<uid>.eml` |
+| `Append` | `.tmp/` → `fsync` → `rename` to `<uid>.eml`, then one INSERT |
 | `SearchHeader` | scan headers; used only when adopting |
 | `Search` | evaluate `searchkey.Key` against headers and `stat` |
-| `FetchFlags` | read the folder's flag index |
-| `StoreFlags` | update the flag index; the message is not touched |
-| `DeleteMessages` | `unlink`, and drop the index entry |
+| `FetchFlags` | one SELECT |
+| `StoreFlags` | one UPDATE; the message file is not touched |
+| `DeleteMessages` | `unlink`, then one DELETE |
 
 `changedSince` on `FetchFlags` is ignored, which is correct rather than lazy: a
 store reporting no CONDSTORE is never asked for a modseq it did not give out.
 
-### 4.1 UIDs must survive the state database
+### 4.1 The filesystem is the truth; the database annotates it
 
-A backup readable only alongside `state.db` is not a backup. The mapping
-therefore lives in the store, and in the most durable place available: the
-message's own filename. `0000009083.eml` is UID 9083 whatever else is lost.
+The database will be wrong. Files get deleted in Finder, restored from a
+backup, copied in from somewhere else, or moved while nothing is watching. A
+design that treats `.imapsync-folder.db` as authoritative would report messages
+that are gone and overlook messages that are there — and this project has
+already met that exact bug from the other side. Finding 1 of the migration was
+iCloud's SEARCH index listing 100,184 UIDs for a folder holding 487 messages;
+the fix was to stop believing the index and cross-check it against reality.
+Shipping the same bug in our own store, having just paid to learn it, would be
+unforgivable.
 
-Each folder carries `.imapsync-folder.json`, holding its `uidvalidity`, its
-`uidnext`, the folder's true IMAP name, its subscription state, and the flag
-index. If that file is lost, everything except the flags and the exact name
-spelling is rebuilt by reading the directory — `uidnext` is the highest UID
-plus one — so the store is self-describing and self-healing, and the flags
-are restored by the next sync from the source.
+So the rule is: **existence is a question for the directory, never for the
+database.** `AllUIDs` reads `readdir`. The database supplies only what the
+filesystem cannot express — flags, keywords, and the authoritative
+INTERNALDATE.
 
-`uidnext` is allocated under a per-folder lock held only for the increment.
-Writing the message is not serialised, which is the whole point.
+`Select` reconciles, on names alone, which keeps it to one `readdir` with no
+`stat` per file:
 
-### 4.2 Flags
+- **File with no row** — adopt it. Flags empty, INTERNALDATE from mtime. The
+  next sync from a live source fills the flags in.
+- **Row with no file** — the message was deleted outside the tool. Drop the
+  row and count it in the report. This is a legitimate way to delete mail from
+  the store, not an error.
+- **A `.eml` whose name is not a UID** — someone dropped mail in by hand.
+  Allocate the next UID, rename it into the store's form, adopt as above.
 
-`\Seen`→`S`, `\Answered`→`R`, `\Flagged`→`F`, `\Deleted`→`T`, `\Draft`→`D`,
-`\Recent`→`N`. Keywords are stored verbatim; there is no need for dovecot's
-`a`–`z` indirection once flags are no longer squeezed into a filename, and
-storing the keyword as the server spelled it is what makes restore exact.
+That last one is a feature rather than a tolerance: **mail can be added to the
+store by copying files into a folder in Finder**, which falls out of the design
+for free and is a large part of what makes the format worth having.
 
-The index maps UID to flag set. A message present on disk but absent from the
-index — the window between `rename` and the index write — reads as having no
-flags, which is a state a later sync corrects rather than a corruption.
-Messages are never rewritten to carry a flag: a backup that edits the mail it
-stores is not a backup.
+### 4.2 UIDs, and the one thing a lost database costs
 
-### 4.3 Folder names are the sharp edge
+A backup readable only alongside `state.db` is not a backup. The UID therefore
+lives in the most durable place available — the message's own filename.
+`0000009083.eml` is UID 9083 whatever else is lost.
+
+The folder database also holds `uidvalidity`, `uidnext`, the folder's true IMAP
+name and its subscription state, in a single-row table beside the per-message
+one. `uidnext` is allocated under a per-folder lock held only for the
+increment; writing the message is not serialised, which is the whole point.
+
+If the database is lost, the messages and their UIDs are still on disk and
+INTERNALDATE comes back from mtime. Flags and the folder's exact name spelling
+are gone, and the next sync from a live source restores both.
+
+`uidnext` is the exception, and it is the one place where guessing is not
+allowed. Rebuilding it as the highest UID on disk plus one is wrong whenever
+the highest-numbered messages were the ones deleted: the UIDs would be handed
+out a second time, and IMAP promises within a UIDVALIDITY that they never are.
+A client holding the old numbers would silently fetch the wrong mail. So a
+folder that finds its database missing **generates a new UIDVALIDITY** rather
+than risking reuse. That is the IMAP-legal way to say "my numbering is no
+longer the one you remember", every client and this tool's own state database
+already know how to respond to it, and the cost is one re-examination of a
+folder in a situation that should never arise.
+
+### 4.3 Flags
+
+`\Seen`→`S`, `\Answered`→`R`, `\Flagged`→`F`, `\Deleted`→`T`, `\Draft`→`D`.
+Keywords are stored verbatim; there is no need for dovecot's `a`–`z`
+indirection once flags are no longer squeezed into a filename, and storing the
+keyword as the server spelled it is what makes restore exact.
+
+`\Recent` is not stored, because it is not a property of a message. It means
+"arrived since another client last looked", it cannot be set by APPEND, and
+this tool already strips it on the way out (`syncer.go`) and refuses to search
+on it (`searchkey`). Recording it would be recording one server's passing mood.
+
+The database maps UID to flag set. A message present on disk but absent from
+the database — the window between `rename` and the INSERT, or a file someone
+copied in — reads as having no flags, which §4.1 adopts and a later sync
+corrects rather than a corruption. Messages are never rewritten to carry a
+flag: a backup that edits the mail it stores is not a backup.
+
+### 4.4 What has to survive for a restore to be exact
+
+The point of the store is that an arbitrary IMAP server can be handed the
+contents back. That fixes what must be kept, and the list is longer than the
+messages.
+
+**The message bytes**, unmodified. Nothing is rewritten, escaped or
+re-encoded, which is the other half of why `.eml` is honest: the file is the
+message.
+
+**INTERNALDATE**, which is the one piece of per-message state that is *not* in
+the message. `AppendMessage.InternalDate` already flows through the interface
+into `APPEND`'s optional date-time, so a store that drops it would restore
+776,802 messages all dated the day of the restore, with every client's sort
+order destroyed and no way to notice until it was far too late. It is recorded
+in the folder database, and *also* set as the file's mtime — the mtime is the
+redundant copy and the one Finder shows, the database is the authority. Two
+copies is not gratuitous here: unlike flags, INTERNALDATE cannot be re-fetched
+from a source that no longer exists, which is the situation a backup is for,
+and mtime is what lets §4.1 adopt a file that appeared from nowhere.
+
+**Flags and keywords**, **folder names** as the server spelled them, and
+**subscription state**.
+
+What deliberately does not survive, because it cannot:
+
+- **UIDs and UIDVALIDITY.** The destination assigns its own. The store's UIDs
+  are local addressing, unrelated to the source's, and the state database is
+  what maps between endpoints — as it already does for IMAP-to-IMAP.
+- **MODSEQ.** The store reports no CONDSTORE, so it is never asked.
+- **The hierarchy delimiter.** Stored as structure rather than as a character,
+  so restoring to a server that separates with `.` works from a store filled by
+  one that separates with `/`.
+
+### 4.5 Folder names are the sharp edge
 
 Three problems, none of them interesting and all of them capable of losing
 mail.
@@ -216,7 +312,7 @@ mail.
   subdirectory is a subfolder and a `.eml` is a message, so the two can never
   be confused for one another.
 - **Filesystem-unsafe characters.** Percent-encode anything outside a
-  conservative set, and keep the true name in the metadata file so restore
+  conservative set, and keep the true name in the folder database so restore
   spells it exactly as the server did.
 - **macOS is case-insensitive.** Two IMAP folders differing only in case are
   legal and would collide on this user's own machine. Detect the collision and
@@ -229,36 +325,48 @@ mail.
 that folder — 413,954 files for the INBOX in the example. On an SSD that is
 minutes, not hours, and it happens only when adopting an existing store rather
 than on every run. It is the same shape as `indexDestination` today. If it
-proves painful the answer is a header index in the store, but it should not be
-built before the pain is measured.
+proves painful the folder database is the obvious place to cache Message-ID and
+size, but that should not be built before the pain is measured.
+
+The reconciliation of §4.1 is a `readdir` per folder per run and no `stat`,
+which is the cheap half of the same walk.
 
 ## 6. Testing
 
 The existing suite tests against an in-memory IMAP server; the local store
 needs no server at all, so `t.TempDir()` is the whole fixture.
 
-Three things deserve tests that would fail without them:
+These deserve tests that would fail without them:
 
-- **Round trip.** IMAP → local → IMAP, with the second IMAP compared to the
-  first: same messages, same flags, same internal dates. This is the restore
-  the FAQ warns about, asserted rather than assumed.
+- **Round trip to a *different* server.** IMAP → local → a second, empty IMAP
+  account, compared against the first: same messages byte for byte, same
+  flags and keywords, same INTERNALDATE, same folder tree — including a source
+  and destination whose hierarchy delimiters differ, since that is the case a
+  structural layout exists to handle. This is the restore the FAQ warns about,
+  asserted rather than assumed, and it is the test the whole design is for.
+- **Every way the directory and the database can disagree**, since §4.1 is the
+  part most likely to be got wrong. Delete a `.eml` behind the store's back and
+  it must vanish from `AllUIDs` rather than be fetched. Drop a foreign `.eml`
+  in and it must be adopted, renamed and appear. Delete the database entirely
+  and the folder must come back with a new UIDVALIDITY, its messages intact and
+  their dates recovered from mtime — and specifically **must not reuse a UID**
+  after the highest-numbered message was deleted, which is the case that would
+  hand two different messages the same number.
 - **Crash during append.** A message left in `.tmp/` is not visible as a
   `.eml` and is not counted, so the existing in-flight recovery settles it.
-- **A message on disk with no index entry** reads as flagless and is corrected
-  by the next sync, rather than being reported as missing.
 - **The case collision.** Two folders differing only in case must fail rather
   than merge.
 - **Double-clickable.** A written message is byte-identical to what the server
   gave us, so the point of the `.eml` name holds.
 
 Plus the ordinary mutation discipline: break each of the flag mappings, the
-UID-from-filename parse, and the percent-encoding, and confirm a named test
-fails.
+UID-from-filename parse, the percent-encoding, and each arm of the
+reconciliation, and confirm a named test fails.
 
 ## 7. Milestones
 
-- **L0** — the store: create, list, select, append, fetch, flags, delete, with
-  metadata and UID allocation. Local → local sync in tests.
+- **L0** — the store: create, list, select, append, fetch, flags, delete, UID
+  allocation, and the reconciliation of §4.1. Local → local sync in tests.
 - **L1** — wire it into config and the `sync` command as either endpoint.
   IMAP → local backup works end to end.
 - **L2** — restore, which is L1 with the endpoints swapped, plus the round-trip
@@ -269,18 +377,25 @@ fails.
 ## 8. Decisions and what they cost
 
 1. **`<uid>.eml`, and therefore not a maildir.** Double-clickable in Finder and
-   Explorer, at the price that no maildir-aware tool — mutt, mbsync, dovecot —
-   can read the store. Confirmed as the priority: the store is meant to be
-   opened by a person.
+   Explorer. No maildir-aware tool — mutt, mbsync, dovecot — can read the
+   store, and that is a non-goal rather than a price: the store exists to be
+   handed back to an arbitrary IMAP server by this tool, and to be opened by a
+   person in between. Feeding other mail software was never the job.
 2. **Nested directories rather than Maildir++.** Legible, and no dot-escaping.
    The compatibility this gives up was already gone with decision 1.
-3. **Flags in a per-folder index, not the filename.** Message files are then
-   written once and never touched, so an incremental backup of the store copies
-   only the mail that actually arrived. Costs a lock on a path that is mostly
-   exercised by `Append`, which is carrying the flags anyway.
-4. **UID in the filename** rather than only in the index, so the store survives
-   losing both `state.db` and its metadata.
-5. **Restore in the first milestone**, on the FAQ's warning.
+3. **Flags in a per-folder SQLite database, not the filename.** Message files
+   are then written once and never touched, so an incremental backup of the
+   store copies only the mail that actually arrived. SQLite rather than JSON
+   because a document has to be rewritten whole to change one entry.
+4. **The filesystem outranks the database.** Existence is answered by
+   `readdir`; the database only annotates. This is the decision most likely to
+   be quietly abandoned under performance pressure, and the one that must not
+   be.
+5. **UID in the filename** rather than only in the database, so the store
+   survives losing both `state.db` and its own bookkeeping.
+6. **A missing folder database means a new UIDVALIDITY**, because a rebuilt
+   `uidnext` can reuse numbers that deleted messages already had.
+7. **Restore in the first milestones**, on the FAQ's warning.
 
 Still genuinely open, and cheap to settle at L0:
 
@@ -292,3 +407,8 @@ Still genuinely open, and cheap to settle at L0:
   when browsing. `0000009083 Re Invoice for March.eml` is not, and costs
   sanitising, length limits, and a rename if the design ever lets a subject
   change. Deferred until the store is being browsed in anger.
+- **What a backup tool copying the store mid-write sees.** SQLite's WAL means
+  a naive copy can catch a torn database. Since the messages survive it and
+  §4.1 rebuilds from them, the damage is bounded — but the store should
+  probably checkpoint and close when idle, and that should be measured rather
+  than assumed.
