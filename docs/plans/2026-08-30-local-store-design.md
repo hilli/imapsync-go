@@ -87,7 +87,7 @@ serve.
 That compatibility is not wanted. The store is a waypoint between IMAP servers,
 not a format for other mail tools to read: what it has to do is hand every
 message back to an arbitrary IMAP server intact. Being legible to mutt or
-mbsync was never the goal, and §8's second decision had already mirrored the
+mbsync was never the goal, and §9's second decision had already mirrored the
 IMAP hierarchy as ordinary nested directories rather than Maildir++, which
 mbsync cannot read either. Half-honouring a convention nothing can use is worse
 than declaring the format, so:
@@ -108,7 +108,44 @@ Kept from maildir: one file per message, write-`fsync`-rename delivery, delete
 by `unlink`, and no lock anywhere on the message path. Dropped: `cur/new/tmp`,
 the colon, and flags in the filename.
 
-### 2.2 Message files are immutable
+### 2.2 Large folders are split, by UID range rather than by hash
+
+413,954 files in one directory is fine for APFS and miserable for Finder, which
+has to enumerate and sort the lot before it draws anything. Folders above
+10,000 messages are therefore split into subdirectories of 10,000, named for
+the first UID they can hold:
+
+```
+INBOX/+0000000000/0000009083.eml
+INBOX/+0000410000/0000413954.eml
+```
+
+**By UID range, not by hash.** Hashing distributes evenly, which is exactly
+wrong here: UIDs are approximately chronological, so hashing scatters each
+day's mail across all forty-two directories and leaves no directory meaning
+anything. A range keeps recent mail together — `+0000410000/` *is* the newest
+mail — and preserves the lexical-order-is-UID-order property within and across
+directories. Even distribution buys nothing when the goal is browsing.
+
+The `+` prefix distinguishes a split directory from a subfolder, since an IMAP
+folder may legitimately be named `2024` or even `0000410000`. It is outside the
+safe set of §4.5, so a real folder by that name is percent-encoded and cannot
+collide; it also sorts ahead of ordinary names, so the splits group together.
+
+**Decided when the folder is created and never revisited.** The source's
+message count is known from `Select` before the destination folder is made, so
+the choice is made once, from the real number. Re-splitting later would move
+every file in the folder — which would break the write-once property of §2.3
+and make the next incremental backup re-copy the entire folder, the exact cost
+this design exists to avoid. A folder that starts small and grows past the
+threshold therefore stays flat. Re-splitting on request is a later feature if
+it is ever wanted; doing it automatically is not.
+
+Which layout a folder uses is read from the disk, not the database: a folder
+containing `+` directories is split. Consistent with §4.1, and it means the
+layout survives losing the database.
+
+### 2.3 Message files are immutable
 
 Flags do not go in the filename. They go in a SQLite database in the folder,
 `.imapsync-folder.db`.
@@ -212,8 +249,10 @@ INTERNALDATE.
 `Select` reconciles, on names alone, which keeps it to one `readdir` with no
 `stat` per file:
 
-- **File with no row** — adopt it. Flags empty, INTERNALDATE from mtime. The
-  next sync from a live source fills the flags in.
+- **File with no row** — adopt it. Flags empty, INTERNALDATE from the file's
+  mtime, which is the timestamp `cp -p`, `rsync -t` and Finder all preserve
+  when a message is copied in from elsewhere. The next sync from a live source
+  fills the flags in.
 - **Row with no file** — the message was deleted outside the tool. Drop the
   row and count it in the report. This is a legitimate way to delete mail from
   the store, not an error.
@@ -236,8 +275,9 @@ one. `uidnext` is allocated under a per-folder lock held only for the
 increment; writing the message is not serialised, which is the whole point.
 
 If the database is lost, the messages and their UIDs are still on disk and
-INTERNALDATE comes back from mtime. Flags and the folder's exact name spelling
-are gone, and the next sync from a live source restores both.
+INTERNALDATE comes back from the file's own timestamps. Flags and the folder's
+exact name spelling are gone, and the next sync from a live source restores
+both.
 
 `uidnext` is the exception, and it is the one place where guessing is not
 allowed. Rebuilding it as the highest UID on disk plus one is wrong whenever
@@ -283,11 +323,24 @@ the message. `AppendMessage.InternalDate` already flows through the interface
 into `APPEND`'s optional date-time, so a store that drops it would restore
 776,802 messages all dated the day of the restore, with every client's sort
 order destroyed and no way to notice until it was far too late. It is recorded
-in the folder database, and *also* set as the file's mtime — the mtime is the
-redundant copy and the one Finder shows, the database is the authority. Two
-copies is not gratuitous here: unlike flags, INTERNALDATE cannot be re-fetched
-from a source that no longer exists, which is the situation a backup is for,
-and mtime is what lets §4.1 adopt a file that appeared from nowhere.
+in the folder database, and *also* written to the file itself. Two copies is
+not gratuitous here: unlike flags, INTERNALDATE cannot be re-fetched from a
+source that no longer exists, which is the situation a backup is for, and it is
+what lets §4.1 adopt a file that appeared from nowhere.
+
+Writing it to the file means **both** timestamps, not just mtime. Finder shows
+"Date Created" from `st_birthtime`, which `os.Chtimes` cannot touch — so a
+store that set only mtime would list every message in a folder as created on
+the day of the backup, which is precisely the thing that makes browsing by date
+useless. `st_birthtime` is settable, and this was checked rather than assumed:
+`unix.Setattrlist` with `ATTR_CMN_CRTIME` on a file, then `stat -f %SB`,
+reports the date asked for. `golang.org/x/sys` is already an indirect
+dependency.
+
+So both are set to INTERNALDATE, and Finder's two date columns agree with each
+other and with the mail. This is a macOS and BSD affordance; Linux has no
+interface for setting birthtime at all, so there it is skipped and mtime
+carries the date alone. The database remains the authority in both cases.
 
 **Flags and keywords**, **folder names** as the server spelled them, and
 **subscription state**.
@@ -319,7 +372,71 @@ mail.
   fail the folder loudly; do not silently merge two folders into one, which
   would be indistinguishable from mail loss.
 
-## 5. Cost, honestly
+## 5. Being backed up, which is the point
+
+The store exists to be copied by something else — Time Machine, `rsync`,
+Backblaze, a external disk. Messages are written once and never touched, so
+they are the easy part. The folder databases are the only files that change,
+and SQLite in WAL mode is exactly the shape of file that naive copying
+corrupts.
+
+SQLite's own corruption guide is unusually direct about it, and it also
+supplies the answer:
+
+> Systems that run automatic backups in the background might try to make a
+> backup copy of an SQLite database file while it is in the middle of a
+> transaction. The backup copy then might contain some old and some new
+> content, and thus be corrupt. […] It is also safe to make a copy of an SQLite
+> database file **as long as there are no transactions in progress** while the
+> copy is taking place.
+
+So the fix is not to copy the database cleverly. It is to make "no transactions
+in progress" the store's resting state, which is a property the code can
+guarantee:
+
+**At the end of a run, every folder database is checkpointed with
+`PRAGMA wal_checkpoint(TRUNCATE)` and closed.** That removes the `-wal` and
+`-shm` files rather than leaving them empty, so a store at rest is a tree of
+message files plus one quiescent database per folder — and copying it is safe
+by SQLite's own rule, with nothing for the backup tool to know or the user to
+remember.
+
+This is why "run a sync before the backup starts" should not be the answer. It
+is backwards — that leaves the database at its most active immediately before
+the copy — and more importantly it is a procedure, and the FAQ quoted in §1
+warns about exactly the backup regime whose correctness depends on someone
+remembering a step. Better to make the untended case correct.
+
+### 5.1 When the copy is taken mid-run anyway
+
+Scheduled backups do not ask permission, so assume it happens. Two outcomes,
+and the dangerous one is not the obvious one.
+
+**A corrupt database** is the benign case, because it announces itself. It is
+handled by the path §4.1 and §4.2 already require: the database is a cache, the
+mail is the truth. Fail to open it, or fail `PRAGMA integrity_check`, and treat
+it exactly as missing — adopt every message from disk, recover dates from the
+files, take a new UIDVALIDITY, and let the next sync refill the flags. No new
+code, and this is the established answer elsewhere: Dovecot's advice for a
+damaged index is to delete it, leaving `cur/` and `new/` untouched, and rebuild
+with `doveadm force-resync`.
+
+**A stale but internally consistent database** is the one to worry about, and
+it arrives by the front door: someone restores the store from last month's
+backup. Nothing is corrupt, nothing complains, and the recorded `uidnext` is
+now *lower* than UIDs already present on disk. Left alone, the store would hand
+those numbers out a second time, and two different messages would share a UID
+inside one UIDVALIDITY — the guarantee IMAP makes most firmly, broken silently,
+with clients fetching mail that is not the mail they asked for.
+
+The defence is one line and costs nothing: **`uidnext` is monotonic.** On
+`Select` it is raised to `max(stored, highest UID on disk + 1)` and never
+lowered. A stale database then heals into a correct one instead of quietly
+issuing duplicates, and it needs no new UIDVALIDITY — unlike a missing database
+(§4.2), where the highest deleted UID is unknowable and a fresh UIDVALIDITY is
+the only safe answer.
+
+## 6. Cost, honestly
 
 `FetchMeta` over a folder with no state database entry reads every header in
 that folder — 413,954 files for the INBOX in the example. On an SSD that is
@@ -331,7 +448,7 @@ size, but that should not be built before the pain is measured.
 The reconciliation of §4.1 is a `readdir` per folder per run and no `stat`,
 which is the cheap half of the same walk.
 
-## 6. Testing
+## 7. Testing
 
 The existing suite tests against an in-memory IMAP server; the local store
 needs no server at all, so `t.TempDir()` is the whole fixture.
@@ -349,32 +466,45 @@ These deserve tests that would fail without them:
   it must vanish from `AllUIDs` rather than be fetched. Drop a foreign `.eml`
   in and it must be adopted, renamed and appear. Delete the database entirely
   and the folder must come back with a new UIDVALIDITY, its messages intact and
-  their dates recovered from mtime — and specifically **must not reuse a UID**
-  after the highest-numbered message was deleted, which is the case that would
-  hand two different messages the same number.
+  their dates recovered from the files — and specifically **must not reuse a
+  UID** after the highest-numbered message was deleted, which is the case that
+  would hand two different messages the same number.
+- **The stale database**, which is the same hazard arriving silently. Restore
+  an older copy of the database over a folder that has since grown, and
+  `uidnext` must be raised to clear the highest UID on disk rather than
+  trusted. Nothing reports an error in this scenario, so without the test
+  nothing would notice.
 - **Crash during append.** A message left in `.tmp/` is not visible as a
   `.eml` and is not counted, so the existing in-flight recovery settles it.
 - **The case collision.** Two folders differing only in case must fail rather
   than merge.
+- **Both timestamps.** A written message's mtime *and* birthtime equal its
+  INTERNALDATE, so the dates Finder shows are the mail's own.
+- **Splitting.** A folder created above the threshold lays out under `+`
+  directories and one below it does not; both round-trip identically; and a
+  folder literally named `+0000000000` is encoded rather than mistaken for a
+  split.
 - **Double-clickable.** A written message is byte-identical to what the server
   gave us, so the point of the `.eml` name holds.
 
 Plus the ordinary mutation discipline: break each of the flag mappings, the
-UID-from-filename parse, the percent-encoding, and each arm of the
-reconciliation, and confirm a named test fails.
+UID-from-filename parse, the percent-encoding, the `uidnext` monotonicity, and
+each arm of the reconciliation, and confirm a named test fails.
 
-## 7. Milestones
+## 8. Milestones
 
 - **L0** — the store: create, list, select, append, fetch, flags, delete, UID
-  allocation, and the reconciliation of §4.1. Local → local sync in tests.
+  allocation, the split layout of §2.2, and the reconciliation of §4.1. Local →
+  local sync in tests.
 - **L1** — wire it into config and the `sync` command as either endpoint.
-  IMAP → local backup works end to end.
+  IMAP → local backup works end to end, quiescent when it finishes.
 - **L2** — restore, which is L1 with the endpoints swapped, plus the round-trip
   test that proves it.
-- **Later, if asked** — one-way mbox export for other tools; a header index if
-  L1 measures the scan as painful.
+- **Later, if asked** — one-way mbox export for other tools; re-splitting a
+  folder that outgrew its layout; a header index if L1 measures the scan as
+  painful.
 
-## 8. Decisions and what they cost
+## 9. Decisions and what they cost
 
 1. **`<uid>.eml`, and therefore not a maildir.** Double-clickable in Finder and
    Explorer. No maildir-aware tool — mutt, mbsync, dovecot — can read the
@@ -394,21 +524,23 @@ reconciliation, and confirm a named test fails.
 5. **UID in the filename** rather than only in the database, so the store
    survives losing both `state.db` and its own bookkeeping.
 6. **A missing folder database means a new UIDVALIDITY**, because a rebuilt
-   `uidnext` can reuse numbers that deleted messages already had.
-7. **Restore in the first milestones**, on the FAQ's warning.
+   `uidnext` can reuse numbers that deleted messages already had. A *stale*
+   one does not, because `uidnext` is monotonic.
+7. **Folders over 10,000 messages are split by UID range**, decided once at
+   creation. Costs a folder that grows past the threshold staying flat, which
+   is cheaper than re-splitting and re-copying it in every later backup.
+8. **Both file timestamps carry INTERNALDATE**, so Finder's date columns mean
+   something. Verified: `ATTR_CMN_CRTIME` via `unix.Setattrlist` sets
+   `st_birthtime` and `stat` confirms it. macOS and BSD only.
+9. **The store is quiescent at rest** — checkpointed and closed after each run
+   — so an unattended backup is safe by SQLite's own rule, with no procedure
+   to remember.
+10. **No subject in the filename.** The UID is the name; the date comes from
+    the file's timestamps and the subject from opening it.
+11. **Restore in the first milestones**, on the FAQ's warning.
 
-Still genuinely open, and cheap to settle at L0:
-
-- **Whether one directory per folder scales to a Finder window.** 413,954 files
-  in `INBOX/` is fine for APFS and unpleasant for Finder. Sharding by UID
-  prefix would fix the machine's problem by ruining the human's, so it is not
-  proposed — but the number should be looked at once rather than assumed.
-- **Whether the subject belongs in the filename.** `0000009083.eml` is opaque
-  when browsing. `0000009083 Re Invoice for March.eml` is not, and costs
-  sanitising, length limits, and a rename if the design ever lets a subject
-  change. Deferred until the store is being browsed in anger.
-- **What a backup tool copying the store mid-write sees.** SQLite's WAL means
-  a naive copy can catch a torn database. Since the messages survive it and
-  §4.1 rebuilds from them, the damage is bounded — but the store should
-  probably checkpoint and close when idle, and that should be measured rather
-  than assumed.
+Nothing here is still open. What was open at the previous revision is settled
+above: the Finder question by decision 7, the subject question by decision 10,
+and the WAL question by §5 — which turned out to have an answer better than the
+procedural one, since SQLite's rule is about transactions in progress rather
+than about the copy, and the store can simply not have any at rest.
