@@ -281,9 +281,17 @@ func TestARefusalIsReported(t *testing.T) {
 	}
 }
 
-// TestACapacityRefusalIsDistinguishableByCallers. The pool's judgement is only
-// useful if it survives the trip back to whoever decides how long to wait.
-func TestACapacityRefusalIsDistinguishableByCallers(t *testing.T) {
+// TestACapacityRefusalIsWaitedOutRatherThanReturned.
+//
+// This test used to assert the opposite, under the name
+// TestACapacityRefusalIsDistinguishableByCallers, and its premise was the bug.
+// Measuring mox settled it: asking a server that holds 30 connections for 36
+// produced one shrink and four failed folders, because the refusals racing
+// alongside the shrink found the width already corrected, had nothing left to
+// do, and became each folder's own failure. A pool that has just been refused
+// is a pool demonstrably holding connections the server accepted, so the answer
+// is to wait for one of them.
+func TestACapacityRefusalIsWaitedOutRatherThanReturned(t *testing.T) {
 	t.Parallel()
 
 	w := &wall{limit: 1}
@@ -306,13 +314,68 @@ func TestACapacityRefusalIsDistinguishableByCallers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire() error = %v", err)
 	}
-	defer held.Release(nil)
+
+	// The second acquire must block on the held connection rather than fail. It
+	// is released from another goroutine so that a pool which waits completes
+	// and a pool which returns the refusal fails on the error instead.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		held.Release(nil)
+	}()
+
+	second, err := p.Acquire(ctx, "")
+	if err != nil {
+		t.Fatalf("Acquire() after a capacity refusal = %v, want it to wait for the connection that was busy", err)
+	}
+	second.Release(nil)
+
+	if _, _, live := w.stats(); live > 1 {
+		t.Errorf("server sees %d live connections, want no more than its limit of 1", live)
+	}
+}
+
+// TestACapacityRefusalWithNothingToWaitForReachesTheCaller.
+//
+// Waiting is only right while the pool holds a connection to wait for. Once
+// every connection it opened has broken, there is nothing a wait could ever be
+// satisfied by, and the refusal has to go back with its judgement intact — this
+// is the error retry.classify reads to decide to slow down rather than
+// reconnect straight into a server asking for less load.
+func TestACapacityRefusalWithNothingToWaitForReachesTheCaller(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	dials := 0
+	dial := func(context.Context) (imapx.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dials++
+		if dials == 1 {
+			return &fakeConn{}, nil
+		}
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	p, err := pool.New(pool.Options{Cap: 4, Dial: dial})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	ctx := context.Background()
+
+	// The one connection is opened, proving the server alive, and then broken,
+	// so the pool holds nothing while its judgement of a refusal is still fresh.
+	l, err := p.Acquire(ctx, "")
+	if err != nil {
+		t.Fatalf("first Acquire() error = %v", err)
+	}
+	l.Release(imapx.ErrConnectionBroken)
 
 	_, err = p.Acquire(ctx, "")
 	if err == nil {
-		t.Fatal("the server accepted a second connection despite a limit of one")
+		t.Fatal("Acquire() succeeded against a server refusing every connection")
 	}
-
 	if !errors.Is(err, imapx.ErrAtCapacity) {
 		t.Errorf("Acquire() error = %v, want it to carry imapx.ErrAtCapacity", err)
 	}
@@ -336,6 +399,70 @@ func TestACapacityRefusalIsDistinguishableByCallers(t *testing.T) {
 // one that settled on the *wider* number. A pool can hold a small width and
 // still hand out concurrency it has already decided it cannot have, and every
 // worker that takes some gets refused again.
+// TestACrowdMeetingTheWallLosesNoWork is the mox scenario, in miniature.
+//
+// The pool is warm — something has already succeeded, so a refusal is judged
+// rather than mistaken for the network — and then more workers than the server
+// will hold arrive at once. That is what a run does when it reaches a folder
+// wide enough to want every connection, and it is what asking mox for 36
+// against its limit of 30 did: one worker's refusal narrowed the pool, and the
+// refusals racing alongside it found the width already corrected and came back
+// as four failed folders, rescued only by a retry pass 42 seconds later.
+//
+// Nothing here may fail. Every one of these workers is asking for a connection
+// the server is holding perfectly happily; that they asked while the pool was
+// still working out its width is not their problem.
+func TestACrowdMeetingTheWallLosesNoWork(t *testing.T) {
+	t.Parallel()
+
+	const workers = 24
+	w := &wall{limit: 5}
+	p, err := pool.New(pool.Options{Cap: workers, Dial: w.dial})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	ctx := context.Background()
+
+	// Priming is the whole difference from TestAPoolOpenedPastTheLimitStops-
+	// FailingWork. A refusal that arrives before anything has ever succeeded
+	// cannot be told apart from a dead network and is deliberately not judged,
+	// so that pool is allowed its early failures. This one is not.
+	if err := work(ctx, p); err != nil {
+		t.Fatalf("priming lease: %v", err)
+	}
+
+	var (
+		wg     sync.WaitGroup
+		failed atomic.Int64
+		sample atomic.Value
+	)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 8 {
+				if err := workFor(ctx, p, 3*time.Millisecond); err != nil {
+					failed.Add(1)
+					sample.Store(err.Error())
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := failed.Load(); n > 0 {
+		got, _ := sample.Load().(string)
+		t.Errorf("%d of %d leases failed against a server that was holding its %d connections throughout; first was: %s",
+			n, workers*8, w.limit, got)
+	}
+
+	if got := p.Width(); got > 5 {
+		t.Errorf("Width() = %d, want the pool narrowed to the server's limit of 5", got)
+	}
+}
+
 func TestAPoolOpenedPastTheLimitStopsFailingWork(t *testing.T) {
 	t.Parallel()
 

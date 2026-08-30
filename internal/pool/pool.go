@@ -222,21 +222,40 @@ func (l *Lease) Release(err error) {
 // When mailbox is not empty the connection is left with that mailbox selected.
 // Pass "" for work that names its own mailbox, which on the destination side is
 // every APPEND.
+//
+// A refusal by the server's connection limit is the pool's business, not the
+// caller's, and is waited out here rather than returned. Measuring mox showed
+// why. Asking for 36 connections from a server that holds 30 produced one
+// shrink and four failed folders: the first refusal narrowed the pool, and the
+// refusals racing alongside it found the width already correct, had nothing
+// left to do, and so came back as each folder's own failure. Those folders were
+// rescued only by the retry pass, which does not run until every other folder
+// has finished — 42 seconds later, against a pool that had room again within
+// milliseconds.
+//
+// Waiting is the honest answer because a capacity refusal is proof the pool
+// already holds connections the server is happy with. Asking for one of those
+// is an ordinary wait for a busy pool, which is what the caller would have done
+// had it arrived a moment later.
 func (p *Pool) Acquire(ctx context.Context, mailbox string) (*Lease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	select {
-	case <-p.tokens:
-	case <-p.done:
-		return nil, ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	for {
+		select {
+		case <-p.tokens:
+		case <-p.done:
+			return nil, ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 
-	c, err := p.ready(ctx, mailbox)
-	if err != nil {
+		c, err := p.ready(ctx, mailbox)
+		if err == nil {
+			return &Lease{pool: p, c: c}, nil
+		}
+
 		// A worker whose dial was refused is holding a token the pool may have
 		// already decided to destroy, and handing it straight back is what let
 		// a shrunk pool go on being refused indefinitely: the excess tokens
@@ -246,9 +265,35 @@ func (p *Pool) Acquire(ctx context.Context, mailbox string) (*Lease, error) {
 		if !p.payDebt() {
 			p.tokens <- struct{}{}
 		}
+
+		// Going round again cannot spin. Taking a token requires one to be
+		// free, and a free token means a free connection once the pool holds as
+		// many connections as its width allows — which a capacity refusal has
+		// just made true, since the width is set to the number open. So the
+		// next turn finds an idle connection and does not dial at all.
+		var room roomError
+		if errors.As(err, &room) {
+			continue
+		}
 		return nil, err
 	}
-	return &Lease{pool: p, c: c}, nil
+}
+
+// roomError marks a capacity refusal the pool can absorb by waiting, because it
+// still holds connections the server has accepted. It delegates its message and
+// its identity, so errors.Is finds imapx.ErrAtCapacity and the server's own
+// error underneath exactly as before.
+type roomError struct{ error }
+
+func (r roomError) Unwrap() error { return r.error }
+
+// holdsConnections reports whether the pool has any open connection to wait
+// for. Without one there is nothing a wait could be satisfied by, so a refusal
+// has to go back to the caller.
+func (p *Pool) holdsConnections() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.open > 0
 }
 
 // ready produces a usable connection with the right mailbox selected, reusing
@@ -342,7 +387,11 @@ func (p *Pool) take(ctx context.Context) (*conn, bool, error) {
 	c, err := p.dial(ctx)
 	if err != nil {
 		if p.refused(err) {
-			return nil, false, fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, err))
+			refusal := fmt.Errorf("dialling: %w", errors.Join(imapx.ErrAtCapacity, err))
+			if p.holdsConnections() {
+				return nil, false, roomError{refusal}
+			}
+			return nil, false, refusal
 		}
 		return nil, false, fmt.Errorf("dialling: %w", err)
 	}
