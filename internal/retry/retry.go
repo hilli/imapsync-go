@@ -275,7 +275,9 @@ func (p Policy) Wait(ctx context.Context, k Kind, attempt int) error {
 		ceiling = p.Max
 	}
 
-	t := time.NewTimer(rand.N(ceiling + 1))
+	// Jitter spreads a thundering herd; it guards nothing, so a cheap
+	// non-cryptographic source is the right one.
+	t := time.NewTimer(rand.N(ceiling + 1)) // #nosec G404
 	defer t.Stop()
 	select {
 	case <-t.C:

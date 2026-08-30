@@ -108,7 +108,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	password, err := opts.Endpoint.Password.Resolve()
+	password, err := opts.Endpoint.Password.Resolve(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -161,12 +161,12 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 // measureCeiling opens connections one at a time, holding each open, until the
 // server refuses or the cap is reached. It returns the highest count that
 // succeeded, including the connection the caller already holds.
-func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (held int, why string, refused bool) {
+func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, limit int) (held int, why string, refused bool) {
 	// The ceiling search is the same login repeated; tracing it would bury the
 	// interesting conversation in noise.
 	dialOpts.DebugWriter = nil
 
-	open := make([]imapx.Conn, 0, max)
+	open := make([]imapx.Conn, 0, limit)
 	defer func() {
 		for _, c := range open {
 			_ = c.Close()
@@ -176,7 +176,7 @@ func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (h
 	// The caller's own connection counts toward the server's limit.
 	const alreadyOpen = 1
 
-	for len(open)+alreadyOpen < max {
+	for len(open)+alreadyOpen < limit {
 		if err := ctx.Err(); err != nil {
 			// A cancelled probe found nothing: it stopped because we stopped it.
 			return len(open) + alreadyOpen, "probe cancelled", false
@@ -187,7 +187,7 @@ func measureCeiling(ctx context.Context, dialOpts imapx.DialOptions, max int) (h
 		}
 		open = append(open, c)
 	}
-	return max, fmt.Sprintf("reached configured cap of %d, server may allow more", max), false
+	return limit, fmt.Sprintf("reached configured cap of %d, server may allow more", limit), false
 }
 
 func refusalReason(err error) string {

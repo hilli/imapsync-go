@@ -178,7 +178,7 @@ func TestSecretValidate(t *testing.T) {
 func TestSecretResolveFromEnv(t *testing.T) {
 	t.Setenv("IMAPSYNC_TEST_PW", "hunter2")
 
-	got, err := Secret{Env: "IMAPSYNC_TEST_PW"}.Resolve()
+	got, err := Secret{Env: "IMAPSYNC_TEST_PW"}.Resolve(t.Context())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestSecretResolveFromEnv(t *testing.T) {
 		t.Errorf("got %q, want %q", got, "hunter2")
 	}
 
-	if _, err := (Secret{Env: "IMAPSYNC_TEST_PW_MISSING"}).Resolve(); err == nil {
+	if _, err := (Secret{Env: "IMAPSYNC_TEST_PW_MISSING"}).Resolve(t.Context()); err == nil {
 		t.Error("expected an error for an unset variable")
 	}
 }

@@ -598,7 +598,7 @@ func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) poo
 			if addr, resolve = ep.Address(); resolve != nil {
 				return
 			}
-			password, resolve = ep.Password.Resolve()
+			password, resolve = ep.Password.Resolve(ctx)
 		})
 		if resolve != nil {
 			return nil, resolve

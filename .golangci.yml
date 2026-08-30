@@ -40,6 +40,10 @@ linters:
       rules:
         - name: blank-imports
         - name: context-as-argument
+          arguments:
+            # A test helper idiomatically takes *testing.T first, and revive
+            # otherwise insists the context precede it.
+            - allowTypesBefore: "*testing.T"
         - name: context-keys-type
         - name: dot-imports
         - name: error-return

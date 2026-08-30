@@ -5,6 +5,7 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -278,12 +279,12 @@ func splitHostPort(hostport string) (host string, port int, err error) {
 
 	var portStr string
 	if strings.HasPrefix(hostport, "[") {
-		close := strings.Index(hostport, "]")
-		if close < 0 {
+		end := strings.Index(hostport, "]")
+		if end < 0 {
 			return "", 0, fmt.Errorf("unterminated IPv6 address in %q", hostport)
 		}
-		host = hostport[1:close]
-		switch remainder := hostport[close+1:]; {
+		host = hostport[1:end]
+		switch remainder := hostport[end+1:]; {
 		case remainder == "":
 		case strings.HasPrefix(remainder, ":"):
 			portStr = remainder[1:]
@@ -310,8 +311,10 @@ func splitHostPort(hostport string) (host string, port int, err error) {
 	return host, n, nil
 }
 
-// Resolve returns the secret value from its configured source.
-func (s Secret) Resolve() (string, error) {
+// Resolve returns the secret value from its configured source. The context
+// bounds the keychain lookup, which is the one source that can block
+// indefinitely: it may put a prompt in front of the user.
+func (s Secret) Resolve(ctx context.Context) (string, error) {
 	switch {
 	case s.Env != "":
 		v, ok := os.LookupEnv(s.Env)
@@ -338,7 +341,10 @@ func (s Secret) Resolve() (string, error) {
 		if runtime.GOOS != "darwin" {
 			return "", fmt.Errorf("keychain secrets are only supported on macOS, not %s", runtime.GOOS)
 		}
-		out, err := exec.Command("security", "find-generic-password", "-s", s.Keychain, "-w").Output()
+		// The keychain item name comes from the user's own configuration, and
+		// the argument vector is passed to exec without a shell, so there is
+		// nothing here for a metacharacter to escape into.
+		out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", s.Keychain, "-w").Output() // #nosec G204
 		if err != nil {
 			return "", fmt.Errorf("reading keychain item %q: %w", s.Keychain, err)
 		}
@@ -373,7 +379,8 @@ func (s Secret) Validate() error {
 
 // Load reads and validates a configuration file.
 func Load(path string) (*Config, error) {
-	raw, err := os.ReadFile(path)
+	// Reading the file the user named is the whole purpose of this function.
+	raw, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}

@@ -18,6 +18,13 @@ import (
 var version = "dev"
 
 func main() {
+	os.Exit(run())
+}
+
+// run is main's body, returning a status rather than calling os.Exit itself so
+// that the deferred stop actually runs. Exiting from inside main skipped it,
+// leaving the signal handler installed as the process went down.
+func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -30,8 +37,9 @@ func main() {
 		if !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // argsFor decides what the arguments mean, which depends on what this binary
@@ -62,7 +70,7 @@ func newRootCmd() *cobra.Command {
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
 			return setupLogging(g)
 		},
 	}

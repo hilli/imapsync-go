@@ -10,14 +10,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
-	"github.com/hilli/imapsync-go/internal/folder"
-	"github.com/hilli/imapsync-go/internal/syncer"
 	"math/big"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hilli/imapsync-go/internal/folder"
+	"github.com/hilli/imapsync-go/internal/syncer"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"

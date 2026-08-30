@@ -270,7 +270,7 @@ func (c *conn) Caps() Caps {
 	return caps
 }
 
-func (c *conn) Namespaces(ctx context.Context) (Namespaces, error) {
+func (c *conn) Namespaces(_ context.Context) (Namespaces, error) {
 	if !c.Caps().Namespace {
 		return Namespaces{Supported: false}, nil
 	}
@@ -291,7 +291,7 @@ func (c *conn) Namespaces(ctx context.Context) (Namespaces, error) {
 	return ns, nil
 }
 
-func (c *conn) ListFolders(ctx context.Context, opts ListOptions) ([]Folder, error) {
+func (c *conn) ListFolders(_ context.Context, opts ListOptions) ([]Folder, error) {
 	caps := c.Caps()
 
 	listOpts := listOptions(caps, opts)
@@ -415,7 +415,7 @@ func applyStatus(f *Folder, st *imap.StatusData) {
 	f.HighestModSeq = st.HighestModSeq
 }
 
-func (c *conn) Logout(ctx context.Context) error {
+func (c *conn) Logout(_ context.Context) error {
 	if err := c.c.Logout().Wait(); err != nil {
 		return fmt.Errorf("logging out: %w", err)
 	}
