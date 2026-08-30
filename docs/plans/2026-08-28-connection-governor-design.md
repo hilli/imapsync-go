@@ -497,6 +497,74 @@ have been fetched, come back empty, and been written to the state database as
 gone — a fifth of the run, every run. `AllUIDs` now checks its answer against
 EXISTS and walks the mailbox when the two disagree.
 
+## 8.2 Asking for more than the server will give
+
+Questions 1-3 were left open twice: first because the instrumentation was
+missing, then because the runs that might have answered them were accidentally
+made at 8 connections against a server that refuses at 30. Both are fixed, so
+on 2026-08-30 the destination was deliberately over-asked.
+
+| ask | outcome | folders failed | retry pass |
+|---|---|---|---|
+| 36 | refused, settled on **30** | **4** | yes, 42s later |
+| 36 | **held all 36** | 0 | no |
+| 64 | refused, settled on **29** | 0 | no |
+
+**1. Does the pool shrink at a realistic width?** Yes, and now against a wall it
+could actually reach. Both refusals narrowed the pool in a single step.
+
+**2. Does it settle, or ratchet down?** It settles. One shrink per run, and
+nothing after it — no walk down toward the floor. The arithmetic in §4.1 holds
+at 64 workers as it did at 40: every worker in the crowd reads the same number
+of open connections, computes the same width, and all but the first find nothing
+to do.
+
+**3. Is the settled width consistently short of the true limit?** The question
+assumes a fixed limit, and that assumption is wrong. The same server, within
+twelve minutes, refused past 30, then held 36, then refused past 29. The number
+is not a property of the server alone; it is what is left after every other
+client on the account has taken its share.
+
+That changes the case for the increase half of AIMD rather than closing it, and
+strengthens it for a different reason than §8 gave. The concern there was that a
+shrink lands below a fixed wall and stays there. The real problem is worse: the
+wall *moves*, and a decrease-only governor cannot follow it upward. A run that
+meets a busy moment in its first minute and settles on 29 keeps 29 for the rest
+of the run, even when the server would happily hold 36 an hour later. Long runs
+are exactly where this costs most, and this tool exists for long runs.
+
+### The bug the over-ask found
+
+Asking for 36 cost four folders — `Arkiv/OMA/OMA indbox`, `Arkiv/Magazines`,
+`Arkiv/Chainalysis`, `Arkiv/DMU` — all failing with `server is at its connection
+limit`.
+
+The shrink was not the bug. A wall is met by every worker at once, so one
+refusal narrows the pool and the refusals racing alongside it find the width
+already corrected. §4.1 describes them as having "nothing left to do", which was
+true of the *governor* and quietly false of the *worker*: it still had a folder
+to sync, and it failed it.
+
+This is the same shape as the idle-connection bug of §8.1 — a pool-level
+condition reported as the folder's failure — and it was rescued by the same
+safety net, the retry pass. But that pass does not run until every other folder
+has finished. The four sat idle for 42 seconds against a pool that had room
+again within milliseconds.
+
+`Acquire` now waits for a connection instead of returning the refusal. A
+capacity refusal is proof the pool holds connections the server accepts, so
+asking for one of those is an ordinary wait for a busy pool — what the caller
+would have done had it arrived a moment later. It cannot spin: a free token
+implies a free connection once the pool holds as many as its width allows, which
+the refusal has just made true by setting the width to the number open. The
+refusal still reaches the caller when the pool holds nothing to wait for, which
+is the error `retry.classify` reads to slow down rather than reconnect into a
+server asking for less load.
+
+Confirmed by the third run: 64 against a server that would hold 29 — an over-ask
+six times the size of the one that broke it — with zero folder failures and no
+retry pass at all.
+
 ## 9. Related, separate — fixed
 
 `probe` reported *"Suggested concurrency: 47 (one below the ceiling, leaving
