@@ -834,7 +834,7 @@ func writeConnectionNote(p *printer, conns connections) {
 	for _, c := range conns {
 		switch {
 		case c.got < c.asked:
-			p.printf("\nThe %s server would not hold %d connections; the run settled on %d.\nPass --%s=%d next time to start there and skip the refusals.\n",
+			p.printf("\nThe %s server would not hold %d connections; the run ended on %d.\nThat is where the width finished rather than a fixed limit: it narrows when the\nserver refuses and climbs back while it does not. Pass --%s=%d next time to\nstart nearer and skip the opening refusals.\n",
 				c.side, c.asked, c.got, c.flag, c.got)
 		default:
 			p.printf("\nThe %s server held all %d connections.\n", c.side, c.got)

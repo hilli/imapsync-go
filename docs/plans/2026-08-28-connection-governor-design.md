@@ -140,6 +140,35 @@ Convergent, and it tracks a limit that moves.
 The refusing operation is unaffected: it retries as `Slower` under the existing
 exponential-with-jitter policy, so no message is dropped by any of this.
 
+### 4.2 Climbing back
+
+The decrease half shipped alone, deliberately, because nothing had shown the
+increase half was needed. Three over-asks on 2026-08-30 showed it. The same mox
+instance refused past 30, held 36, then refused past 29 within twelve minutes: a
+connection limit is not a property of the server but of what every other client
+on the account is not currently using.
+
+A governor that only shrinks therefore treats the narrowest moment it ever met
+as permanent. On a run of minutes that is nothing; on the 2h49m run this tool
+exists for, it is most of the run spent at a width chosen by one unlucky second.
+
+Growth is one connection at a time, gated on two clocks: thirty seconds since
+the last refusal, and fifteen since the last step. Slow, because the cost of
+guessing high is a refused dial, and a server sitting at a hard wall should see
+one of those every half minute rather than a stream. Not so slow that an
+hours-long run cannot recover.
+
+Two things make it safe that were not true before. Refusals are absorbed by
+`Acquire` rather than failing a folder (§8.2), so a probe upward costs one dial
+instead of a folder's work — before that, growth would have been trading a known
+cost for an unknown one. And growth is driven by leases coming back clean rather
+than by a ticker, so the pool widens only while work is flowing through it, and
+there is no goroutine to shut down.
+
+It will not go past the cap it was given. The invariant that capacity can be
+neither leaked nor invented still holds; it is now destroyed in one place and
+restored in one place, and the second cannot outrun the first.
+
 ## 5. The mechanism
 
 The pool holds two resources, deliberately decoupled: a token is required to
@@ -564,6 +593,17 @@ server asking for less load.
 Confirmed by the third run: 64 against a server that would hold 29 — an over-ask
 six times the size of the one that broke it — with zero folder failures and no
 retry pass at all.
+
+### The increase half, built and measured
+
+The moving ceiling is what finally justified it; see §4.2. A fourth run asked
+for 64 again: the pool met the wall at 30, and finished the run at 31, having
+taken one step back up once the server had been quiet for thirty seconds. One
+step is all a sixty-second run has time for, which is the point — the mechanism
+is deliberately slow, and it is the hours-long runs it exists for.
+
+The report no longer says the run "settled on" a width, because it no longer
+does. It says where the width finished, and that it moves.
 
 ## 9. Related, separate — fixed
 

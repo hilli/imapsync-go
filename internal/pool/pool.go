@@ -66,6 +66,28 @@ type Options struct {
 // they cannot observe.
 const capacityWindow = 10 * time.Second
 
+// growQuiet is how long the pool must go without meeting the server's limit
+// before it tries for a wider one, and growStep is how often it may then add a
+// connection.
+//
+// The pair exists because a limit is not a property of the server. The same mox
+// instance refused past 30 connections, held 36, and refused past 29 inside
+// twelve minutes: what is available is whatever the other clients on the account
+// are not using. A governor that only ever shrinks reads one busy moment as
+// permanent, so a run that meets one in its first minute keeps that width for
+// hours — and this tool exists for runs that last hours.
+//
+// Growth is one connection at a time because the cost of guessing high is a
+// refusal, and refusals are no longer free of consequence only because Acquire
+// now waits them out; before that, a probe upward could have cost a folder.
+// Thirty seconds of quiet and fifteen between steps is slow enough that a
+// server at a hard wall sees one refused dial every half minute rather than a
+// stream of them, and fast enough that an hours-long run recovers.
+const (
+	growQuiet = 30 * time.Second
+	growStep  = 15 * time.Second
+)
+
 // Pool hands out exclusive leases on connections, dialling lazily up to Cap.
 //
 // Connections are dialled on demand rather than up front. A run that touches
@@ -84,8 +106,9 @@ type Pool struct {
 	now func() time.Time
 
 	// tokens is the concurrency limit, nothing more. It is created holding Cap
-	// values, and thereafter capacity can be neither leaked nor invented: it
-	// can only be destroyed, in one place, by shrink. The bookkeeping that says
+	// values, and thereafter capacity can be neither leaked nor invented: it is
+	// destroyed in one place, by shrink, and restored in one place, by grow,
+	// which will not go past the Cap it started with. The bookkeeping that says
 	// so is width and debt, and the invariant relating them to this channel is
 	//
 	//	tokens still in circulation == width + debt
@@ -113,9 +136,10 @@ type Pool struct {
 	closed bool
 
 	// width is how many connections the pool currently allows itself, starting
-	// at cap and only ever falling. debt is how much of the last reduction has
-	// yet to be taken out of circulation, and open is how many connections
-	// exist right now.
+	// at cap. It falls on a refusal and climbs back one at a time while the
+	// server is not refusing, but never past cap. debt is how much of the last
+	// reduction has yet to be taken out of circulation, and open is how many
+	// connections exist right now.
 	width int
 	debt  int
 	open  int
@@ -124,6 +148,13 @@ type Pool struct {
 	// It is the whole basis for telling a connection limit from a network
 	// fault: at a limit, the connections that got in keep working.
 	lastOK time.Time
+
+	// lastRefusal is when the pool last judged a dial to be the server's limit,
+	// and lastGrow is when it last widened. Growth waits on both: the first so
+	// it does not walk straight back into a wall it has just met, the second so
+	// it climbs rather than jumps.
+	lastRefusal time.Time
+	lastGrow    time.Time
 }
 
 // conn is one pooled connection and what it currently has selected.
@@ -452,6 +483,7 @@ func (p *Pool) refused(cause error) bool {
 	// halving. Multiplicative decrease is for a limit you cannot see; this one
 	// can be read off at the moment of refusal.
 	to := max(p.open, 1)
+	p.lastRefusal = p.now()
 	if to >= p.width {
 		p.mu.Unlock()
 		return true
@@ -544,6 +576,44 @@ func (p *Pool) put(c *conn, err error) {
 	if !p.payDebt() {
 		p.tokens <- struct{}{}
 	}
+
+	// A lease that finished cleanly is the evidence growth waits for. Driving it
+	// from here rather than from a ticker means the pool widens only while work
+	// is actually flowing through it, and needs no goroutine to shut down.
+	if err == nil {
+		p.grow()
+	}
+}
+
+// grow gives back one connection's worth of the capacity a shrink took away.
+//
+// It is the other half of the governor, and the half that was deliberately left
+// unbuilt until a run could show it was needed. Three over-asks against the same
+// mox instance showed the limit moving between 29 and at least 36 within twelve
+// minutes, which is what makes shrink-only wrong: the pool would keep the
+// narrowest width it ever met for the rest of the run.
+//
+// The send cannot block. Tokens in circulation equal width plus debt, growth
+// requires debt to be zero and width below cap, so after the increment
+// circulation is at most cap — which is the channel's own capacity.
+func (p *Pool) grow() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Debt outstanding means a shrink is still being collected, and widening
+	// while owing tokens would hand back the very capacity being taken away.
+	if p.closed || p.debt > 0 || p.width >= p.cap {
+		return
+	}
+
+	now := p.now()
+	if now.Sub(p.lastRefusal) < growQuiet || now.Sub(p.lastGrow) < growStep {
+		return
+	}
+
+	p.width++
+	p.lastGrow = now
+	p.tokens <- struct{}{}
 }
 
 // payDebt reports whether a token coming back should be destroyed rather than

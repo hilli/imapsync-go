@@ -240,3 +240,127 @@ func TestDebtIsNotPaidOnceTheShutdownHasCounted(t *testing.T) {
 		t.Errorf("debt = %d, want 4: the closed pool must not have recorded a payment", debt)
 	}
 }
+
+// TestThePoolWidensAgainWhenTheServerRelents is the increase half, and the
+// reason it exists rather than a preference for symmetry.
+//
+// A connection limit is not a property of the server. What is available is
+// whatever the other clients on the account are not currently using, and
+// measuring mox showed it moving between 29 and at least 36 inside twelve
+// minutes. A governor that only shrinks treats the narrowest moment it ever met
+// as permanent, which on an hours-long run is most of the run.
+func TestThePoolWidensAgainWhenTheServerRelents(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	p := poolForClock(t, 16)
+	p.now = func() time.Time { return now }
+	p.open = 4
+	p.lastOK = now
+
+	if !p.refused(io.ErrUnexpectedEOF) {
+		t.Fatal("a refusal at the wall was not recognised")
+	}
+	if got := p.Width(); got != 4 {
+		t.Fatalf("Width() = %d after the refusal, want 4", got)
+	}
+
+	// The server stops refusing. Each step needs the quiet period behind it and
+	// the step interval since the last one.
+	now = now.Add(growQuiet)
+	for range 100 {
+		now = now.Add(growStep)
+		p.grow()
+	}
+
+	if got := p.Width(); got != 16 {
+		t.Errorf("Width() = %d after the server stopped refusing, want it back at the cap of 16", got)
+	}
+
+	// A hundred attempts against a cap of 16 is the assertion that matters:
+	// growth stops at what the pool was given rather than inventing capacity
+	// nobody asked for.
+	if got := len(p.tokens); got > 16 {
+		t.Errorf("%d tokens in the channel, want no more than the cap of 16", got)
+	}
+}
+
+// TestAPoolStillMeetingTheWallDoesNotWiden. Growth waits on quiet, not on the
+// clock alone, or the pool would walk straight back into a wall it just met and
+// spend the run alternating between refused and shrunk.
+func TestAPoolStillMeetingTheWallDoesNotWiden(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	p := poolForClock(t, 16)
+	p.now = func() time.Time { return now }
+	p.open = 4
+	p.lastOK = now
+
+	if !p.refused(io.ErrUnexpectedEOF) {
+		t.Fatal("a refusal at the wall was not recognised")
+	}
+
+	// Time passes, but the server refuses again just before each attempt.
+	for range 20 {
+		now = now.Add(growQuiet + growStep)
+		p.lastOK = now
+		p.refused(io.ErrUnexpectedEOF)
+		p.grow()
+	}
+
+	if got := p.Width(); got != 4 {
+		t.Errorf("Width() = %d while the server was still refusing, want it held at 4", got)
+	}
+}
+
+// TestGrowthIsDrivenByWorkFinishing. Growth hangs off released leases rather
+// than a ticker, so that the pool widens only while work is flowing and nothing
+// has to be shut down. That wiring is the part a test can lose without noticing.
+func TestGrowthIsDrivenByWorkFinishing(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	p := poolForClock(t, 16)
+	p.now = func() time.Time { return now }
+	p.open = 4
+	p.lastOK = now
+
+	if !p.refused(io.ErrUnexpectedEOF) {
+		t.Fatal("a refusal at the wall was not recognised")
+	}
+	now = now.Add(growQuiet + growStep)
+
+	// A lease coming back clean, through the path a real one takes. The token
+	// has to be taken first, because the pool starts holding all of them.
+	<-p.tokens
+	p.put(&conn{}, nil)
+
+	if got := p.Width(); got != 5 {
+		t.Errorf("Width() = %d after a lease finished cleanly, want 5: releasing work is what drives growth", got)
+	}
+}
+
+// TestAFailedLeaseDoesNotWidenThePool. The evidence for widening is work that
+// succeeded. A lease that came back with an error is the opposite.
+func TestAFailedLeaseDoesNotWidenThePool(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	p := poolForClock(t, 16)
+	p.now = func() time.Time { return now }
+	p.open = 4
+	p.lastOK = now
+
+	if !p.refused(io.ErrUnexpectedEOF) {
+		t.Fatal("a refusal at the wall was not recognised")
+	}
+	now = now.Add(growQuiet + growStep)
+
+	<-p.tokens
+	p.put(&conn{}, io.ErrUnexpectedEOF)
+
+	if got := p.Width(); got != 4 {
+		t.Errorf("Width() = %d after a lease failed, want it held at 4", got)
+	}
+}
