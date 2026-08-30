@@ -389,6 +389,42 @@ flag beating it and `auto` starting at 16 — a starting guess, not a
 measurement, because a governor that only ever gives capacity up cannot find a
 limit from below. `probe` measures; the config records what was measured.
 
+### The third run: the same account at the width it was configured for
+
+With the block honoured, `imapsync.yaml` asking for 40 and 24, and `--full` to
+force a complete diff of every folder rather than trusting the watermarks:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| width asked / actual | auto / **4+8** | auto / **4+8** | 40+24 / **40+24** |
+| elapsed | 2h49m01s | 2h01m43s | **1m27s** |
+| folders failed | 2 | 0 | 0 |
+| settled width | — (silent) | — (silent) | 40 and 24, both held |
+
+The first two are not comparable to the third — they were copying, and run 3
+had almost nothing left to copy — so this is not a 84x speedup in migration.
+What it does measure cleanly is the **diff**: 776,802 messages across 141
+folders, re-examined from scratch, in 87 seconds. 137 of the 141 folders were
+finished within the first 30.
+
+Two things worth having:
+
+- **40 connections to iCloud held for the whole run.** `probe` measures an
+  instantaneous ceiling by opening connections as fast as it can; that is not
+  the same claim as holding them open under sustained load, and the config now
+  tells people to write the probed number down. It survives the stronger test.
+- **Neither pool shrank, and this time that is informative.** mox refuses past
+  30 and was asked for 24, so there was no wall to find. Question 1 stays open
+  for a reason that is now precise rather than mysterious: answering it means
+  deliberately asking a server for more than it will give.
+
+The run exits non-zero, and will do so for ever, because of the two messages
+mox refuses to preview. Nothing records a permanent failure, so they are
+retried every run. Two messages is not worth a state migration, but a scheduled
+sync reporting failure on every single run is a real cost, and it is the first
+concrete argument for the permanent-failure state this design has kept
+deferring.
+
 ### Two folder-level observations worth keeping
 
 - **A failed folder is retried, and the retry works.** INBOX failed at 18:05 on
