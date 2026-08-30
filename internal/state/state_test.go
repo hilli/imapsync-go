@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -741,5 +742,28 @@ func TestForgettingIsScopedToOneNumbering(t *testing.T) {
 	}
 	if len(kept) != 1 {
 		t.Errorf("%d rows left at the other numbering, want 1: the delete reached past its own", len(kept))
+	}
+}
+
+// A percent sign in a path is meaningful to SQLite's URI parser and not to the
+// filesystem, so an unescaped DSN sends the driver looking somewhere else and
+// reports the user's own directory as unopenable.
+func TestAPathWithAPercentSignOpens(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "Rejsen 50% #1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(dir, "state.db")
+
+	db, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open(%q) error = %v", path, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the database was not created where it was asked for: %v", err)
 	}
 }

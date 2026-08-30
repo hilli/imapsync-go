@@ -132,18 +132,30 @@ folder may legitimately be named `2024` or even `0000410000`. It is outside the
 safe set of §4.5, so a real folder by that name is percent-encoded and cannot
 collide; it also sorts ahead of ordinary names, so the splits group together.
 
-**Decided when the folder is created and never revisited.** The source's
-message count is known from `Select` before the destination folder is made, so
-the choice is made once, from the real number. Re-splitting later would move
-every file in the folder — which would break the write-once property of §2.3
-and make the next incremental backup re-copy the entire folder, the exact cost
-this design exists to avoid. A folder that starts small and grows past the
-threshold therefore stays flat. Re-splitting on request is a later feature if
-it is ever wanted; doing it automatically is not.
+**A pure function of the UID, decided nowhere.** *Revised during
+implementation.* This section originally said the choice was made once when the
+folder was created, from the source's message count. It cannot be: the seam the
+store plugs into is `CreateFolder(ctx, name)`, which carries a name and nothing
+else. The count is known to the syncer and never reaches the backend, and
+widening the interface to pass it would change every implementation of it to
+serve one.
 
-Which layout a folder uses is read from the disk, not the database: a folder
-containing `+` directories is split. Consistent with §4.1, and it means the
-layout survives losing the database.
+The rule is instead read straight off the UID — flat below 10,000, sharded
+above — which turns out to be better than what it replaced rather than a
+concession to it. There is no decision to record, so nothing to store, nothing
+to migrate, and no way for the database and the disk to disagree about it. A
+message's directory is computable from its name alone, so **no file ever
+moves**, which is the write-once property of §2.3 obtained by construction
+instead of by care.
+
+The cost is that the first 9,999 messages of a large folder sit flat while the
+rest are sharded. That is a cosmetic irregularity in a folder large enough that
+nobody browses the whole of it, and it buys the guarantee that a folder growing
+past the threshold never rewrites what it already had.
+
+Which layout a folder uses is therefore not read from anywhere. Consistent with
+§4.1 in the strongest available sense: there is no second copy of the fact to
+diverge.
 
 ### 2.3 Message files are immutable
 
@@ -493,9 +505,20 @@ each arm of the reconciliation, and confirm a named test fails.
 
 ## 8. Milestones
 
-- **L0** — the store: create, list, select, append, fetch, flags, delete, UID
-  allocation, the split layout of §2.2, and the reconciliation of §4.1. Local →
-  local sync in tests.
+- **L0 — done.** The store: create, list, select, append, fetch, flags, delete,
+  UID allocation, the split layout of §2.2, and the reconciliation of §4.1.
+  `internal/localstore` implements `imapx.Conn` in full, so it plugs into the
+  existing pools, governor, state database, adoption and filters unchanged.
+  The IMAP → disk → IMAP round trip of L2 is already asserted in tests against
+  go-imap's in-memory server, ahead of the command-line wiring.
+
+  Three things the design did not anticipate, each found by a test rather than
+  by reading: `CreateFolder` carries no message count (§2.2, revised); an
+  account needs an INBOX nobody creates (decision 12); and a folder name
+  containing `%` — `Rejsen 50%` — broke the SQLite DSN, because SQLite decodes
+  `%HH` in a `file:` URI. The last was a live bug in `internal/state` too,
+  where it was worse: rather than failing, it silently put the state database
+  somewhere else.
 - **L1** — wire it into config and the `sync` command as either endpoint.
   IMAP → local backup works end to end, quiescent when it finishes.
 - **L2** — restore, which is L1 with the endpoints swapped, plus the round-trip
@@ -526,9 +549,10 @@ each arm of the reconciliation, and confirm a named test fails.
 6. **A missing folder database means a new UIDVALIDITY**, because a rebuilt
    `uidnext` can reuse numbers that deleted messages already had. A *stale*
    one does not, because `uidnext` is monotonic.
-7. **Folders over 10,000 messages are split by UID range**, decided once at
-   creation. Costs a folder that grows past the threshold staying flat, which
-   is cheaper than re-splitting and re-copying it in every later backup.
+7. **Messages above UID 10,000 are split by UID range**, as a pure function
+   of the UID rather than a decision made at creation — see §2.2, where
+   implementation disproved the original premise. Costs a large folder having
+   its first 9,999 messages flat; buys never moving a file.
 8. **Both file timestamps carry INTERNALDATE**, so Finder's date columns mean
    something. Verified: `ATTR_CMN_CRTIME` via `unix.Setattrlist` sets
    `st_birthtime` and `stat` confirms it. macOS and BSD only.
@@ -538,6 +562,11 @@ each arm of the reconciliation, and confirm a named test fails.
 10. **No subject in the filename.** The UID is the name; the date comes from
     the file's timestamps and the subject from opening it.
 11. **Restore in the first milestones**, on the FAQ's warning.
+12. **A store always has an INBOX.** *Added during implementation.* Every IMAP
+    account has one and nothing creates it, because on a real server it is
+    always already there; a sync appends to the destination's INBOX expecting
+    it to exist. A store presenting itself as an account has to supply the one
+    mailbox an account is guaranteed to have.
 
 Nothing here is still open. What was open at the previous revision is settled
 above: the Finder question by decision 7, the subject question by decision 10,

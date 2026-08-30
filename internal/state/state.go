@@ -125,8 +125,13 @@ CREATE INDEX IF NOT EXISTS messages_by_ident ON messages (folder_id, ident_hash)
 // WAL is enabled because M2 runs many connections against this file at once,
 // and a busy timeout is set so a concurrent writer waits rather than failing
 // the run outright.
+//
+// The path is escaped because SQLite decodes %HH in a file: URI, so a state
+// database under a directory whose name contains a percent sign — which is a
+// path the user chose, not one we did — would otherwise be looked for
+// somewhere else and reported as missing.
 func Open(ctx context.Context, path string) (*DB, error) {
-	dsn := "file:" + path +
+	dsn := "file:" + escapeDSNPath(path) +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(10000)" +
 		"&_pragma=foreign_keys(1)" +
@@ -661,3 +666,7 @@ func (d *DB) ForgetMessages(ctx context.Context, folderID int64, srcUIDValidity 
 	}
 	return tx.Commit()
 }
+
+// escapeDSNPath hides from SQLite's URI parser the three characters that mean
+// something to it, so that a filesystem path is read as itself.
+var escapeDSNPath = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace
