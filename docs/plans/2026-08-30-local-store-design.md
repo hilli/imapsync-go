@@ -519,10 +519,10 @@ each arm of the reconciliation, and confirm a named test fails.
   `%HH` in a `file:` URI. The last was a live bug in `internal/state` too,
   where it was worse: rather than failing, it silently put the state database
   somewhere else.
-- **L1** — wire it into config and the `sync` command as either endpoint.
+- **L1 — done.** Wired into config and the `sync` command as either endpoint.
   IMAP → local backup works end to end, quiescent when it finishes.
-- **L2** — restore, which is L1 with the endpoints swapped, plus the round-trip
-  test that proves it.
+- **L2 — done.** Restore, which is L1 with the endpoints swapped, plus the
+  round-trip test that proves it. Measured against real mail in §10.
 - **Later, if asked** — one-way mbox export for other tools; re-splitting a
   folder that outgrew its layout; a header index if L1 measures the scan as
   painful.
@@ -573,3 +573,80 @@ above: the Finder question by decision 7, the subject question by decision 10,
 and the WAL question by §5 — which turned out to have an answer better than the
 procedural one, since SQLite's rule is about transactions in progress rather
 than about the copy, and the store can simply not have any at rest.
+
+## 10. What the measurement found
+
+Everything above was written before any of it had touched real mail. This
+section is what happened when it did: an 11,770-message `Sent` mailbox, backed
+up to disk and restored twice, the second time after deleting the state
+database.
+
+### 10.1 The backup
+
+11,770 messages in 1m22s, 703 MB on disk, 142.8 copied/second across 16
+connections a side. Nothing surprising, which is the point — the store is an
+`imapx.Conn` like any other, so it inherited the pools and the governor without
+knowing it.
+
+### 10.2 The claim that had never been tested
+
+§4.1 says the filesystem is the truth and the database only annotates it, and
+§4.2 names the one thing a lost database costs. Neither had been tried. The
+question a backup has to answer is blunt: **if the state database is gone, does
+restoring duplicate the mail?**
+
+Restore, delete the state database, restore again. Adoption has to recognise
+every message from its content alone.
+
+**11,751 of 11,770 were adopted. Nineteen were copied a second time.**
+
+### 10.3 The nineteen, predicted before they were observed
+
+The nineteen were not an adoption failure. Scanning the backup on disk — the
+messages themselves, independent of any server — found **exactly 19 with a
+header line longer than 1000 bytes, and none longer than 8192**.
+
+Those two numbers are mox's parse limit under `Pedantic: true` and `false`
+respectively. A message whose header holds a line over the limit is stored with
+its body starting at offset 0, so `BODY[HEADER]` comes back empty. A message
+with no header cannot be digested, so it cannot be adopted, so it is copied
+again.
+
+That made the outcome predictable from the data before the experiment ran, and
+it explains a discrepancy that had been confusing: the **real** server returned
+all 11,770 headers and reported nothing wrong, because its limit is 8192 and no
+message crossed it. `mox localserve` hardcodes `Pedantic: true`, so the same
+mail breaks there at 1000. The bug was always present on the real server; the
+mail had simply never been long enough to find it.
+
+Repeating the restore against a mox built with the fix — mjl-/mox#468 — closes
+it:
+
+| destination | copied on the second restore | adopted | reported | mailbox holds |
+|---|---|---|---|---|
+| mox as shipped | **19** | 11,751 | 19 headerless on the destination | 11,789 |
+| mox with #468 | **0** | 11,770 | nothing to report | **11,770** |
+
+Nineteen predicted from the files, nineteen reported by the run, nineteen
+duplicates on the server, and zero of each once the server was fixed. No false
+positives and no misses.
+
+### 10.4 What this does and does not establish
+
+**Established.** A lost state database costs nothing. Adoption reconstructs the
+mapping from message content, and the database is a cache in the sense §4.1
+claimed rather than in the sense a design document usually means it. The store
+is therefore a backup and not merely a copy: it can be handed to a server that
+has never seen it, twice, without growing duplicates.
+
+Also established, unexpectedly: the run **says** when a server will not return
+headers. That count was added because of these nineteen, and it is the only
+thing standing between this failure and silence — the messages copy, no folder
+fails, and the exit code is zero.
+
+**Not established.** One folder on one server. The restore ran at 13
+messages/second against `localserve`, an eleventh of the backup's rate, and
+that number describes a development server rather than this tool or a real one.
+Restore throughput against a production server is unmeasured. Nothing here
+tests a folder large enough to split under §2.2, and nothing tests a backup
+taken while the source is being written to.
