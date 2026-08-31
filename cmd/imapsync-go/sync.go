@@ -1138,11 +1138,17 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 // helped. Adopted and already-recorded messages are left out: they cost a
 // header comparison rather than a transfer, and counting them would flatter a
 // re-run into looking like a fast copy.
+//
+// The label has to carry that qualification, because the number sits beside the
+// adoption count and cannot be read without it. A run that settled 11,770
+// messages in 37 seconds by adopting all but 19 of them reports 0.5, and "0.5
+// messages/second" next to "11751 adopted" reads as a stall rather than as the
+// fastest outcome a re-run has.
 func rate(copied int, elapsed time.Duration, dryRun bool) string {
 	if dryRun || copied == 0 || elapsed <= 0 {
 		return ""
 	}
-	return fmt.Sprintf(" (%.1f messages/second)", float64(copied)/elapsed.Seconds())
+	return fmt.Sprintf(" (%.1f copied/second)", float64(copied)/elapsed.Seconds())
 }
 
 func plural(n int, word string) string {

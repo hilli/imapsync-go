@@ -550,3 +550,35 @@ func TestAHealthyRunSaysNothingAboutHeaders(t *testing.T) {
 		t.Errorf("a healthy run warned about headers:\n%s", out.String())
 	}
 }
+
+// TestTheRateSaysWhatItCounted.
+//
+// The rate counts copies alone, which is the right number for tuning but the
+// wrong one to label "messages/second" when it is printed beside the adoption
+// count. A restore that lost its state database settled 11,770 messages in 37
+// seconds by adopting all but 19, and reported 0.5 — a figure that reads as a
+// stall unless the label says which of the two counts it came from.
+func TestTheRateSaysWhatItCounted(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{
+			{Source: "Sent", Dest: "Sent", Messages: 11770, Copied: 19, Adopted: 11751},
+		},
+	}
+
+	var out bytes.Buffer
+	if err := writeSyncReport(&out, report, 38*time.Second, false, nil); err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "0.5 copied/second") {
+		t.Errorf("want the rate labelled by what it counted, got:\n%s", got)
+	}
+	// The adopted messages are the ones the label exists to disown. If the rate
+	// ever counts them, it is no longer the transfer number anyone tunes with.
+	if strings.Contains(got, "309.7") || strings.Contains(got, "messages/second") {
+		t.Errorf("the rate must count copies alone, and say so, got:\n%s", got)
+	}
+}

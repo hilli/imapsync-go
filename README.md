@@ -136,7 +136,7 @@ SOURCE  DESTINATION  MESSAGES  COPIED  ADOPTED  ALREADY  FAILED
 INBOX   INBOX        2         2       0        0        0
 Work    Work         1         1       0        0        0
 
-2 folders, 3 copied, 0 adopted, 0 failed, in 5ms (600.0 messages/second)
+2 folders, 3 copied, 0 adopted, 0 failed, in 5ms (600.0 copied/second)
 ```
 
 Use `--dry-run` first: it reports the folders it would create and the messages
