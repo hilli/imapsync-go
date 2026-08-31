@@ -136,8 +136,60 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 		DebugWriter: newTraceWriter(opts.DebugWriter),
 	}
 
+	secret, err := opts.Credential.Secret(dialCtx)
+	if err != nil {
+		return nil, fmt.Errorf("credentials for %s: %w", opts.Addr.User, err)
+	}
+
+	client, err := establish(dialCtx, opts, clientOpts, tlsConfig, timeout, secret)
+	if err == nil {
+		return &conn{c: client}, nil
+	}
+
+	// One retry, and only when the credential says it has something better.
+	//
+	// This is the asymmetry Pool.ready already uses for SELECT, read for
+	// credentials: a secret that was just produced and is still refused is the
+	// server's answer, and asking again asks the same question, while one that
+	// had been held for a while has proven nothing recent. The decision never
+	// depends on why the server refused, only on whether we were holding
+	// something that could be out of date, so there is no table of
+	// per-provider refusal spellings to keep up to date.
+	var refused *credentialRefusedError
+	if !errors.As(err, &refused) {
+		return nil, err
+	}
+
+	replacement, better, refreshErr := opts.Credential.Refresh(dialCtx, secret)
+	if refreshErr != nil {
+		// Both are causes: the server refused, and the attempt to answer that
+		// refusal failed. Wrapping only the second would hide which credential
+		// the server was objecting to.
+		return nil, fmt.Errorf("renewing credentials for %s after %w: %w", opts.Addr.User, err, refreshErr)
+	}
+	if !better {
+		return nil, err
+	}
+
+	client, err = establish(dialCtx, opts, clientOpts, tlsConfig, timeout, replacement)
+	if err != nil {
+		return nil, fmt.Errorf("with renewed credentials: %w", err)
+	}
+	return &conn{c: client}, nil
+}
+
+// establish makes one complete attempt at a session: transport, TLS, and
+// authentication with the secret it is given.
+//
+// The retry above dials again rather than offering the second secret on this
+// connection, which costs a handshake on the rare expiry path and buys two
+// things. A server is free to drop the connection after refusing credentials,
+// and some do. And XOAUTH2 reports failure as a challenge the client must
+// answer, so a refused exchange leaves the connection mid-command; reusing it
+// would send the next command where the server expects a SASL response.
+func establish(ctx context.Context, opts DialOptions, clientOpts *imapclient.Options, tlsConfig *tls.Config, timeout time.Duration, secret string) (*imapclient.Client, error) {
 	addr := opts.Addr.HostPort()
-	raw, err := dialRaw(dialCtx, opts.Addr, tlsConfig, timeout)
+	raw, err := dialRaw(ctx, opts.Addr, tlsConfig, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +206,7 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		client, err := authenticate(dialCtx, raw, clientOpts, opts)
+		client, err := authenticate(raw, clientOpts, opts, secret)
 		done <- result{client, err}
 	}()
 
@@ -164,9 +216,9 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 			_ = raw.Close()
 			return nil, r.err
 		}
-		return &conn{c: r.client}, nil
+		return r.client, nil
 
-	case <-dialCtx.Done():
+	case <-ctx.Done():
 		// Closing the socket unblocks the goroutine; collect whatever it
 		// produces so neither the client nor its read loop is left running.
 		_ = raw.Close()
@@ -175,7 +227,7 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 				_ = r.client.Close()
 			}
 		}()
-		return nil, fmt.Errorf("establishing session with %s: %w", addr, dialCtx.Err())
+		return nil, fmt.Errorf("establishing session with %s: %w", addr, ctx.Err())
 	}
 }
 
@@ -205,9 +257,28 @@ func dialRaw(ctx context.Context, endpoint config.Address, tlsConfig *tls.Config
 	}
 }
 
-// authenticate upgrades the transport if needed and logs in. It blocks until
-// the server answers, so Dial runs it under a context race.
-func authenticate(ctx context.Context, raw net.Conn, clientOpts *imapclient.Options, opts DialOptions) (*imapclient.Client, error) {
+// credentialRefusedError marks the point where the server rejected the secret we
+// offered, as distinct from every other way a session can fail to establish.
+//
+// The distinction is structural rather than a reading of the server's words:
+// it says only that we got far enough to offer a credential and were turned
+// down, which is what makes it safe to ask the credential for a better one.
+// Nothing here interprets *why* the server refused, so there is no table of
+// per-provider refusal spellings to maintain.
+type credentialRefusedError struct {
+	user string
+	err  error
+}
+
+func (e *credentialRefusedError) Error() string {
+	return fmt.Sprintf("authenticating as %s: %v", e.user, e.err)
+}
+
+func (e *credentialRefusedError) Unwrap() error { return e.err }
+
+// authenticate upgrades the transport if needed and offers the secret. It
+// blocks until the server answers, so establish runs it under a context race.
+func authenticate(raw net.Conn, clientOpts *imapclient.Options, opts DialOptions, secret string) (*imapclient.Client, error) {
 	addr := opts.Addr.HostPort()
 
 	var client *imapclient.Client
@@ -221,44 +292,22 @@ func authenticate(ctx context.Context, raw net.Conn, clientOpts *imapclient.Opti
 		client = imapclient.New(raw, clientOpts)
 	}
 
-	secret, err := opts.Credential.Secret(ctx)
-	if err != nil {
+	if err := offer(client, opts.Credential.Mechanism(), opts.Addr.User, secret); err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("credentials for %s: %w", opts.Addr.User, err)
-	}
-
-	refused := client.Login(opts.Addr.User, secret).Wait()
-	if refused == nil {
-		return client, nil
-	}
-
-	// One retry, and only when the credential says it has something better.
-	//
-	// This is the asymmetry Pool.ready already uses for SELECT, read for
-	// credentials: a secret that was just produced and is still refused is the
-	// server's answer, and asking again asks the same question, while one that
-	// had been held for a while has proven nothing recent. The decision never
-	// depends on why the server refused, only on whether we were holding
-	// something that could be out of date, so there is no table of
-	// per-provider refusal spellings to keep up to date.
-	replacement, better, err := opts.Credential.Refresh(ctx, secret)
-	if err != nil {
-		_ = client.Close()
-		// Both are causes: the server refused, and the attempt to answer that
-		// refusal failed. Wrapping only the second would hide which credential
-		// the server was objecting to.
-		return nil, fmt.Errorf("renewing credentials for %s after %w: %w", opts.Addr.User, refused, err)
-	}
-	if !better {
-		_ = client.Close()
-		return nil, fmt.Errorf("authenticating as %s: %w", opts.Addr.User, refused)
-	}
-
-	if err := client.Login(opts.Addr.User, replacement).Wait(); err != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("authenticating as %s with renewed credentials: %w", opts.Addr.User, err)
+		return nil, &credentialRefusedError{user: opts.Addr.User, err: err}
 	}
 	return client, nil
+}
+
+// offer presents the secret using the mechanism the credential asks for.
+func offer(client *imapclient.Client, mech Mechanism, user, secret string) error {
+	switch mech {
+	case MechanismXOAUTH2:
+		return client.Authenticate(newXOAUTH2Client(user, secret))
+
+	default:
+		return client.Login(user, secret).Wait()
+	}
 }
 
 func (c *conn) Caps() Caps {

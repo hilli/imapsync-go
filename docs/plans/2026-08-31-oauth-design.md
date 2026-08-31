@@ -104,15 +104,35 @@ twenty-five lines implementing `sasl.Client`.
 - `Start()` returns `("XOAUTH2", []byte("user=" + user + "\x01auth=Bearer " +
   token + "\x01\x01"))`.
 - `Next(challenge)` parses the provider's JSON error and returns it, which
-  makes go-imap cancel the exchange and surface the tagged `NO`.
+  carries the provider's reason (`{"status":"401","schemes":"Bearer",...}`)
+  into the error text instead of a bare "authentication failed".
 
 The second point is the awkward part of XOAUTH2: a failure arrives as a
-*challenge* rather than as a refusal, and a client that does not answer it can
-desynchronise the connection. `go-sasl`'s own `oauthBearerClient.Next` does
-exactly this — unmarshal, return the error — so this follows the library's
-handling rather than inventing one. The payoff is that the provider's reason
-(`{"status":"401","schemes":"Bearer","scope":...}`) reaches the error text
-instead of a bare "authentication failed".
+*challenge* rather than as a refusal. `go-sasl`'s own `oauthBearerClient.Next`
+unmarshals and returns the error, and this follows it.
+
+**Correction, found while implementing.** This section first said that
+returning an error from `Next` "makes go-imap cancel the exchange and surface
+the tagged `NO`". Reading `imapclient/authenticate.go` disproves it: on an
+error from `Next` the client returns immediately, without sending the `*` that
+would cancel and without reading the tagged response. The connection is left
+mid-command, with the server still waiting for a SASL response.
+
+That mattered, because §2.2's retry offered the second secret on the *same*
+connection. For LOGIN that is legal; for XOAUTH2 it would have sent the next
+command where the server expects a continuation response — a desynchronised
+session, and the kind of failure that appears only against a real provider.
+
+**The retry now dials again rather than reusing the connection.** It costs one
+handshake on the expiry path, which happens about once an hour per pool, and it
+buys two things beyond correcting the bug. It is mechanism-independent, so
+nothing about the retry depends on how the secret was presented. And it settles
+the question O0 left open and marked for O3 — whether a second `LOGIN` on one
+connection is universally safe, given that some servers disconnect after a
+failed attempt — by never asking it.
+
+A test asserts one connection per attempt, so the property is not left to the
+comment that explains it.
 
 **Tracing needs no change.** `internal/imapx/trace.go` already keeps `tag
 AUTHENTICATE <mechanism>` and redacts an inline initial response, as well as
@@ -226,12 +246,13 @@ that exists — is where every bug this project has found has lived.
 
 ## 8. Milestones
 
-- **O0** — the `Credential` interface, with static passwords as the only
+- **O0** *(done, `ab3afb9`)* — the `Credential` interface, with static passwords as the only
   implementation. No behaviour change at all. It is the riskiest edit in the
   design, because it touches the path every existing run takes, so it happens
   alone and is judged by the existing suite passing unchanged.
-- **O1** — XOAUTH2, the command and file sources, the cache and its
-  compare-and-swap, and the proxy harness.
+- **O1** *(done)* — XOAUTH2, the command and file sources, the cache and its
+  compare-and-swap, and the proxy harness. Nothing reaches a user yet: no
+  configuration names a token source until O2.
 - **O2** — compat translations, `probe`, configuration, documentation.
 - **O3** — verification against real Gmail and Office 365 accounts.
 

@@ -1,6 +1,8 @@
 package imapx
 
-import "context"
+import (
+	"context"
+)
 
 // Credential answers with the secret to authenticate with.
 //
@@ -29,7 +31,24 @@ type Credential interface {
 	// the first replaces it, and the rest find it already replaced and take
 	// the replacement without minting anything.
 	Refresh(ctx context.Context, stale string) (string, bool, error)
+
+	// Mechanism names how the secret should be presented to the server.
+	Mechanism() Mechanism
 }
+
+// Mechanism is the SASL mechanism, or LOGIN, that a credential is presented
+// with. The credential decides: a token cannot be sent by LOGIN and a password
+// has no business in an XOAUTH2 exchange, so a separate switch could only ever
+// contradict the secret it applies to.
+type Mechanism string
+
+const (
+	// MechanismLogin is the IMAP LOGIN command rather than a SASL mechanism.
+	MechanismLogin Mechanism = "LOGIN"
+
+	// MechanismXOAUTH2 is Google's and Microsoft's bearer-token mechanism.
+	MechanismXOAUTH2 Mechanism = "XOAUTH2"
+)
 
 // StaticPassword is a credential that is already known and cannot be renewed.
 func StaticPassword(password string) Credential { return staticPassword(password) }
@@ -43,3 +62,5 @@ func (p staticPassword) Secret(context.Context) (string, error) { return string(
 func (p staticPassword) Refresh(context.Context, string) (string, bool, error) {
 	return "", false, nil
 }
+
+func (p staticPassword) Mechanism() Mechanism { return MechanismLogin }

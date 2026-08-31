@@ -26,6 +26,9 @@ type scriptedCredential struct {
 	// refreshErr, when set, makes Refresh fail rather than decline.
 	refreshErr error
 
+	// mech is how the secret is presented. Zero means LOGIN.
+	mech Mechanism
+
 	secrets   atomic.Int32
 	refreshes atomic.Int32
 	sawStale  atomic.Value
@@ -49,6 +52,13 @@ func (c *scriptedCredential) Refresh(_ context.Context, stale string) (string, b
 		return "", false, nil
 	}
 	return c.better, true, nil
+}
+
+func (c *scriptedCredential) Mechanism() Mechanism {
+	if c.mech == "" {
+		return MechanismLogin
+	}
+	return c.mech
 }
 
 func dialCredential(t *testing.T, srv *fakeServer, cred Credential) (Conn, error) {
