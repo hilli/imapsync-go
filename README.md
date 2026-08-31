@@ -129,7 +129,7 @@ go run ./cmd/imapsync-go sync \
     --source-url 'imaps://you%40icloud.com@imap.mail.me.com' \
     --source-password-env ICLOUD_APP_PW \
     --dest-url 'imaps://you%40example.com@outlook.office365.com' \
-    --dest-oauth-cmd 'az account get-access-token --resource https://outlook.office365.com --query accessToken -o tsv'
+    --dest-oauth-cmd ~/bin/office365-token
 ```
 
 The command runs when a token is first needed, and **runs again when the
@@ -147,28 +147,44 @@ A token on the command line -- imapsync's `--oauthdirect1` -- is refused. It is
 readable by every process on the machine through `ps`, and it expires within
 the hour, which is the failure this feature exists to prevent.
 
-Getting a token is the provider's business rather than this tool's. Two
-recipes that work today:
+Getting a token is the provider's business rather than this tool's, and both
+big providers make it harder than a one-liner. **The cloud CLIs cannot do it.**
+`az account get-access-token` mints a token whose scope is `user_impersonation`
+and Exchange Online answers `NO AUTHENTICATE failed.`; `gcloud auth
+print-access-token` likewise has no `https://mail.google.com/` scope. Both were
+tried against the live servers before this paragraph was written.
 
-```sh
-# Microsoft 365, via the Azure CLI:
-az login
-az account get-access-token --resource https://outlook.office365.com \
-    --query accessToken -o tsv
+What each provider actually needs:
 
-# Gmail, via the Google Cloud CLI. The account needs the
-# https://mail.google.com/ scope, which is restricted; for a personal account
-# an app password is usually the simpler route.
-gcloud auth print-access-token
-```
+- **Microsoft 365** — register an application in Entra ID and give it the
+  delegated `IMAP.AccessAsUser.All` permission from the *Office 365 Exchange
+  Online* API, with admin consent. Then mint tokens for it with a device-code
+  or authorization-code flow. Microsoft's
+  [Authenticate an IMAP, POP or SMTP connection using OAuth][ms-oauth] is the
+  reference.
+- **Gmail** — the `https://mail.google.com/` scope is restricted, so a project
+  requesting it needs Google's verification unless the account is inside your
+  own Workspace organisation. For a personal account an app password with
+  `--dest-password-env` is far less work.
+
+[ms-oauth]: https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
+
+Whatever you end up with, `--source-oauth-cmd` wants a command that prints a
+current access token on stdout. A three-line shell script wrapping your
+refresh-token exchange is the usual shape, and it is what makes an expiry
+mid-migration survivable.
 
 Confirm one before starting a long migration:
 
 ```sh
 go run ./cmd/imapsync-go probe \
     --url 'imaps://you%40example.com@outlook.office365.com' \
-    --oauth-cmd 'az account get-access-token --resource https://outlook.office365.com --query accessToken -o tsv'
+    --oauth-cmd ~/bin/office365-token
 ```
+
+`probe --trace` prints the exchange with the token redacted and the server's
+verdict intact, which is usually enough to tell a wrong scope from a wrong
+account.
 
 
 ## sync

@@ -244,6 +244,79 @@ The re-mint path fires on a real refusal. The harness only proves it fires on a
 refusal we wrote ourselves. That gap — between a server we imagined and a server
 that exists — is where every bug this project has found has lived.
 
+### 7.2 What reality said
+
+Run against live Exchange Online (`outlook.office365.com`), and against iCloud
+and mox for comparison.
+
+**Question 1, the framing: answered, and it is right.** Exchange advertises
+`AUTH=XOAUTH2` and `SASL-IR`, parsed our inline initial response, and rejected
+it on the merits rather than on syntax. iCloud advertises `AUTH=XOAUTH2` too;
+mox does not, offering only SCRAM, CRAM-MD5 and PLAIN.
+
+**Question 3, the stale token: answered for Microsoft, and not as assumed.**
+Exchange sends **no challenge at all**. It goes straight to the tagged
+`NO AUTHENTICATE failed.` — there is no base64 JSON status document to read.
+Verified twice: through our client, and by hand over a raw TLS socket to rule
+out our own parsing.
+
+iCloud does the same, answering a junk token with
+`NO [AUTHENTICATIONFAILED] Invalid credentials` and no challenge either. Two of
+the two real XOAUTH2 servers reachable from here never send one.
+
+That vindicates §2's decision to treat a refusal **structurally** rather than by
+reading the server's text. A design that classified errors by parsing the
+challenge would have had nothing whatever to parse against either provider —
+including the one this feature exists for.
+
+The re-mint was then confirmed end to end against that real refusal: the token
+command ran **twice**, and the second dial was declined by the `fresh == stale`
+guard because the minting command returned its cached token. One clear error,
+no loop — the behaviour §7 specifies, now observed against a refusal we did not
+write.
+
+**Still unverified: a successful XOAUTH2 authentication.** Reaching one needs a
+token with `IMAP.AccessAsUser.All`, which no cloud CLI will mint (below), so it
+waits for an account with an app registration behind it.
+
+#### The recipes in the first draft of the documentation were wrong
+
+Worth recording because it is the same mistake this project keeps catching:
+something written from memory, that reality then refused.
+
+`az account get-access-token --resource https://outlook.office365.com` returns a
+token with the right audience and the right account whose scope is
+`user_impersonation`, not `IMAP.AccessAsUser.All`. Exchange refuses it. The
+Azure CLI's first-party application simply does not hold the IMAP permission,
+and neither does the gcloud CLI hold `https://mail.google.com/`. Both providers
+require an app registration of your own. The README now says so, having been
+corrected by a live server rather than by review.
+
+#### A trace that hid the only line explaining the failure
+
+Found while diagnosing the above, and fixed. The redactor armed its SASL
+suppression when it saw `AUTHENTICATE`, on the assumption that the client's
+payload came next. With `SASL-IR` the payload is already inline, so nothing
+follows — and the next line is the server's verdict, which was duly redacted as
+`<redacted SASL payload>`.
+
+So a trace of a failed authentication showed everything except the failure.
+Invisible against mox and iCloud, which challenge; guaranteed against Exchange,
+which does not.
+
+The suppression is now armed by the server's continuation instead, which is the
+only thing a client SASL payload ever follows — in both framings, with and
+without `SASL-IR`. Two tests hold the halves apart: the refusal is shown, and a
+challenged payload is still hidden. Confirmed against iCloud, which now traces
+its refusal in full with the token still redacted.
+
+Mutation testing then cut a guard the restructure had made redundant. Excluding
+a continuation from the *consuming* branch survived every test, and thinking
+about why showed it was on the wrong side of the redactor's own bias: after the
+move, that guard no longer protects a credential, and in the concatenated-line
+case the paranoia exists for it would print a line containing the payload.
+Hiding one server line beats showing one client secret.
+
 ## 8. Milestones
 
 - **O0** *(done, `ab3afb9`)* — the `Credential` interface, with static passwords as the only
@@ -253,8 +326,9 @@ that exists — is where every bug this project has found has lived.
 - **O1** *(done)* — XOAUTH2, the command and file sources, the cache and its
   compare-and-swap, and the proxy harness. Nothing reaches a user yet: no
   configuration names a token source until O2.
-- **O2** — compat translations, `probe`, configuration, documentation.
-- **O3** — verification against real Gmail and Office 365 accounts.
+- **O2** *(done, `739fd26`)* — compat translations, `probe`, configuration,
+  documentation.
+- **O3** *(partly done; see §7.2)* — verification against real providers.
 
 ## 9. Decisions and what they cost
 

@@ -170,3 +170,54 @@ func TestTraceWriterIsConcurrencySafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestASASLRefusalWithNoChallengeIsShown. Exchange Online refuses XOAUTH2 by
+// going straight to a tagged NO -- it sends no challenge at all, so there is no
+// client payload after the initial response. Arming the suppression on the
+// AUTHENTICATE command instead of on the challenge swallowed that verdict and
+// left a trace of an authentication failure with the failure removed.
+func TestASASLRefusalWithNoChallengeIsShown(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	w := newTraceWriter(&buf)
+
+	const token = "ya29.a0AfB_super_secret_token"
+	_, _ = w.Write([]byte("T2 AUTHENTICATE XOAUTH2 " + token + "\r\n"))
+	_, _ = w.Write([]byte("T2 NO AUTHENTICATE failed.\r\n"))
+
+	got := buf.String()
+	if strings.Contains(got, token) {
+		t.Fatalf("the inline token reached the trace:\n%s", got)
+	}
+	if !strings.Contains(got, "NO AUTHENTICATE failed.") {
+		t.Errorf("the server's refusal is missing from the trace:\n%s", got)
+	}
+	if !strings.Contains(got, "AUTHENTICATE XOAUTH2") {
+		t.Errorf("the trace lost the command that failed:\n%s", got)
+	}
+}
+
+// TestAChallengedSASLPayloadIsStillHidden guards the other half: when the
+// server does ask for more, the client's answer is a credential and must not
+// appear. Moving the suppression to the challenge must not have opened this.
+func TestAChallengedSASLPayloadIsStillHidden(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	w := newTraceWriter(&buf)
+
+	const proof = "cj1mNzRhZDIwMSxwPXNlY3JldHByb29m"
+	_, _ = w.Write([]byte("T2 AUTHENTICATE SCRAM-SHA-256 bixhPXVzZXI=\r\n"))
+	_, _ = w.Write([]byte("+ cj1mNzRhZDIwMSxzPXNhbHQ=\r\n"))
+	_, _ = w.Write([]byte(proof + "\r\n"))
+	_, _ = w.Write([]byte("T2 OK authenticated\r\n"))
+
+	got := buf.String()
+	if strings.Contains(got, proof) {
+		t.Fatalf("a challenged SASL payload reached the trace:\n%s", got)
+	}
+	if !strings.Contains(got, "T2 OK authenticated") {
+		t.Errorf("the trace lost the tagged result:\n%s", got)
+	}
+}

@@ -104,10 +104,12 @@ pairs:
         # printed. A migration outlives an access token -- an hour is typical
         # -- so this is what makes an overnight run possible at all. Whatever
         # the command prints is the token; trailing whitespace is trimmed.
-        command: >-
-          az account get-access-token
-          --resource https://outlook.office365.com
-          --query accessToken -o tsv
+        # Note that neither cloud CLI can do this: an `az account
+        # get-access-token` token carries user_impersonation rather than
+        # IMAP.AccessAsUser.All, and Exchange refuses it. Microsoft 365 needs
+        # an Entra ID app registration with that delegated permission, so
+        # this is normally a small script wrapping a refresh-token exchange.
+        command: ~/bin/office365-token
         # Bounds a command that hangs waiting for input it will never get.
         # Defaults to 30s.
         timeout: 30s

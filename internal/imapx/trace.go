@@ -36,6 +36,10 @@ type traceWriter struct {
 	w   io.Writer
 	buf []byte
 
+	// authInFlight marks that an AUTHENTICATE command has been sent and its
+	// tagged response has not arrived yet.
+	authInFlight bool
+
 	// pendingSASL marks that the next client line carries a SASL payload.
 	pendingSASL bool
 }
@@ -87,9 +91,27 @@ func (t *traceWriter) emit(line []byte) {
 // Mistaking server chatter for a command costs a mangled line in a diagnostic
 // dump, while the reverse mistake costs a password.
 func (t *traceWriter) redact(line string) string {
-	if t.pendingSASL && !isContinuation(line) && strings.TrimSpace(line) != "" {
-		t.pendingSASL = false
-		return "<redacted SASL payload>"
+	if strings.TrimSpace(line) != "" {
+		switch {
+		// Deliberately not excluding a continuation here. Once the payload
+		// is expected, hiding it matters more than showing the server line it
+		// might have been concatenated with -- and a concatenated "+ " and
+		// client response is precisely the case the paranoia above is for.
+		case t.pendingSASL:
+			t.pendingSASL, t.authInFlight = false, false
+			return "<redacted SASL payload>"
+
+		case t.authInFlight && isContinuation(line):
+			// The server is asking for the next SASL payload, so the client's
+			// following line is the thing to hide.
+			t.pendingSASL = true
+
+		case t.authInFlight:
+			// Neither a challenge nor a client payload: the exchange is over
+			// and this is the server's tagged verdict. Showing it is the
+			// point of tracing an authentication that failed.
+			t.authInFlight = false
+		}
 	}
 
 	fields := strings.Fields(line)
@@ -105,9 +127,15 @@ func (t *traceWriter) redact(line string) string {
 
 		case strings.EqualFold(f, "AUTHENTICATE"):
 			// tag AUTHENTICATE mechanism [initial-response]: keep the
-			// mechanism, drop any inline response, and suppress the client's
-			// answer to the continuation that follows.
-			t.pendingSASL = true
+			// mechanism and drop any inline response.
+			//
+			// The suppression is armed by the server's continuation rather
+			// than here, because that is the only thing a client SASL payload
+			// ever follows. Arming here hid the server's tagged refusal
+			// whenever it declined without asking anything -- which is what
+			// Exchange Online does, so the one line explaining the failure was
+			// the one line the trace withheld.
+			t.authInFlight = true
 			if i+1 >= len(fields) {
 				continue
 			}
