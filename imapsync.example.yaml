@@ -50,3 +50,32 @@ pairs:
     # Destructive operations are opt-in. Even when enabled, a run that would
     # delete an unusually large share of a folder aborts unless forced.
     delete2: false
+
+  # A directory on disk is a valid endpoint on either side, so the same pair
+  # syntax backs an account up and puts it back again. There is no separate
+  # backup command and no separate format: file:// is an IMAP server that
+  # happens to be a folder of .eml files.
+  - name: mox-to-disk
+
+    source:
+      url: "imaps://jens@hilli.dk@mox-archive.hilli.dk:993"
+      password:
+        keychain: mox-imap
+
+    dest:
+      # Everything after file:// is the path, taken literally and not
+      # percent-decoded, so a folder really can be called "Rejsen 50%". A
+      # leading ~ is expanded here, because no shell will see this file.
+      url: "file://~/Mail-backup"
+      # No password: a directory does not have one, and writing one here is an
+      # error rather than something quietly ignored.
+
+    concurrency:
+      source: 24
+      # The destination is a disk. The limit is fsync and SQLite rather than a
+      # server's patience, and past about 16 the writers mostly wait on each
+      # other.
+      dest: 16
+
+    # The reverse pair restores it: swap source and dest. Any server will do —
+    # the backup is not tied to the one it came from.

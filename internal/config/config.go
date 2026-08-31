@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -224,8 +225,10 @@ func (e Endpoint) Address() (Address, error) {
 		addr.TLS, addr.Port = TLSStartTLS, 143
 	case "imap+insecure":
 		addr.TLS, addr.Port = TLSNone, 143
+	case localScheme:
+		return Address{}, errors.New("file:// names a directory on disk, which cannot be dialled")
 	default:
-		return Address{}, fmt.Errorf("unsupported scheme %q, want imaps, imap or imap+insecure", scheme)
+		return Address{}, fmt.Errorf("unsupported scheme %q, want imaps, imap, imap+insecure or file", scheme)
 	}
 
 	// A mailbox path or query string would be silently ignored, so reject it
@@ -268,6 +271,101 @@ func (e Endpoint) Address() (Address, error) {
 	}
 
 	return addr, nil
+}
+
+// localScheme names a directory on disk rather than a server. It is how an
+// account is backed up to files and restored from them, which is the one thing
+// imapsync itself refuses to do.
+const localScheme = "file"
+
+// IsLocal reports whether this endpoint is a directory rather than a server.
+func (e Endpoint) IsLocal() bool {
+	scheme, _, ok := strings.Cut(strings.TrimSpace(e.URL), "://")
+	return ok && strings.EqualFold(scheme, localScheme)
+}
+
+// LocalPath is the directory a file:// endpoint names.
+//
+// Everything after the scheme is the path, taken literally:
+//
+//	file:///Users/hilli/Mail        an absolute path
+//	file://mail-backup              relative to the working directory
+//	file://~/Mail                   relative to the home directory
+//
+// Taken literally means not percent-decoded, which is a deliberate departure
+// from the file: URL other tools implement. A directory really can be called
+// "Rejsen 50%" or "Q1 100%", and a user writing a path down means the path
+// they wrote; decoding would make "a%20b" ambiguous between two real
+// directories to save typing that a shell does not require either.
+//
+// The tilde is expanded here rather than left to the shell, because the most
+// likely place to write one of these is a configuration file, where no shell
+// will ever see it.
+func (e Endpoint) LocalPath() (string, error) {
+	raw := strings.TrimSpace(e.URL)
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok || !strings.EqualFold(scheme, localScheme) {
+		return "", fmt.Errorf("not a local endpoint: %q", raw)
+	}
+	if rest == "" {
+		return "", errors.New("missing path, expected file:///path/to/directory")
+	}
+	if strings.ContainsAny(rest, "?#") {
+		return "", errors.New("url must not contain a query or fragment, expected file:///path/to/directory")
+	}
+
+	if rest == "~" || strings.HasPrefix(rest, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expanding %q: %w", rest, err)
+		}
+		rest = filepath.Join(home, strings.TrimPrefix(rest, "~"))
+	}
+
+	abs, err := filepath.Abs(rest)
+	if err != nil {
+		return "", fmt.Errorf("resolving %q: %w", rest, err)
+	}
+	return abs, nil
+}
+
+// Describe names an endpoint for a log line or a state database key.
+func (e Endpoint) Describe() (string, error) {
+	if e.IsLocal() {
+		path, err := e.LocalPath()
+		if err != nil {
+			return "", err
+		}
+		return localScheme + ":" + path, nil
+	}
+	addr, err := e.Address()
+	if err != nil {
+		return "", err
+	}
+	return addr.User + "@" + addr.Host, nil
+}
+
+// Validate checks an endpoint completely, whichever kind it is.
+//
+// One function rather than each caller checking a URL and a password
+// separately: a local endpoint has no password to check, and four call sites
+// deriving that rule independently are four chances to get it wrong. This
+// package has paid that bill once already, when a function returning four of a
+// pair's five fields silently dropped the other two.
+func (e Endpoint) Validate() error {
+	if e.IsLocal() {
+		if _, err := e.LocalPath(); err != nil {
+			return err
+		}
+		if e.Password.Set() {
+			return errors.New("a file:// endpoint is a directory on disk and takes no password")
+		}
+		return nil
+	}
+	if _, err := e.Address(); err != nil {
+		return err
+	}
+	return e.Password.Validate()
 }
 
 // splitHostPort splits "host", "host:port", "[::1]" or "[::1]:port". A zero
@@ -360,6 +458,11 @@ func (s Secret) Resolve(ctx context.Context) (string, error) {
 }
 
 // Validate checks that exactly one secret source is configured.
+// Set reports whether any secret source was configured.
+func (s Secret) Set() bool {
+	return s.Env != "" || s.File != "" || s.Keychain != ""
+}
+
 func (s Secret) Validate() error {
 	n := 0
 	for _, set := range []bool{s.Env != "", s.File != "", s.Keychain != ""} {
@@ -437,11 +540,8 @@ func (c *Config) Validate() error {
 			ep    Endpoint
 		}{{"source", p.Source}, {"dest", p.Dest}}
 		for _, side := range sides {
-			if _, err := side.ep.Address(); err != nil {
+			if err := side.ep.Validate(); err != nil {
 				return fmt.Errorf("pair %q %s: %w", p.Name, side.label, err)
-			}
-			if err := side.ep.Password.Validate(); err != nil {
-				return fmt.Errorf("pair %q %s password: %w", p.Name, side.label, err)
 			}
 		}
 

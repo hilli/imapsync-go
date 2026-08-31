@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/config"
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/imapx"
+	"github.com/hilli/imapsync-go/internal/localstore"
 	"github.com/hilli/imapsync-go/internal/pool"
 	"github.com/hilli/imapsync-go/internal/searchkey"
 	"github.com/hilli/imapsync-go/internal/selection"
@@ -241,28 +243,11 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		return fmt.Errorf("invalid --memory-limit: %w", err)
 	}
 
-	// EXAMINE on the source: reading a message must not mark it \Seen, which
-	// would rewrite an account this tool is only supposed to read.
-	srcPool, err := pool.New(pool.Options{
-		Cap:      srcConns,
-		Dial:     dialer(source, f, f.insecureSrc, trace),
-		Select:   imapx.SelectOptions{ReadOnly: true},
-		OnShrink: shrinkLogger(sideSource),
-	})
+	srcPool, dstPool, release, err := pools(ctx, pair, f, trace, srcConns, dstConns)
 	if err != nil {
-		return fmt.Errorf("source connections: %w", err)
+		return err
 	}
-	defer closePool(ctx, srcPool, sideSource)
-
-	dstPool, err := pool.New(pool.Options{
-		Cap:      dstConns,
-		Dial:     dialer(dest, f, f.insecureDst, trace),
-		OnShrink: shrinkLogger(sideDest),
-	})
-	if err != nil {
-		return fmt.Errorf("destination connections: %w", err)
-	}
-	defer closePool(ctx, dstPool, sideDest)
+	defer release()
 
 	if pairName == "" {
 		pairName, err = derivePairID(source, dest)
@@ -521,10 +506,7 @@ func syncPair(f syncFlags) (config.Pair, error) {
 		},
 	}
 	for label, ep := range map[string]config.Endpoint{sideSource: pair.Source, sideDest: pair.Dest} {
-		if err := ep.Password.Validate(); err != nil {
-			return config.Pair{}, fmt.Errorf("%s password: %w", label, err)
-		}
-		if _, err := ep.Address(); err != nil {
+		if err := ep.Validate(); err != nil {
 			return config.Pair{}, fmt.Errorf("--%s-url: %w", label, err)
 		}
 	}
@@ -586,6 +568,180 @@ func compilePatterns(patterns []string, label string) ([]*regexp.Regexp, error) 
 // The password is resolved once, here, rather than on every dial: a keychain
 // lookup can prompt, and a pool that grows to thirty connections should not
 // prompt thirty times.
+// pools builds both connection pools and hands back one function that takes
+// them down again, in the order they have to come down in.
+//
+// Both sides are built together because their teardown is interleaved: a local
+// store must be settled after the pool that was reading it has returned its
+// connections, and getting that order wrong leaves a store an unattended
+// backup cannot safely copy.
+//
+// The unwind closures capture locals rather than the named results on purpose.
+// A `return nil, nil, nil, err` assigns the named results *before* the deferred
+// unwind runs, so a closure reading them would find the pool it was meant to
+// close already nil — closing nothing, and leaking every connection the side
+// that did succeed had opened.
+func pools(
+	ctx context.Context,
+	pair config.Pair,
+	f syncFlags,
+	trace io.Writer,
+	srcConns, dstConns int,
+) (src, dst *pool.Pool, release func(), err error) {
+	var closers []func()
+	unwind := func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i]()
+		}
+	}
+	defer func() {
+		if err != nil {
+			unwind()
+		}
+	}()
+
+	srcDial, srcStore, err := endpoint(pair.Source, f, f.insecureSrc, trace, sideSource)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("source: %w", err)
+	}
+	closers = append(closers, func() { closeStore(srcStore, sideSource) })
+
+	dstDial, dstStore, err := endpoint(pair.Dest, f, f.insecureDst, trace, sideDest)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("destination: %w", err)
+	}
+	closers = append(closers, func() { closeStore(dstStore, sideDest) })
+
+	// EXAMINE on the source: reading a message must not mark it \Seen, which
+	// would rewrite an account this tool is only supposed to read.
+	srcPool, err := pool.New(pool.Options{
+		Cap:      srcConns,
+		Dial:     srcDial,
+		Select:   imapx.SelectOptions{ReadOnly: true},
+		OnShrink: shrinkLogger(sideSource),
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("source connections: %w", err)
+	}
+	closers = append(closers, func() { closePool(ctx, srcPool, sideSource) })
+
+	dstPool, err := pool.New(pool.Options{
+		Cap:      dstConns,
+		Dial:     dstDial,
+		OnShrink: shrinkLogger(sideDest),
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("destination connections: %w", err)
+	}
+	closers = append(closers, func() { closePool(ctx, dstPool, sideDest) })
+
+	return srcPool, dstPool, unwind, nil
+}
+
+// endpoint prepares one side of a pair for its pool.
+//
+// It returns a closer as well as a dial function because a local store has an
+// end to its run that a socket does not: its databases have to be
+// checkpointed and closed, or the store is left with -wal files beside every
+// folder and an unattended backup copying it may copy a transaction in
+// progress. Quiescent at rest is a promise the store cannot keep alone.
+func endpoint(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer, side string) (pool.DialFunc, io.Closer, error) {
+	if !ep.IsLocal() {
+		return dialer(ep, f, insecure, trace), nil, nil
+	}
+
+	path, err := ep.LocalPath()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// A source has to be there already. Creating one on demand turns a mistyped
+	// restore path into an empty directory, a report of nothing to do and an
+	// exit code of zero — a backup tool telling someone their mail is safe
+	// because it looked in the wrong place.
+	if side == sideSource {
+		if err := mustExist(path); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// A dry run promises to change nothing, and creating the destination tree
+	// is a change. Where the directory is not there yet, an empty scratch store
+	// answers every question the run actually asks — no folders, no messages —
+	// and is the truth rather than a stand-in for it.
+	if side == sideDest && f.dryRun {
+		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			return scratchStore()
+		}
+	}
+
+	store, err := localstore.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Store.Connect is already a pool.DialFunc: it neither authenticates nor
+	// opens a socket, which is the whole reason the pool did not have to
+	// change to accommodate a directory.
+	return store.Connect, store, nil
+}
+
+// mustExist reports a source path that is not there, in the words of the thing
+// the user typed.
+//
+// Only absence is checked here. A path that exists but is not a directory is
+// already refused by the store itself, and a second check saying so in nicer
+// words is a branch no test can tell from its absence.
+func mustExist(path string) error {
+	_, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s does not exist", path)
+	}
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	return nil
+}
+
+// scratchStore is an empty destination that leaves nothing behind, for a dry
+// run against a directory that does not exist yet.
+func scratchStore() (pool.DialFunc, io.Closer, error) {
+	dir, err := os.MkdirTemp("", "imapsync-go-dryrun-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("preparing a scratch destination for the dry run: %w", err)
+	}
+	store, err := localstore.Open(dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	return store.Connect, closerFunc(func() error {
+		err := store.Close()
+		if rmErr := os.RemoveAll(dir); err == nil {
+			err = rmErr
+		}
+		return err
+	}), nil
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// closeStore settles a local store and says so if it cannot.
+//
+// A failure here loses no mail — every message is already on disk — but it
+// leaves the store in a state a backup cannot safely copy, and that is exactly
+// the kind of thing that stays silent until the restore.
+func closeStore(c io.Closer, side string) {
+	if c == nil {
+		return
+	}
+	if err := c.Close(); err != nil {
+		slog.Error("could not settle the local store; a backup taken now may copy it mid-write",
+			"side", side, "error", err)
+	}
+}
+
 func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) pool.DialFunc {
 	var (
 		once     sync.Once
@@ -782,15 +938,15 @@ func searchFlag(flag, value string) (searchkey.Key, error) {
 // that share a name would treat one's progress as the other's and skip messages
 // it never copied.
 func derivePairID(source, dest config.Endpoint) (string, error) {
-	src, err := source.Address()
+	src, err := source.Describe()
 	if err != nil {
 		return "", err
 	}
-	dst, err := dest.Address()
+	dst, err := dest.Describe()
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s@%s>%s@%s", src.User, src.Host, dst.User, dst.Host), nil
+	return src + ">" + dst, nil
 }
 
 // statePath resolves where progress is recorded.

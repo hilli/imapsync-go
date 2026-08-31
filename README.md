@@ -110,9 +110,12 @@ and share.
 | `imaps://user@host` | implicit TLS | 993 |
 | `imap://user@host` | STARTTLS | 143 |
 | `imap+insecure://user@host` | plaintext, test use only | 143 |
+| `file:///path/to/directory` | a directory on disk | — |
 
 Inline passwords (`imaps://user:pass@host`) are rejected. Credentials come from
-`--password-env`, `--password-file` or `--password-keychain` (macOS).
+`--password-env`, `--password-file` or `--password-keychain` (macOS). A
+`file://` endpoint is a directory and takes no password; supplying one is an
+error rather than something quietly ignored.
 
 ## sync
 
@@ -534,6 +537,72 @@ source reached over the internet, so there is no single flag that does both.
 macOS rejects a self-signed certificate whose validity exceeds 398 days with
 `certificate is not standards compliant`, and adding it to the keychain does not
 help. Either reissue it with a shorter lifetime or pass `--dest-insecure`.
+
+## Backing up to a directory
+
+A `file://` endpoint is a directory of `.eml` files that behaves like an IMAP
+server, so it can be either side of a sync. imapsync has no equivalent, so
+neither does `compat`.
+
+```sh
+# Back an account up to disk
+imapsync-go sync --source-url imaps://you@imap.example.net \
+    --source-password-keychain example-imap \
+    --dest-url file://~/Mail-backup
+
+# Put it back on a server — any server, not the one it came from
+imapsync-go sync --source-url file://~/Mail-backup \
+    --dest-url imaps://you@imap.other.net \
+    --dest-password-keychain other-imap
+```
+
+Everything the rest of this document describes still applies: the same
+concurrency, the same state database, the same folder and message filters, the
+same interruptible resume. Only the URL changed.
+
+### What it looks like on disk
+
+One directory per folder, one file per message, named by UID:
+
+```
+Mail-backup/
+  INBOX/
+    .imapsync-folder.db
+    0000000001.eml
+    0000000002.eml
+    +0000010000/          folders over 10,000 messages shard by UID
+      0000010001.eml
+```
+
+One file per message is what makes an incremental backup cheap: a run that
+changes nothing writes nothing, so the next `restic`, `borg` or Time Machine
+pass stores only what actually arrived. Flags, UIDs and UIDVALIDITY live in the
+SQLite database beside the messages, and each file's creation and modification
+time is set to the message's own date, so a 1999 message reads as 1999 in
+Finder.
+
+The database is a cache, not the truth. Delete a message and the next run
+notices it is gone; delete the database and the folder is rebuilt from the
+files, under a new UIDVALIDITY so no peer mistakes it for the one it replaced.
+
+The store is quiescent between runs — the write-ahead log is checkpointed and
+removed on close — so a backup taken while nothing is syncing cannot capture a
+transaction in progress. Run the sync before the backup rather than during it.
+
+Folder names are escaped only where the filesystem forces it, so `Arkiv/2019`
+nests as directories and stays readable. `.eml` was chosen over maildir's
+naming so the files open by double-clicking; the maildir mechanics that matter
+— one file per message, written to a temporary name and renamed into place —
+are kept.
+
+### A source has to exist, a destination is created
+
+A `file://` source that is not there is an error. The asymmetry is deliberate:
+a mistyped restore path would otherwise be created empty, diffed against a
+destination that already had everything, and reported as a clean run with
+nothing to do.
+
+`--dry-run` creates nothing at all, including the destination.
 
 ## Running imapsync command lines
 

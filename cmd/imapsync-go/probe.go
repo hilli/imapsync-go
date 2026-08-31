@@ -155,16 +155,23 @@ func probeTargets(f probeFlags) ([]probeTarget, error) {
 			return nil, fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
 		}
 
+		var targets []probeTarget
 		switch strings.ToLower(f.side) {
 		case sideSource:
-			return []probeTarget{{sideSource, pair.Source}}, nil
+			targets = []probeTarget{{sideSource, pair.Source}}
 		case sideDest:
-			return []probeTarget{{sideDest, pair.Dest}}, nil
+			targets = []probeTarget{{sideDest, pair.Dest}}
 		case "both":
-			return []probeTarget{{sideSource, pair.Source}, {sideDest, pair.Dest}}, nil
+			targets = []probeTarget{{sideSource, pair.Source}, {sideDest, pair.Dest}}
 		default:
 			return nil, fmt.Errorf("invalid --side %q, want source, dest or both", f.side)
 		}
+		for _, t := range targets {
+			if err := probeable(t.endpoint); err != nil {
+				return nil, fmt.Errorf("%s: %w", t.label, err)
+			}
+		}
+		return targets, nil
 	}
 
 	if f.url == "" {
@@ -178,13 +185,25 @@ func probeTargets(f probeFlags) ([]probeTarget, error) {
 			Keychain: f.passwordKeychain,
 		},
 	}
-	if err := ep.Password.Validate(); err != nil {
-		return nil, fmt.Errorf("password: %w", err)
+	if err := probeable(ep); err != nil {
+		return nil, fmt.Errorf("--url: %w", err)
 	}
-	if _, err := ep.Address(); err != nil {
+	if err := ep.Validate(); err != nil {
 		return nil, fmt.Errorf("--url: %w", err)
 	}
 	return []probeTarget{{"endpoint", ep}}, nil
+}
+
+// probeable refuses an endpoint there is nothing to probe.
+//
+// Everything this command measures — a connection ceiling, a round trip, what
+// the server says it supports — is a property of a server. A directory has no
+// ceiling, and reporting one would be inventing a number.
+func probeable(ep config.Endpoint) error {
+	if ep.IsLocal() {
+		return errors.New("probe measures a server's limits; a file:// endpoint is a directory and has none")
+	}
+	return nil
 }
 
 // printer writes formatted output and remembers the first write error, so the
