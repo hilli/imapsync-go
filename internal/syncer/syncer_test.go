@@ -97,8 +97,8 @@ func (a account) dial(t *testing.T) imapx.Conn {
 	}
 
 	conn, err := imapx.Dial(context.Background(), imapx.DialOptions{
-		Addr:     config.Address{Host: host, Port: portNum, User: testUser, TLS: config.TLSNone},
-		Password: testPassword,
+		Addr:       config.Address{Host: host, Port: portNum, User: testUser, TLS: config.TLSNone},
+		Credential: imapx.StaticPassword(testPassword),
 	})
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)

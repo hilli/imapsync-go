@@ -389,8 +389,8 @@ func cliDial(t *testing.T, addr string) imapx.Conn {
 	}
 
 	conn, err := imapx.Dial(context.Background(), imapx.DialOptions{
-		Addr:     config.Address{Host: host, Port: portNum, User: cliUser, TLS: config.TLSNone},
-		Password: cliPassword,
+		Addr:       config.Address{Host: host, Port: portNum, User: cliUser, TLS: config.TLSNone},
+		Credential: imapx.StaticPassword(cliPassword),
 	})
 	if err != nil {
 		t.Fatalf("dialling %q: %v", addr, err)

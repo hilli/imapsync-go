@@ -50,7 +50,7 @@ func dialMemWithTrace(t *testing.T, addr string, trace *traceBuf) imapx.Conn {
 
 	conn, err := imapx.Dial(context.Background(), imapx.DialOptions{
 		Addr:        config.Address{Host: host, Port: portNum, User: testUser, TLS: config.TLSNone},
-		Password:    testPassword,
+		Credential:  imapx.StaticPassword(testPassword),
 		DebugWriter: trace,
 	})
 	if err != nil {

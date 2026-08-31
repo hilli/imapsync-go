@@ -74,7 +74,7 @@ func dialMem(t *testing.T, addr string) imapx.Conn {
 			User: testUser,
 			TLS:  config.TLSNone,
 		},
-		Password: testPassword,
+		Credential: imapx.StaticPassword(testPassword),
 	})
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)

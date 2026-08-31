@@ -115,7 +115,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 
 	dialOpts := imapx.DialOptions{
 		Addr:               addr,
-		Password:           password,
+		Credential:         imapx.StaticPassword(password),
 		Timeout:            opts.DialTimeout,
 		InsecureSkipVerify: opts.InsecureSkipVerify,
 		DebugWriter:        opts.Trace,

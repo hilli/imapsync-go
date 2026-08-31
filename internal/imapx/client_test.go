@@ -192,9 +192,9 @@ func TestDialBoundsEstablishment(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := Dial(context.Background(), DialOptions{
-			Addr:     config.Address{Host: host, Port: port, User: "user", TLS: config.TLSNone},
-			Password: "pass",
-			Timeout:  500 * time.Millisecond,
+			Addr:       config.Address{Host: host, Port: port, User: "user", TLS: config.TLSNone},
+			Credential: StaticPassword("pass"),
+			Timeout:    500 * time.Millisecond,
 		})
 		done <- err
 	}()
@@ -342,7 +342,7 @@ func dialFakeWithTrace(t *testing.T, srv *fakeServer, trace io.Writer, password 
 			User: "user",
 			TLS:  config.TLSNone,
 		},
-		Password:    password,
+		Credential:  StaticPassword(password),
 		DebugWriter: trace,
 	})
 	if err != nil {
@@ -375,6 +375,11 @@ type fakeServerOptions struct {
 	// selectWithoutUIDValidity imitates a server that completes SELECT without
 	// telling the client how to detect renumbering.
 	selectWithoutUIDValidity bool
+
+	// acceptPassword makes LOGIN refuse anything but this password. Empty
+	// accepts whatever it is given, which is what every test predating
+	// credentials expects.
+	acceptPassword string
 }
 
 // fakeServer is a hand-rolled IMAP server that answers just enough to exercise
@@ -464,6 +469,10 @@ func (s *fakeServer) serve(conn net.Conn) {
 			send("%s OK done", tag)
 
 		case "LOGIN":
+			if s.opts.acceptPassword != "" && loginPassword(fields) != s.opts.acceptPassword {
+				send("%s NO [AUTHENTICATIONFAILED] invalid credentials", tag)
+				continue
+			}
 			send("%s OK logged in", tag)
 
 		case "NAMESPACE":
@@ -506,6 +515,15 @@ func (s *fakeServer) serve(conn net.Conn) {
 			send("%s OK done", tag)
 		}
 	}
+}
+
+// loginPassword returns the password argument of a LOGIN command, without the
+// quotes go-imap puts around it.
+func loginPassword(fields []string) string {
+	if len(fields) < 4 {
+		return ""
+	}
+	return strings.Trim(fields[3], `"`)
 }
 
 // commandMailbox extracts the mailbox argument, which may be a quoted string

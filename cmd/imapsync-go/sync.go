@@ -788,7 +788,7 @@ func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) poo
 		}
 		return imapx.Dial(ctx, imapx.DialOptions{
 			Addr:               addr,
-			Password:           password,
+			Credential:         imapx.StaticPassword(password),
 			DebugWriter:        trace,
 			Timeout:            f.dialTimeout,
 			InsecureSkipVerify: insecure,

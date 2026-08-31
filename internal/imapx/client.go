@@ -95,8 +95,8 @@ type Conn interface {
 
 // DialOptions describes how to establish and authenticate one connection.
 type DialOptions struct {
-	Addr     config.Address
-	Password string
+	Addr       config.Address
+	Credential Credential
 
 	// DebugWriter receives the raw protocol conversation for diagnosing server
 	// quirks. Credentials are redacted before they reach it. Nil disables
@@ -154,7 +154,7 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		client, err := authenticate(raw, clientOpts, opts)
+		client, err := authenticate(dialCtx, raw, clientOpts, opts)
 		done <- result{client, err}
 	}()
 
@@ -207,7 +207,7 @@ func dialRaw(ctx context.Context, endpoint config.Address, tlsConfig *tls.Config
 
 // authenticate upgrades the transport if needed and logs in. It blocks until
 // the server answers, so Dial runs it under a context race.
-func authenticate(raw net.Conn, clientOpts *imapclient.Options, opts DialOptions) (*imapclient.Client, error) {
+func authenticate(ctx context.Context, raw net.Conn, clientOpts *imapclient.Options, opts DialOptions) (*imapclient.Client, error) {
 	addr := opts.Addr.HostPort()
 
 	var client *imapclient.Client
@@ -221,9 +221,42 @@ func authenticate(raw net.Conn, clientOpts *imapclient.Options, opts DialOptions
 		client = imapclient.New(raw, clientOpts)
 	}
 
-	if err := client.Login(opts.Addr.User, opts.Password).Wait(); err != nil {
+	secret, err := opts.Credential.Secret(ctx)
+	if err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("authenticating as %s: %w", opts.Addr.User, err)
+		return nil, fmt.Errorf("credentials for %s: %w", opts.Addr.User, err)
+	}
+
+	refused := client.Login(opts.Addr.User, secret).Wait()
+	if refused == nil {
+		return client, nil
+	}
+
+	// One retry, and only when the credential says it has something better.
+	//
+	// This is the asymmetry Pool.ready already uses for SELECT, read for
+	// credentials: a secret that was just produced and is still refused is the
+	// server's answer, and asking again asks the same question, while one that
+	// had been held for a while has proven nothing recent. The decision never
+	// depends on why the server refused, only on whether we were holding
+	// something that could be out of date, so there is no table of
+	// per-provider refusal spellings to keep up to date.
+	replacement, better, err := opts.Credential.Refresh(ctx, secret)
+	if err != nil {
+		_ = client.Close()
+		// Both are causes: the server refused, and the attempt to answer that
+		// refusal failed. Wrapping only the second would hide which credential
+		// the server was objecting to.
+		return nil, fmt.Errorf("renewing credentials for %s after %w: %w", opts.Addr.User, refused, err)
+	}
+	if !better {
+		_ = client.Close()
+		return nil, fmt.Errorf("authenticating as %s: %w", opts.Addr.User, refused)
+	}
+
+	if err := client.Login(opts.Addr.User, replacement).Wait(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("authenticating as %s with renewed credentials: %w", opts.Addr.User, err)
 	}
 	return client, nil
 }
