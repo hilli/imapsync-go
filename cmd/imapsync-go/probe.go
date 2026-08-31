@@ -28,6 +28,8 @@ type probeFlags struct {
 	passwordEnv      string
 	passwordFile     string
 	passwordKeychain string
+	oauthCmd         string
+	oauthFile        string
 
 	maxConnections int
 	withStatus     bool
@@ -74,6 +76,8 @@ refuses. It is off by default because it is intrusive; enable it with
 	cmd.Flags().StringVar(&f.passwordEnv, "password-env", "", "environment variable holding the password")
 	cmd.Flags().StringVar(&f.passwordFile, "password-file", "", "file holding the password")
 	cmd.Flags().StringVar(&f.passwordKeychain, "password-keychain", "", "macOS keychain service name holding the password")
+	cmd.Flags().StringVar(&f.oauthCmd, "oauth-cmd", "", "command printing an OAuth access token, for a server that no longer accepts passwords")
+	cmd.Flags().StringVar(&f.oauthFile, "oauth-file", "", "file holding an OAuth access token")
 
 	cmd.Flags().IntVar(&f.maxConnections, "max-connections", 0, "measure the connection ceiling, opening at most this many connections (0 disables)")
 	cmd.Flags().BoolVar(&f.withStatus, "status", false, "include per-folder message counts and UIDVALIDITY")
@@ -84,6 +88,7 @@ refuses. It is off by default because it is intrusive; enable it with
 
 	cmd.MarkFlagsMutuallyExclusive("config", "url")
 	cmd.MarkFlagsMutuallyExclusive("password-env", "password-file", "password-keychain")
+	cmd.MarkFlagsMutuallyExclusive("oauth-cmd", "oauth-file")
 
 	return cmd
 }
@@ -184,6 +189,7 @@ func probeTargets(f probeFlags) ([]probeTarget, error) {
 			File:     f.passwordFile,
 			Keychain: f.passwordKeychain,
 		},
+		OAuth: config.OAuth{Command: f.oauthCmd, File: f.oauthFile},
 	}
 	if err := probeable(ep); err != nil {
 		return nil, fmt.Errorf("--url: %w", err)

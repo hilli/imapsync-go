@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -64,6 +65,7 @@ type Pair struct {
 type Endpoint struct {
 	URL      string `yaml:"url"`
 	Password Secret `yaml:"password"`
+	OAuth    OAuth  `yaml:"oauth"`
 }
 
 // Secret references a credential held outside the configuration file. Exactly
@@ -72,6 +74,41 @@ type Secret struct {
 	Env      string `yaml:"env"`
 	File     string `yaml:"file"`
 	Keychain string `yaml:"keychain"`
+}
+
+// OAuth names where access tokens come from. Exactly one source must be set.
+//
+// A block of its own rather than a fourth source on Secret plus a mechanism
+// switch. The two are genuinely separable -- a password could come from a
+// command too -- but this is a file people write by hand, and one block that
+// reads like what it is beats two settings that have to agree.
+type OAuth struct {
+	// Command is run to mint a token, which it prints on standard output.
+	Command string `yaml:"command"`
+
+	// File is read for a token, and re-read whenever the server refuses the
+	// one held. It is for a token some other process maintains.
+	File string `yaml:"file"`
+
+	// Timeout bounds the command. Zero means the default.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+func (o OAuth) Set() bool { return o.Command != "" || o.File != "" }
+
+func (o OAuth) Validate() error {
+	switch {
+	case o.Command != "" && o.File != "":
+		return errors.New("both oauth command and oauth file configured, set exactly one")
+	case !o.Set():
+		return errors.New("no oauth token source configured, set one of command or file")
+	case o.Timeout < 0:
+		return fmt.Errorf("oauth timeout %s is negative", o.Timeout)
+	case o.File != "" && o.Timeout != 0:
+		return errors.New("oauth timeout applies to a command, not a file")
+	default:
+		return nil
+	}
 }
 
 // Concurrency bounds the connection pools and in-flight memory for a pair.
@@ -360,10 +397,23 @@ func (e Endpoint) Validate() error {
 		if e.Password.Set() {
 			return errors.New("a file:// endpoint is a directory on disk and takes no password")
 		}
+		if e.OAuth.Set() {
+			return errors.New("a file:// endpoint is a directory on disk and takes no oauth")
+		}
 		return nil
 	}
 	if _, err := e.Address(); err != nil {
 		return err
+	}
+
+	// Refused rather than resolved by precedence. Guessing which one wins is
+	// how syncEndpoints silently dropped delete2 for the life of the tool, and
+	// a credential quietly not used is worse than a config that will not load.
+	if e.Password.Set() && e.OAuth.Set() {
+		return errors.New("both password and oauth configured, set exactly one")
+	}
+	if e.OAuth.Set() {
+		return e.OAuth.Validate()
 	}
 	return e.Password.Validate()
 }

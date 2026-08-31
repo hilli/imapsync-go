@@ -168,18 +168,25 @@ func endpointOptions() []*option {
 
 		no("domain1=s", "authentication domains are not implemented; put the whole login in --host1's user part"),
 		no("domain2=s", "authentication domains are not implemented; put the whole login in --host2's user part"),
-		no("authmech1=s", "this tool authenticates with LOGIN or AUTHENTICATE PLAIN and cannot be told to do otherwise"),
-		no("authmech2=s", "this tool authenticates with LOGIN or AUTHENTICATE PLAIN and cannot be told to do otherwise"),
+		no("authmech1=s", "the mechanism follows from the credential: a password is sent with LOGIN and an OAuth token "+
+			"with XOAUTH2, so a separate mechanism could only contradict it"),
+		no("authmech2=s", "the mechanism follows from the credential; see --authmech1"),
 		no("authuser1=s", "authenticating as one user to act as another is not implemented"),
 		no("authuser2=s", "authenticating as one user to act as another is not implemented"),
 		no("proxyauth1", "PROXYAUTH is not implemented"),
 		no("proxyauth2", "PROXYAUTH is not implemented"),
-		no("oauthdirect1=s", "OAuth is not implemented"),
-		no("oauthdirect2=s", "OAuth is not implemented"),
-		no("oauthaccesstoken1=s", "OAuth is not implemented"),
-		no("oauthaccesstoken2=s", "OAuth is not implemented"),
-		no("oauthrefreshcmd1=s", "OAuth is not implemented"),
-		no("oauthrefreshcmd2=s", "OAuth is not implemented"),
+		// A token on the command line is readable by every process on the
+		// machine through ps, and it expires within the hour -- which is the
+		// failure the OAuth support exists to prevent. Both alternatives are
+		// re-consultable, so an expiry mid-run costs a re-mint rather than the
+		// rest of the run.
+		no("oauthdirect1=s", "a token in the command line is readable by any process on the machine and expires "+
+			"within the hour; use --source-oauth-cmd or --source-oauth-file, which can be asked again"),
+		no("oauthdirect2=s", "a token in the command line is readable by any process on the machine; see --oauthdirect1"),
+		tr("oauthaccesstoken1=s", "--source-oauth-file"),
+		tr("oauthaccesstoken2=s", "--dest-oauth-file"),
+		tr("oauthrefreshcmd1=s", "--source-oauth-cmd"),
+		tr("oauthrefreshcmd2=s", "--dest-oauth-cmd"),
 
 		ig("authmd51!", "this tool does not offer CRAM-MD5, so there is nothing to turn off").
 			offIgnores("this tool does not offer CRAM-MD5"),

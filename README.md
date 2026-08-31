@@ -117,6 +117,60 @@ Inline passwords (`imaps://user:pass@host`) are rejected. Credentials come from
 `file://` endpoint is a directory and takes no password; supplying one is an
 error rather than something quietly ignored.
 
+### OAuth
+
+Some servers no longer accept a password at all. Microsoft finished retiring
+IMAP basic authentication for Exchange Online in April 2026, and Gmail accepts
+one only for accounts with an app password. Those authenticate with an OAuth
+access token, sent with `XOAUTH2` instead of `LOGIN`:
+
+```sh
+go run ./cmd/imapsync-go sync \
+    --source-url 'imaps://you%40icloud.com@imap.mail.me.com' \
+    --source-password-env ICLOUD_APP_PW \
+    --dest-url 'imaps://you%40example.com@outlook.office365.com' \
+    --dest-oauth-cmd 'az account get-access-token --resource https://outlook.office365.com --query accessToken -o tsv'
+```
+
+The command runs when a token is first needed, and **runs again when the
+server refuses the one it printed**. That is the point of naming a command
+rather than a token: an access token lasts about an hour and a migration does
+not, so a run that would otherwise die at 3am re-mints and carries on. Nothing
+is scheduled and no claimed lifetime is trusted -- an expiry is discovered by
+being refused. When forty connections meet the same expiry at once the command
+runs once, and the other thirty-nine wait for its answer.
+
+`--source-oauth-file` / `--dest-oauth-file` read the token from a file
+instead, re-read on the same refusal, for a token minted by something else.
+
+A token on the command line -- imapsync's `--oauthdirect1` -- is refused. It is
+readable by every process on the machine through `ps`, and it expires within
+the hour, which is the failure this feature exists to prevent.
+
+Getting a token is the provider's business rather than this tool's. Two
+recipes that work today:
+
+```sh
+# Microsoft 365, via the Azure CLI:
+az login
+az account get-access-token --resource https://outlook.office365.com \
+    --query accessToken -o tsv
+
+# Gmail, via the Google Cloud CLI. The account needs the
+# https://mail.google.com/ scope, which is restricted; for a personal account
+# an app password is usually the simpler route.
+gcloud auth print-access-token
+```
+
+Confirm one before starting a long migration:
+
+```sh
+go run ./cmd/imapsync-go probe \
+    --url 'imaps://you%40example.com@outlook.office365.com' \
+    --oauth-cmd 'az account get-access-token --resource https://outlook.office365.com --query accessToken -o tsv'
+```
+
+
 ## sync
 
 `sync` copies every message the destination does not already hold.

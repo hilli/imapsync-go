@@ -1,7 +1,10 @@
 # Example imapsync-go configuration.
 #
 # Credentials are always referenced indirectly. Passwords are never written
-# here: use an environment variable, a file, or the macOS keychain.
+# here: use an environment variable, a file, or the macOS keychain. Servers
+# that no longer accept passwords at all -- Microsoft 365 since April 2026,
+# and Gmail unless the account has an app password -- authenticate with an
+# OAuth token instead; see the third pair below.
 #
 #   imapsync-go probe --config imapsync.example.yaml --pair icloud-to-mox --side both
 
@@ -79,3 +82,40 @@ pairs:
 
     # The reverse pair restores it: swap source and dest. Any server will do —
     # the backup is not tied to the one it came from.
+
+  # A pair whose destination no longer accepts a password. Microsoft retired
+  # IMAP basic authentication for Exchange Online in April 2026, so an OAuth
+  # token is the only way in.
+  - name: icloud-to-office365
+
+    source:
+      url: "imaps://you@icloud.com@imap.mail.me.com:993"
+      password:
+        env: ICLOUD_APP_PW
+
+    dest:
+      url: "imaps://you@example.onmicrosoft.com@outlook.office365.com:993"
+      # An access token, not a password: it is sent with XOAUTH2 rather than
+      # LOGIN. A password and an oauth block together are refused rather than
+      # resolved by precedence, because both would authenticate and you would
+      # never learn which one the server saw.
+      oauth:
+        # Run on demand and re-run when the server refuses the token it
+        # printed. A migration outlives an access token -- an hour is typical
+        # -- so this is what makes an overnight run possible at all. Whatever
+        # the command prints is the token; trailing whitespace is trimmed.
+        command: >-
+          az account get-access-token
+          --resource https://outlook.office365.com
+          --query accessToken -o tsv
+        # Bounds a command that hangs waiting for input it will never get.
+        # Defaults to 30s.
+        timeout: 30s
+
+        # The alternative, for a token minted elsewhere. The file is re-read
+        # on a refusal, so an external refresher can replace it mid-run:
+        #   file: ~/.config/imapsync-go/office365.token
+
+    concurrency:
+      source: 40
+      dest: 8

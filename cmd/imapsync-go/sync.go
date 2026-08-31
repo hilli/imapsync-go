@@ -45,11 +45,15 @@ type syncFlags struct {
 	sourcePasswordEnv      string
 	sourcePasswordFile     string
 	sourcePasswordKeychain string
+	sourceOAuthCmd         string
+	sourceOAuthFile        string
 
 	destURL              string
 	destPasswordEnv      string
 	destPasswordFile     string
 	destPasswordKeychain string
+	destOAuthCmd         string
+	destOAuthFile        string
 
 	statePath string
 	dryRun    bool
@@ -143,11 +147,15 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.sourcePasswordEnv, "source-password-env", "", "environment variable holding the source password")
 	cmd.Flags().StringVar(&f.sourcePasswordFile, "source-password-file", "", "file holding the source password")
 	cmd.Flags().StringVar(&f.sourcePasswordKeychain, "source-password-keychain", "", "macOS keychain service name holding the source password")
+	cmd.Flags().StringVar(&f.sourceOAuthCmd, "source-oauth-cmd", "", "command printing an OAuth access token for the source, re-run when the server refuses the one held")
+	cmd.Flags().StringVar(&f.sourceOAuthFile, "source-oauth-file", "", "file holding an OAuth access token for the source, re-read when the server refuses the one held")
 
 	cmd.Flags().StringVar(&f.destURL, "dest-url", "", "destination endpoint URL")
 	cmd.Flags().StringVar(&f.destPasswordEnv, "dest-password-env", "", "environment variable holding the destination password")
 	cmd.Flags().StringVar(&f.destPasswordFile, "dest-password-file", "", "file holding the destination password")
 	cmd.Flags().StringVar(&f.destPasswordKeychain, "dest-password-keychain", "", "macOS keychain service name holding the destination password")
+	cmd.Flags().StringVar(&f.destOAuthCmd, "dest-oauth-cmd", "", "command printing an OAuth access token for the destination")
+	cmd.Flags().StringVar(&f.destOAuthFile, "dest-oauth-file", "", "file holding an OAuth access token for the destination")
 
 	cmd.Flags().StringVar(&f.statePath, "state", "", "path to the state database (default: per-user application state directory)")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would be copied without writing anything")
@@ -191,6 +199,8 @@ watch for authentication failures.`,
 	cmd.MarkFlagsMutuallyExclusive("config", "source-url")
 	cmd.MarkFlagsMutuallyExclusive("source-password-env", "source-password-file", "source-password-keychain")
 	cmd.MarkFlagsMutuallyExclusive("dest-password-env", "dest-password-file", "dest-password-keychain")
+	cmd.MarkFlagsMutuallyExclusive("source-oauth-cmd", "source-oauth-file")
+	cmd.MarkFlagsMutuallyExclusive("dest-oauth-cmd", "dest-oauth-file")
 
 	return cmd
 }
@@ -515,7 +525,11 @@ func syncPair(f syncFlags) (config.Pair, error) {
 		} else if len(cfg.Pairs) > 1 {
 			return config.Pair{}, fmt.Errorf("config defines %d pairs, select one with --pair", len(cfg.Pairs))
 		}
-		return *pair, nil
+
+		merged := *pair
+		merged.Source.OAuth = oauthFrom(merged.Source.OAuth, f.sourceOAuthCmd, f.sourceOAuthFile)
+		merged.Dest.OAuth = oauthFrom(merged.Dest.OAuth, f.destOAuthCmd, f.destOAuthFile)
+		return merged, validateSides(merged, "%s endpoint: %w")
 	}
 
 	if f.sourceURL == "" || f.destURL == "" {
@@ -526,18 +540,38 @@ func syncPair(f syncFlags) (config.Pair, error) {
 		Source: config.Endpoint{
 			URL:      f.sourceURL,
 			Password: config.Secret{Env: f.sourcePasswordEnv, File: f.sourcePasswordFile, Keychain: f.sourcePasswordKeychain},
+			OAuth:    config.OAuth{Command: f.sourceOAuthCmd, File: f.sourceOAuthFile},
 		},
 		Dest: config.Endpoint{
 			URL:      f.destURL,
 			Password: config.Secret{Env: f.destPasswordEnv, File: f.destPasswordFile, Keychain: f.destPasswordKeychain},
+			OAuth:    config.OAuth{Command: f.destOAuthCmd, File: f.destOAuthFile},
 		},
 	}
+	return pair, validateSides(pair, "--%s-url: %w")
+}
+
+// validateSides checks both endpoints, naming which one failed.
+func validateSides(pair config.Pair, format string) error {
 	for label, ep := range map[string]config.Endpoint{sideSource: pair.Source, sideDest: pair.Dest} {
 		if err := ep.Validate(); err != nil {
-			return config.Pair{}, fmt.Errorf("--%s-url: %w", label, err)
+			return fmt.Errorf(format, label, err)
 		}
 	}
-	return pair, nil
+	return nil
+}
+
+// oauthFrom lets a flag override the configured token source.
+//
+// A flag naming a source replaces the configured block outright rather than
+// merging field by field. Merging would let a flag command sit beside a
+// configured file, which is two sources for one credential -- the ambiguity
+// validation exists to refuse.
+func oauthFrom(configured config.OAuth, command, file string) config.OAuth {
+	if command == "" && file == "" {
+		return configured
+	}
+	return config.OAuth{Command: command, File: file}
 }
 
 // folderOptions merges the configuration file's folder rules with the flags.
@@ -771,24 +805,27 @@ func closeStore(c io.Closer, side string) {
 
 func dialer(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer) pool.DialFunc {
 	var (
-		once     sync.Once
-		addr     config.Address
-		password string
-		resolve  error
+		once    sync.Once
+		addr    config.Address
+		cred    imapx.Credential
+		resolve error
 	)
 	return func(ctx context.Context) (imapx.Conn, error) {
+		// One credential for the whole pool, not one per dial. A token that
+		// each connection resolved for itself would be minted once per
+		// connection, and an expiry would be met by every worker separately.
 		once.Do(func() {
 			if addr, resolve = ep.Address(); resolve != nil {
 				return
 			}
-			password, resolve = ep.Password.Resolve(ctx)
+			cred, resolve = imapx.CredentialFor(ctx, ep)
 		})
 		if resolve != nil {
 			return nil, resolve
 		}
 		return imapx.Dial(ctx, imapx.DialOptions{
 			Addr:               addr,
-			Credential:         imapx.StaticPassword(password),
+			Credential:         cred,
 			DebugWriter:        trace,
 			Timeout:            f.dialTimeout,
 			InsecureSkipVerify: insecure,

@@ -2,6 +2,8 @@ package imapx
 
 import (
 	"context"
+
+	"github.com/hilli/imapsync-go/internal/config"
 )
 
 // Credential answers with the secret to authenticate with.
@@ -64,3 +66,23 @@ func (p staticPassword) Refresh(context.Context, string) (string, bool, error) {
 }
 
 func (p staticPassword) Mechanism() Mechanism { return MechanismLogin }
+
+// CredentialFor builds what an endpoint authenticates with.
+//
+// One per endpoint, shared by every connection to it: a token resolved per
+// dial would be minted once per connection, and an expiry would be met by
+// every worker separately rather than once.
+func CredentialFor(ctx context.Context, ep config.Endpoint) (Credential, error) {
+	if ep.OAuth.Set() {
+		if ep.OAuth.File != "" {
+			return FileToken(ep.OAuth.File), nil
+		}
+		return CommandToken(ep.OAuth.Command, ep.OAuth.Timeout), nil
+	}
+
+	password, err := ep.Password.Resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return StaticPassword(password), nil
+}
