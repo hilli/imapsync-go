@@ -2,8 +2,10 @@ package imapx
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/hilli/imapsync-go/internal/config"
+	"github.com/hilli/imapsync-go/internal/oauthx"
 )
 
 // Credential answers with the secret to authenticate with.
@@ -74,10 +76,24 @@ func (p staticPassword) Mechanism() Mechanism { return MechanismLogin }
 // every worker separately rather than once.
 func CredentialFor(ctx context.Context, ep config.Endpoint) (Credential, error) {
 	if ep.OAuth.Set() {
-		if ep.OAuth.File != "" {
+		switch {
+		case ep.OAuth.Refresh.Set():
+			blob, err := ep.OAuth.Refresh.Resolve(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("reading the oauth credential: %w", err)
+			}
+			creds, err := oauthx.ParseCredentials(blob)
+			if err != nil {
+				return nil, err
+			}
+			return RefreshToken(creds, ep.OAuth.Timeout), nil
+
+		case ep.OAuth.File != "":
 			return FileToken(ep.OAuth.File), nil
+
+		default:
+			return CommandToken(ep.OAuth.Command, ep.OAuth.Timeout), nil
 		}
-		return CommandToken(ep.OAuth.Command, ep.OAuth.Timeout), nil
 	}
 
 	password, err := ep.Password.Resolve(ctx)

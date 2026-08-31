@@ -100,22 +100,36 @@ pairs:
       # resolved by precedence, because both would authenticate and you would
       # never learn which one the server saw.
       oauth:
-        # Run on demand and re-run when the server refuses the token it
-        # printed. A migration outlives an access token -- an hour is typical
-        # -- so this is what makes an overnight run possible at all. Whatever
-        # the command prints is the token; trailing whitespace is trimmed.
-        # Note that neither cloud CLI can do this: an `az account
-        # get-access-token` token carries user_impersonation rather than
-        # IMAP.AccessAsUser.All, and Exchange refuses it. Microsoft 365 needs
-        # an Entra ID app registration with that delegated permission, so
-        # this is normally a small script wrapping a refresh-token exchange.
-        command: ~/bin/office365-token
-        # Bounds a command that hangs waiting for input it will never get.
-        # Defaults to 30s.
+        # Exactly one of refresh, command or file.
+        #
+        # refresh is the usual one: the credential written by
+        #
+        #   imapsync-go oauth login --client-id ... --keychain office365
+        #
+        # which this tool exchanges for access tokens itself, minting a new
+        # one whenever the server refuses the one it holds. A migration
+        # outlives an access token -- an hour is typical -- so this is what
+        # makes an overnight run possible at all.
+        #
+        # It is a Secret like a password, so it can come from the keychain,
+        # a file or the environment. Name it per endpoint rather than per
+        # provider: two mailboxes on the same provider are two credentials.
+        refresh:
+          keychain: office365
+
+        # Bounds the token request, or a command that hangs waiting for input
+        # it will never get. Defaults to 30s.
         timeout: 30s
 
-        # The alternative, for a token minted elsewhere. The file is re-read
-        # on a refusal, so an external refresher can replace it mid-run:
+        # command runs on demand and re-runs on a refusal, for a refresher you
+        # already have. Whatever it prints is the token; trailing whitespace is
+        # trimmed. Note that neither cloud CLI can do this: an `az account
+        # get-access-token` token carries user_impersonation rather than
+        # IMAP.AccessAsUser.All, and Exchange refuses it.
+        #   command: ~/bin/office365-token
+
+        # file is for a token some other process maintains. It is re-read on a
+        # refusal, so an external refresher can replace it mid-run.
         #   file: ~/.config/imapsync-go/office365.token
 
     concurrency:

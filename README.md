@@ -154,32 +154,92 @@ and Exchange Online answers `NO AUTHENTICATE failed.`; `gcloud auth
 print-access-token` likewise has no `https://mail.google.com/` scope. Both were
 tried against the live servers before this paragraph was written.
 
-What each provider actually needs:
+So `oauth login` does the consent itself.
 
-- **Microsoft 365** — register an application in Entra ID and give it the
+#### oauth login
+
+```sh
+go run ./cmd/imapsync-go oauth login \
+    --client-file client_secret.json \
+    --scope 'https://mail.google.com/' \
+    --account you@gmail.com \
+    --out ~/.config/imapsync-go/gmail.json
+```
+
+It starts a listener on `127.0.0.1`, prints a URL and opens a browser. You
+consent as the mailbox being migrated; the provider redirects back to that
+listener; the code is exchanged for a **refresh** credential, which is written
+where you said. Nothing is stored anywhere else and nothing listens afterwards.
+
+Then hand that credential to a sync, and it mints access tokens for itself as
+it runs -- the same re-mint-on-refusal behaviour as `--oauth-cmd`, with no
+script to write:
+
+```sh
+go run ./cmd/imapsync-go sync \
+    --source-oauth-refresh-file ~/.config/imapsync-go/gmail.json \
+    --dest-password-keychain mox-archive ...
+```
+
+`--source-oauth-refresh-keychain NAME` stores and reads it from the macOS
+keychain instead, and `--source-oauth-refresh-env VAR` from the environment,
+matching the three ways a password can be named. Each side is named separately,
+so a run can consent as two different accounts -- or as one, with a password on
+the other. In a configuration file the same thing is `oauth: { refresh: { file:
+... } }`.
+
+The credential is one JSON document, deliberately the shape Google's own
+libraries write. Copying it to another machine is how a headless box is served:
+consent on a workstation, copy the file, run there.
+
+**You need an OAuth client of your own.** This tool ships none, and that is not
+laziness. Google's `https://mail.google.com/` is a *restricted* scope: publishing
+an application that requests it requires verification plus an annual
+third-party security assessment. Microsoft's delegated `IMAP.AccessAsUser.All`
+requires tenant admin consent whoever is asking, so a shared client ID would
+still leave every user talking to their own administrator. Registering your own
+takes a few minutes and is the only route either provider offers.
+
+- **Gmail** — in the Google Cloud console create an OAuth client of type
+  *Desktop app*, download its JSON, and pass it with `--client-file`. Add
+  yourself as a test user. Note that while the app is in *Testing* the refresh
+  token expires after **seven days**; moving it to *In production* makes it
+  long-lived, and for a client only you use that does not require verification
+  first -- an unverified production app shows a warning screen and is capped at
+  100 users.
+- **Microsoft 365** — register an application in Entra ID as a *Mobile and
+  desktop* platform with the redirect `http://localhost`, and give it the
   delegated `IMAP.AccessAsUser.All` permission from the *Office 365 Exchange
-  Online* API, with admin consent. Then mint tokens for it with a device-code
-  or authorization-code flow. Microsoft's
-  [Authenticate an IMAP, POP or SMTP connection using OAuth][ms-oauth] is the
-  reference.
-- **Gmail** — the `https://mail.google.com/` scope is restricted, so a project
-  requesting it needs Google's verification unless the account is inside your
-  own Workspace organisation. For a personal account an app password with
-  `--dest-password-env` is far less work.
+  Online* API, with admin consent. There is no file to download, so name the
+  pieces yourself:
+
+  ```sh
+  go run ./cmd/imapsync-go oauth login \
+      --client-id "$APP_ID" \
+      --auth-url "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/authorize" \
+      --token-url "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+      --scope 'https://outlook.office365.com/IMAP.AccessAsUser.All' \
+      --scope offline_access \
+      --keychain imapsync-work
+  ```
+
+  Microsoft's [Authenticate an IMAP, POP or SMTP connection using
+  OAuth][ms-oauth] is the reference. **Untested against a live tenant**: the
+  scope needs an administrator, and this tool's author does not have one to
+  test with. The Gmail path is verified end to end.
 
 [ms-oauth]: https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
 
-Whatever you end up with, `--source-oauth-cmd` wants a command that prints a
-current access token on stdout. A three-line shell script wrapping your
-refresh-token exchange is the usual shape, and it is what makes an expiry
-mid-migration survivable.
+For a personal Gmail account, an app password with `--source-password-env` is
+still far less work than any of this. `oauth login` is for the accounts where
+that is no longer offered.
 
-Confirm one before starting a long migration:
+Confirm a credential before starting a long migration:
 
 ```sh
 go run ./cmd/imapsync-go probe \
-    --url 'imaps://you%40example.com@outlook.office365.com' \
-    --oauth-cmd ~/bin/office365-token
+    --url 'imaps://you%40gmail.com@imap.gmail.com' \
+    --oauth-refresh-file ~/.config/imapsync-go/gmail.json
 ```
 
 `probe --trace` prints the exchange with the token redacted and the server's

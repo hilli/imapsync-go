@@ -47,6 +47,9 @@ type syncFlags struct {
 	sourcePasswordKeychain string
 	sourceOAuthCmd         string
 	sourceOAuthFile        string
+	sourceOAuthRefreshEnv  string
+	sourceOAuthRefreshFile string
+	sourceOAuthRefreshKey  string
 
 	destURL              string
 	destPasswordEnv      string
@@ -54,6 +57,9 @@ type syncFlags struct {
 	destPasswordKeychain string
 	destOAuthCmd         string
 	destOAuthFile        string
+	destOAuthRefreshEnv  string
+	destOAuthRefreshFile string
+	destOAuthRefreshKey  string
 
 	statePath string
 	dryRun    bool
@@ -149,6 +155,9 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.sourcePasswordKeychain, "source-password-keychain", "", "macOS keychain service name holding the source password")
 	cmd.Flags().StringVar(&f.sourceOAuthCmd, "source-oauth-cmd", "", "command printing an OAuth access token for the source, re-run when the server refuses the one held")
 	cmd.Flags().StringVar(&f.sourceOAuthFile, "source-oauth-file", "", "file holding an OAuth access token for the source, re-read when the server refuses the one held")
+	cmd.Flags().StringVar(&f.sourceOAuthRefreshEnv, "source-oauth-refresh-env", "", "environment variable holding the source OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.sourceOAuthRefreshFile, "source-oauth-refresh-file", "", "file holding the source OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.sourceOAuthRefreshKey, "source-oauth-refresh-keychain", "", "macOS keychain service name holding the source OAuth credential written by `oauth login`")
 
 	cmd.Flags().StringVar(&f.destURL, "dest-url", "", "destination endpoint URL")
 	cmd.Flags().StringVar(&f.destPasswordEnv, "dest-password-env", "", "environment variable holding the destination password")
@@ -156,6 +165,9 @@ watch for authentication failures.`,
 	cmd.Flags().StringVar(&f.destPasswordKeychain, "dest-password-keychain", "", "macOS keychain service name holding the destination password")
 	cmd.Flags().StringVar(&f.destOAuthCmd, "dest-oauth-cmd", "", "command printing an OAuth access token for the destination")
 	cmd.Flags().StringVar(&f.destOAuthFile, "dest-oauth-file", "", "file holding an OAuth access token for the destination")
+	cmd.Flags().StringVar(&f.destOAuthRefreshEnv, "dest-oauth-refresh-env", "", "environment variable holding the destination OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.destOAuthRefreshFile, "dest-oauth-refresh-file", "", "file holding the destination OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.destOAuthRefreshKey, "dest-oauth-refresh-keychain", "", "macOS keychain service name holding the destination OAuth credential written by `oauth login`")
 
 	cmd.Flags().StringVar(&f.statePath, "state", "", "path to the state database (default: per-user application state directory)")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would be copied without writing anything")
@@ -199,8 +211,10 @@ watch for authentication failures.`,
 	cmd.MarkFlagsMutuallyExclusive("config", "source-url")
 	cmd.MarkFlagsMutuallyExclusive("source-password-env", "source-password-file", "source-password-keychain")
 	cmd.MarkFlagsMutuallyExclusive("dest-password-env", "dest-password-file", "dest-password-keychain")
-	cmd.MarkFlagsMutuallyExclusive("source-oauth-cmd", "source-oauth-file")
-	cmd.MarkFlagsMutuallyExclusive("dest-oauth-cmd", "dest-oauth-file")
+	cmd.MarkFlagsMutuallyExclusive("source-oauth-cmd", "source-oauth-file",
+		"source-oauth-refresh-env", "source-oauth-refresh-file", "source-oauth-refresh-keychain")
+	cmd.MarkFlagsMutuallyExclusive("dest-oauth-cmd", "dest-oauth-file",
+		"dest-oauth-refresh-env", "dest-oauth-refresh-file", "dest-oauth-refresh-keychain")
 
 	return cmd
 }
@@ -527,8 +541,8 @@ func syncPair(f syncFlags) (config.Pair, error) {
 		}
 
 		merged := *pair
-		merged.Source.OAuth = oauthFrom(merged.Source.OAuth, f.sourceOAuthCmd, f.sourceOAuthFile)
-		merged.Dest.OAuth = oauthFrom(merged.Dest.OAuth, f.destOAuthCmd, f.destOAuthFile)
+		merged.Source.OAuth = oauthFrom(merged.Source.OAuth, f.sourceOAuth())
+		merged.Dest.OAuth = oauthFrom(merged.Dest.OAuth, f.destOAuth())
 		return merged, validateSides(merged, "%s endpoint: %w")
 	}
 
@@ -540,12 +554,12 @@ func syncPair(f syncFlags) (config.Pair, error) {
 		Source: config.Endpoint{
 			URL:      f.sourceURL,
 			Password: config.Secret{Env: f.sourcePasswordEnv, File: f.sourcePasswordFile, Keychain: f.sourcePasswordKeychain},
-			OAuth:    config.OAuth{Command: f.sourceOAuthCmd, File: f.sourceOAuthFile},
+			OAuth:    f.sourceOAuth(),
 		},
 		Dest: config.Endpoint{
 			URL:      f.destURL,
 			Password: config.Secret{Env: f.destPasswordEnv, File: f.destPasswordFile, Keychain: f.destPasswordKeychain},
-			OAuth:    config.OAuth{Command: f.destOAuthCmd, File: f.destOAuthFile},
+			OAuth:    f.destOAuth(),
 		},
 	}
 	return pair, validateSides(pair, "--%s-url: %w")
@@ -567,11 +581,36 @@ func validateSides(pair config.Pair, format string) error {
 // merging field by field. Merging would let a flag command sit beside a
 // configured file, which is two sources for one credential -- the ambiguity
 // validation exists to refuse.
-func oauthFrom(configured config.OAuth, command, file string) config.OAuth {
-	if command == "" && file == "" {
+func oauthFrom(configured, flags config.OAuth) config.OAuth {
+	if !flags.Set() {
 		return configured
 	}
-	return config.OAuth{Command: command, File: file}
+	return flags
+}
+
+// sourceOAuth and destOAuth read the OAuth flags for one side.
+func (f syncFlags) sourceOAuth() config.OAuth {
+	return config.OAuth{
+		Command: f.sourceOAuthCmd,
+		File:    f.sourceOAuthFile,
+		Refresh: config.Secret{
+			Env:      f.sourceOAuthRefreshEnv,
+			File:     f.sourceOAuthRefreshFile,
+			Keychain: f.sourceOAuthRefreshKey,
+		},
+	}
+}
+
+func (f syncFlags) destOAuth() config.OAuth {
+	return config.OAuth{
+		Command: f.destOAuthCmd,
+		File:    f.destOAuthFile,
+		Refresh: config.Secret{
+			Env:      f.destOAuthRefreshEnv,
+			File:     f.destOAuthRefreshFile,
+			Keychain: f.destOAuthRefreshKey,
+		},
+	}
 }
 
 // folderOptions merges the configuration file's folder rules with the flags.

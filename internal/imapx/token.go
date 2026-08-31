@@ -3,12 +3,16 @@ package imapx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hilli/imapsync-go/internal/oauthx"
 )
 
 // DefaultTokenTimeout bounds a minting command.
@@ -151,5 +155,45 @@ func FileToken(path string) Credential {
 			return "", fmt.Errorf("the token file %s is empty", path)
 		}
 		return token, nil
+	}}
+}
+
+// RefreshToken exchanges a stored refresh credential for access tokens,
+// re-exchanging whenever the server refuses the one held.
+//
+// The refresh token is mutable state: both providers may hand back a new one
+// on any exchange, and continuing to present the old one eventually stops
+// working. It is kept in memory for the life of the process rather than
+// written back, because the sources a credential can come from include an
+// environment variable, which cannot be written at all, and rewriting a
+// keychain item behind the user's back is worse than the problem it solves. A
+// migration is one long process, so in-memory is where it matters.
+func RefreshToken(creds oauthx.Credentials, timeout time.Duration) Credential {
+	if timeout <= 0 {
+		timeout = DefaultTokenTimeout
+	}
+	client := &http.Client{Timeout: timeout}
+
+	var mu sync.Mutex
+	current := creds
+
+	return &tokenCredential{source: func(ctx context.Context) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		token, err := oauthx.RefreshAccessToken(ctx, client, current)
+		if err != nil {
+			var provider *oauthx.Error
+			if errors.As(err, &provider) && provider.Dead() {
+				return "", fmt.Errorf("the stored oauth credential is no longer accepted (%w); "+
+					"run `imapsync-go oauth login` again to replace it", err)
+			}
+			return "", fmt.Errorf("refreshing the oauth token: %w", err)
+		}
+
+		if token.RefreshToken != "" && token.RefreshToken != current.RefreshToken {
+			current.RefreshToken = token.RefreshToken
+		}
+		return token.AccessToken, nil
 	}}
 }

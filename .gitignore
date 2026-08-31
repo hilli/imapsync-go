@@ -26,5 +26,12 @@
 .DS_Store
 *.swp
 
+# OAuth client secrets and minted tokens (real credentials, never commit).
+# The Google console downloads its client as client_secret_*.json; a refresh
+# blob may be called anything, so /secrets/ is the place to put one.
+/client_secret_*.json
+/*.oauth.json
+/secrets/
+
 # Sample messages captured from real accounts (personal mail, never commit)
 /samples/

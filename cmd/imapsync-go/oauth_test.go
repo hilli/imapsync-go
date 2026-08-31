@@ -24,7 +24,7 @@ func TestAnOAuthFlagReplacesTheConfiguredSourceOutright(t *testing.T) {
 
 	// A flag naming the other source displaces the command and the timeout
 	// that bounded it.
-	got := oauthFrom(configured, "", "/tmp/token")
+	got := oauthFrom(configured, config.OAuth{Command: "", File: "/tmp/token"})
 	if got.Command != "" {
 		t.Errorf("oauth after --oauth-file = %+v; the configured command survived", got)
 	}
@@ -37,14 +37,14 @@ func TestAnOAuthFlagReplacesTheConfiguredSourceOutright(t *testing.T) {
 
 	// A flag naming the same source still replaces it, so the flag's value
 	// wins rather than the config's.
-	got = oauthFrom(configured, "gcloud auth print-access-token", "")
+	got = oauthFrom(configured, config.OAuth{Command: "gcloud auth print-access-token", File: ""})
 	if got.Command != "gcloud auth print-access-token" {
 		t.Errorf("oauth after --oauth-cmd = %+v; the config's command won", got)
 	}
 
 	// Neither flag given leaves the configured block exactly as written,
 	// timeout included.
-	got = oauthFrom(configured, "", "")
+	got = oauthFrom(configured, config.OAuth{Command: "", File: ""})
 	if got != configured {
 		t.Errorf("oauth with no flag = %+v; want the configured block %+v unchanged", got, configured)
 	}
@@ -61,7 +61,7 @@ func TestATokenFlagBesideAConfiguredPasswordIsRefused(t *testing.T) {
 		URL:      "imaps://user@example.test",
 		Password: config.Secret{Env: "SOME_PASSWORD"},
 	}
-	ep.OAuth = oauthFrom(ep.OAuth, "get-token", "")
+	ep.OAuth = oauthFrom(ep.OAuth, config.OAuth{Command: "get-token", File: ""})
 
 	if err := ep.Validate(); err == nil {
 		t.Fatal("a token flag beside a configured password was accepted")

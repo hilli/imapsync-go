@@ -181,7 +181,8 @@ func endpointOptions() []*option {
 		// re-consultable, so an expiry mid-run costs a re-mint rather than the
 		// rest of the run.
 		no("oauthdirect1=s", "a token in the command line is readable by any process on the machine and expires "+
-			"within the hour; use --source-oauth-cmd or --source-oauth-file, which can be asked again"),
+			"within the hour; run `imapsync-go oauth login` once and use --source-oauth-refresh-file, or "+
+			"--source-oauth-cmd or --source-oauth-file, all of which can be asked again"),
 		no("oauthdirect2=s", "a token in the command line is readable by any process on the machine; see --oauthdirect1"),
 		tr("oauthaccesstoken1=s", "--source-oauth-file"),
 		tr("oauthaccesstoken2=s", "--dest-oauth-file"),

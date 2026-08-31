@@ -90,22 +90,45 @@ type OAuth struct {
 	// one held. It is for a token some other process maintains.
 	File string `yaml:"file"`
 
-	// Timeout bounds the command. Zero means the default.
+	// Refresh resolves to the JSON credential written by `imapsync-go oauth
+	// login`, which the tool exchanges for access tokens itself.
+	//
+	// A Secret rather than a path so that env, file and the macOS keychain all
+	// work without a token store of our own, and so nothing here is named for
+	// a provider or an account: two mailboxes are two secrets with two names,
+	// chosen by whoever writes the config.
+	Refresh Secret `yaml:"refresh"`
+
+	// Timeout bounds the command, or the token request when Refresh is set.
+	// Zero means the default.
 	Timeout time.Duration `yaml:"timeout"`
 }
 
-func (o OAuth) Set() bool { return o.Command != "" || o.File != "" }
+func (o OAuth) Set() bool { return o.Command != "" || o.File != "" || o.Refresh.Set() }
+
+// sources counts the token sources named, since exactly one must be.
+func (o OAuth) sources() int {
+	n := 0
+	for _, set := range []bool{o.Command != "", o.File != "", o.Refresh.Set()} {
+		if set {
+			n++
+		}
+	}
+	return n
+}
 
 func (o OAuth) Validate() error {
 	switch {
-	case o.Command != "" && o.File != "":
-		return errors.New("both oauth command and oauth file configured, set exactly one")
+	case o.sources() > 1:
+		return errors.New("more than one oauth token source configured, set exactly one of command, file or refresh")
 	case !o.Set():
-		return errors.New("no oauth token source configured, set one of command or file")
+		return errors.New("no oauth token source configured, set one of command, file or refresh")
 	case o.Timeout < 0:
 		return fmt.Errorf("oauth timeout %s is negative", o.Timeout)
 	case o.File != "" && o.Timeout != 0:
-		return errors.New("oauth timeout applies to a command, not a file")
+		return errors.New("oauth timeout applies to a command or a refresh credential, not a file")
+	case o.Refresh.Set():
+		return o.Refresh.Validate()
 	default:
 		return nil
 	}

@@ -329,6 +329,8 @@ Hiding one server line beats showing one client secret.
 - **O2** *(done, `739fd26`)* — compat translations, `probe`, configuration,
   documentation.
 - **O3** *(partly done; see §7.2)* — verification against real providers.
+- **O4** *(built; awaiting one live Gmail consent)* — `oauth login` and the
+  refresh exchange. See §10.
 
 ## 9. Decisions and what they cost
 
@@ -349,3 +351,146 @@ Hiding one server line beats showing one client secret.
 4. **XOAUTH2 only, not OAUTHBEARER.** Both targets advertise XOAUTH2;
    OAUTHBEARER would be a second mechanism serving nobody we have. Revisit when
    a server appears that requires it.
+
+## 10. Consent, and the refresh exchange
+
+§9 said getting a token was the provider's business. That was right about
+scope and wrong about the user: what it left behind was a shell script every
+user has to write, wrapping an exchange that is the same four fields every
+time. §7.2 then showed the documentation could not even describe the easy path
+correctly. So the tool grows the smallest thing that removes the script.
+
+### 10.1 What rclone can do that we cannot
+
+rclone's OAuth is pleasant because it ships **its own registered client IDs**,
+so a user consents and is done. That does not survive contact with mail scopes:
+
+- **Gmail** — `https://mail.google.com/` is *restricted*, not merely sensitive.
+  Shipping a shared client ID means verification plus an annual CASA
+  assessment. rclone never met this; it does Drive and Photos, not mail.
+- **Microsoft** — delegated `IMAP.AccessAsUser.All` *always* requires admin
+  consent, so a multi-tenant client ID we ship still needs every tenant's admin
+  to act. Shipping one buys nothing for the accounts that need it.
+
+So the user brings a client ID either way. The mechanics transfer; the shortcut
+does not. Registering an app is five minutes once. Writing a correct refresh
+exchange is not, and that is the part worth deleting.
+
+### 10.2 One blob, carried by the existing Secret
+
+A refresh exchange needs a client ID, an optional client secret, a refresh
+token and a token endpoint. Rather than four config fields and twelve flags,
+they travel as one JSON document held in a `config.Secret`:
+
+```yaml
+oauth:
+  refresh:
+    keychain: gmail-jens          # or file:, or env:
+```
+
+```json
+{
+  "client_id": "....apps.googleusercontent.com",
+  "client_secret": "...",
+  "refresh_token": "...",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+```
+
+`Secret` already resolves env, file and the macOS keychain, so this needs no
+token store and no new storage code: the keychain on macOS and a file elsewhere
+is a choice the user makes per endpoint rather than one the tool makes for
+them. Nothing is named for a provider, so two Gmail accounts are two secrets
+with two names — the naming is the user's.
+
+The blob is also the portable format. Moving a credential to a migration box is
+copying one file, which is the headless case without a second consent flow to
+maintain. It is deliberately the shape of Google's own `authorized_user` file.
+
+`token_uri` is required rather than defaulted. It is where a refresh token gets
+POSTed, and a guessed host is not a risk worth taking to save a line.
+
+### 10.3 Rotation, and what we do not do
+
+Providers may return a new refresh token on each exchange. We cannot write back
+into an environment variable, and rewriting a keychain item behind the user's
+back is worse than the problem. So the newest refresh token is held **in memory
+for the life of the process**, which is exactly the case that matters: a
+migration is one long process. A run that ends and is started again reads the
+stored one, which is still valid for both providers in normal use.
+
+When the exchange itself fails with `invalid_grant` the refresh token is dead,
+and the only useful thing to say is that the consent must be redone. There is
+no retry that helps.
+
+**Google's publishing status decides how long that takes to happen.** An app
+left in *Testing* issues refresh tokens that expire after **seven days**; *In
+production* issues long-lived ones, and is a separate axis from verification —
+unverified merely means a warning screen and a hundred-user cap.
+
+### 10.4 The consent
+
+A subcommand rather than a documented script, because a script is another thing
+to be wrong in the documentation and does not travel:
+
+```
+imapsync-go oauth login --client-file client_secret_….json --out secrets/gmail.json
+```
+
+Loopback, per RFC 8252: bind `127.0.0.1:0`, take whatever port the kernel gives,
+open a browser, catch the redirect, exchange the code. **PKCE (S256) is not
+optional** — Microsoft requires it of public clients, and Google recommends it.
+A `state` value is checked for the same reason.
+
+`--client-file` reads Google's installed-app JSON directly, so the client ID,
+secret and both endpoints come from the file the console downloads and the user
+pastes nothing. Explicit `--client-id`/`--auth-url`/`--token-url` cover
+Microsoft, where the console hands over no such file.
+
+Output goes to `--out`, `--keychain` or `--stdout`, exactly one, chosen rather
+than defaulted: the thing being written is a long-lived credential and it should
+not reach a terminal by accident.
+
+What this is **not**: a token store, an account registry, an export/import pair,
+or a device-code flow. The blob is the format, the `Secret` is the store, and a
+laptop consent plus a file copy is the headless story.
+
+### 10.5 What the build found that the design did not anticipate
+
+Two things, both discovered by running the code against the real thing rather
+than by reading a manual.
+
+**The keychain cannot be written the obvious way, or the second-obvious way.**
+`security add-generic-password -w VALUE` puts the credential in the argument
+vector, where `ps` can read it -- the same objection this design already makes
+to `--oauthdirect`, and worse here, because this credential is good for months
+rather than an hour. The documented alternative, `-w` with no value, prompts
+for the password instead; it reads that prompt the way `getpass` does and
+**silently truncates at 128 bytes**. A real credential is around 350. It would
+have stored a corrupt document and failed on the first sync, days later, with
+an error naming the wrong thing.
+
+What works is `security -i`, where the whole command line arrives on standard
+input, with the value hex-encoded via `-X`. Hex because the interactive parser
+splits on whitespace and honours quotes, and a client secret is free to contain
+both. Interactive mode also reports a failed sub-command in its output while
+still exiting zero, so the exit status alone cannot be believed.
+
+This is exactly the class of thing a unit test cannot find, so the test that
+covers it is a **round trip through the real `security(1)` on both sides**:
+`oauth login --keychain` writes, `config.Secret` reads, and the credential used
+contains a space, a double quote and a backslash. The two halves live in
+different packages and neither one alone can show they agree.
+
+**Suppressing a lint false positive revealed a true finding underneath.** The
+same pattern as the `Secret.Resolve` context fix in the previous phase:
+golangci-lint reports one issue per line, so annotating the `gosec` finding on
+the browser-opening lines exposed a `noctx` finding on the same lines that had
+been hidden by it. `OpenBrowser` now takes a context.
+
+The context bounds the *opener*, not the browser -- all three openers hand the
+URL to a running desktop and exit, so by the time a consent finishes, minutes
+later, the process being cancelled is long gone. What it protects against is
+the opposite case: an opener that hangs because there is no desktop to hand to.
+The child is also now reaped, since a process that may run for hours should not
+accumulate zombies.

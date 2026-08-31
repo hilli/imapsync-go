@@ -30,6 +30,9 @@ type probeFlags struct {
 	passwordKeychain string
 	oauthCmd         string
 	oauthFile        string
+	oauthRefreshEnv  string
+	oauthRefreshFile string
+	oauthRefreshKey  string
 
 	maxConnections int
 	withStatus     bool
@@ -78,6 +81,9 @@ refuses. It is off by default because it is intrusive; enable it with
 	cmd.Flags().StringVar(&f.passwordKeychain, "password-keychain", "", "macOS keychain service name holding the password")
 	cmd.Flags().StringVar(&f.oauthCmd, "oauth-cmd", "", "command printing an OAuth access token, for a server that no longer accepts passwords")
 	cmd.Flags().StringVar(&f.oauthFile, "oauth-file", "", "file holding an OAuth access token")
+	cmd.Flags().StringVar(&f.oauthRefreshEnv, "oauth-refresh-env", "", "environment variable holding the OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.oauthRefreshFile, "oauth-refresh-file", "", "file holding the OAuth credential written by `oauth login`")
+	cmd.Flags().StringVar(&f.oauthRefreshKey, "oauth-refresh-keychain", "", "macOS keychain service name holding the OAuth credential written by `oauth login`")
 
 	cmd.Flags().IntVar(&f.maxConnections, "max-connections", 0, "measure the connection ceiling, opening at most this many connections (0 disables)")
 	cmd.Flags().BoolVar(&f.withStatus, "status", false, "include per-folder message counts and UIDVALIDITY")
@@ -88,7 +94,8 @@ refuses. It is off by default because it is intrusive; enable it with
 
 	cmd.MarkFlagsMutuallyExclusive("config", "url")
 	cmd.MarkFlagsMutuallyExclusive("password-env", "password-file", "password-keychain")
-	cmd.MarkFlagsMutuallyExclusive("oauth-cmd", "oauth-file")
+	cmd.MarkFlagsMutuallyExclusive("oauth-cmd", "oauth-file",
+		"oauth-refresh-env", "oauth-refresh-file", "oauth-refresh-keychain")
 
 	return cmd
 }
@@ -189,7 +196,15 @@ func probeTargets(f probeFlags) ([]probeTarget, error) {
 			File:     f.passwordFile,
 			Keychain: f.passwordKeychain,
 		},
-		OAuth: config.OAuth{Command: f.oauthCmd, File: f.oauthFile},
+		OAuth: config.OAuth{
+			Command: f.oauthCmd,
+			File:    f.oauthFile,
+			Refresh: config.Secret{
+				Env:      f.oauthRefreshEnv,
+				File:     f.oauthRefreshFile,
+				Keychain: f.oauthRefreshKey,
+			},
+		},
 	}
 	if err := probeable(ep); err != nil {
 		return nil, fmt.Errorf("--url: %w", err)
