@@ -201,12 +201,25 @@ still leave every user talking to their own administrator. Registering your own
 takes a few minutes and is the only route either provider offers.
 
 - **Gmail** — in the Google Cloud console create an OAuth client of type
-  *Desktop app*, download its JSON, and pass it with `--client-file`. Add
-  yourself as a test user. Note that while the app is in *Testing* the refresh
-  token expires after **seven days**; moving it to *In production* makes it
-  long-lived, and for a client only you use that does not require verification
-  first -- an unverified production app shows a warning screen and is capped at
-  100 users.
+  *Desktop app*, download its JSON, and pass it with `--client-file`. Then, on
+  the OAuth consent screen, **add the mailbox you are migrating as a test
+  user** and leave the app in *Testing*.
+
+  Leaving it in Testing is not a shortcut, it is the only option.
+  `https://mail.google.com/` is a *restricted* scope, and publishing an app
+  that requests one requires verification plus an annual CASA security
+  assessment. Until that is done, moving the app to *In production* does not
+  relax anything -- it **blocks the consent outright** with `Access blocked:
+  <app> has not completed the Google verification process`. The familiar
+  "unverified app" warning screen and 100-user cap apply to *sensitive* scopes;
+  restricted ones are simply refused. Testing mode with an explicit test user
+  is the one path Google leaves open, which is why this is written down here
+  after walking into it.
+
+  The cost of Testing is that the **refresh token expires after seven days**.
+  For a migration that is usually longer than the job: consent, run, done. For
+  anything longer, expect to run `oauth login` again -- the failure is loud and
+  says so, rather than silently stopping halfway.
 - **Microsoft 365** — register an application in Entra ID as a *Mobile and
   desktop* platform with the redirect `http://localhost`, and give it the
   delegated `IMAP.AccessAsUser.All` permission from the *Office 365 Exchange

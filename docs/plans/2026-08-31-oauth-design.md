@@ -494,3 +494,34 @@ later, the process being cancelled is long gone. What it protects against is
 the opposite case: an opener that hangs because there is no desktop to hand to.
 The child is also now reaped, since a process that may run for hours should not
 accumulate zombies.
+
+### 10.6 What Google's publishing status actually decides
+
+Written down because the first live consent attempt was refused, and the
+refusal contradicted what this document said an hour earlier.
+
+The belief was that *Testing* costs a seven-day refresh token and *In
+production* fixes it, with verification a separate axis that costs only a
+warning screen and a 100-user cap. That is true of **sensitive** scopes. It is
+not true of **restricted** ones, and `https://mail.google.com/` is restricted.
+
+For a restricted scope there is no unverified production state to move to:
+
+| Publishing status | Restricted scope | Refresh token |
+| --- | --- | --- |
+| Testing, listed test user | consent succeeds | expires in 7 days |
+| Testing, anyone else | refused | -- |
+| In production, unverified | **refused outright** | -- |
+| In production, verified + annual CASA | consent succeeds | long-lived |
+
+So a personal migration stays in Testing with itself as a test user, and lives
+with seven days. That is not the compromise it first looks like -- seven days
+is longer than the 776,802-message run this tool was built for, which took two
+hours. What matters is that the expiry is **loud**: `invalid_grant` is
+recognised via `Error.Dead()` and reported as "the consent must be redone",
+rather than retried into a wall.
+
+The wrong version of this table was in the README for exactly one commit. The
+lesson is the one this project keeps relearning: **the provider decides, and
+the only way to know what it decided is to ask it.** No amount of reading the
+documentation produced the right table; one refused consent did.
