@@ -734,6 +734,54 @@ func TestAdoptionSkipsMessagesAlreadyClaimed(t *testing.T) {
 	}
 }
 
+// TestAStampedMessageIsNotStampedAgain guards the property that makes repeated
+// syncing safe: a message must not grow.
+//
+// The stamp goes on at the front, and until this was fixed it went on at every
+// hop, because the digest deliberately ignores the stamp and the fetch did too
+// — so the syncer could not see one that was already there. Backing an account
+// up, restoring it and backing it up again added three copies of the same
+// header to every message lacking a Message-ID, 84 bytes a time, and the copy
+// on disk was no longer the message the server holds.
+//
+// A source that already carries a stamp is not a hypothetical: it is exactly
+// what the destination of the previous sync looks like.
+func TestAStampedMessageIsNotStampedAgain(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, rev1Caps())
+	body := []byte("From: sender@example.test\r\n" +
+		"Subject: no identifier\r\n" +
+		"Date: Mon, 27 Aug 2026 12:00:00 +0000\r\n" +
+		"\r\nBody.\r\n")
+	id := ident.Parse(body)
+	stamped := append(ident.StampBytes(id.StampValue()), body...)
+	h.src.stuff(t, "INBOX", stamped)
+
+	h.run(t)
+
+	got := h.dst.contents(t, "INBOX")
+	if len(got) != 1 {
+		t.Fatalf("destination holds %d messages, want 1", len(got))
+	}
+	if n := strings.Count(got[0], ident.StampHeader+": "); n != 1 {
+		t.Errorf("the copy carries %d stamps, want 1:\n%q", n, got[0])
+	}
+	if got[0] != string(stamped) {
+		t.Errorf("the copy is not the message:\n got %q\nwant %q", got[0], stamped)
+	}
+
+	// The stamp still has to be the thing that finds it, or not writing a
+	// second one would have cost recovery its only handle on the message.
+	h.dbPath = filepath.Join(t.TempDir(), "fresh.db")
+	h.db = h.openDB(t)
+
+	second := h.run(t)
+	if copied, adopted, _ := second.Totals(); copied != 0 || adopted != 1 {
+		t.Errorf("after losing the database: copied %d, adopted %d; want the copy adopted", copied, adopted)
+	}
+}
+
 // TestRecoveryFindsAStampedCopy is tier 4 doing the job tier 3 cannot.
 //
 // The folder has synced before, so no bulk index is built and the suspect has to

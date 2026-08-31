@@ -422,3 +422,65 @@ func TestSentDateAcceptsTheDateFormsRealMailUses(t *testing.T) {
 		t.Errorf("an unpadded day gave %v", got)
 	}
 }
+
+// TestAStampAlreadyCarriedOutranksAFreshDigest names the reason the stamp is
+// read off the message rather than recomputed.
+//
+// The two normally agree, because the digest ignores the stamp. They come apart
+// when a server rewrites one of the digested headers after the stamp was
+// written — and then only one of the two numbers is any use, because a
+// destination can only be searched for the value its copy actually carries. A
+// search for the fresh digest matches nothing, and a message that cannot be
+// found is a message that gets copied a second time, which is the duplication
+// the stamp exists to prevent.
+func TestAStampAlreadyCarriedOutranksAFreshDigest(t *testing.T) {
+	t.Parallel()
+
+	const carried = "0000000000000000000000000000000000000000000000000000000000000000"
+	id := Parse(header(
+		StampHeader+": "+carried,
+		"Subject: rewritten by some server on the way",
+		"From: sender@example.test",
+		"Date: Mon, 27 Aug 2026 12:00:00 +0000",
+	))
+
+	if id.Digest == carried {
+		t.Fatal("the test is not testing anything: the digest happens to equal the carried stamp")
+	}
+	if !id.AlreadyStamped() {
+		t.Error("a message carrying a stamp was not recognised as carrying one")
+	}
+	if got := id.StampValue(); got != carried {
+		t.Errorf("StampValue() = %q, want the carried stamp %q", got, carried)
+	}
+
+	field, value, ok := SearchTerms(id, true)
+	if !ok || field != StampHeader || value != carried {
+		t.Errorf("SearchTerms() = %q, %q, %v; want a search for the stamp the copy carries", field, value, ok)
+	}
+}
+
+// TestTheDigestIgnoresTheStamp is the other half: stamping a message must not
+// change the identity the stamp records, or the value would be stale the moment
+// it was written.
+func TestTheDigestIgnoresTheStamp(t *testing.T) {
+	t.Parallel()
+
+	plain := header(
+		"Subject: no identifier",
+		"From: sender@example.test",
+		"Date: Mon, 27 Aug 2026 12:00:00 +0000",
+	)
+	bare := Parse(plain)
+	stamped := Parse(append(StampBytes(bare.StampValue()), plain...))
+
+	if stamped.Digest != bare.Digest {
+		t.Errorf("stamping changed the digest: %q became %q", bare.Digest, stamped.Digest)
+	}
+	if bare.AlreadyStamped() {
+		t.Error("an unstamped message reported a stamp")
+	}
+	if got := stamped.StampValue(); got != bare.StampValue() {
+		t.Errorf("the stamp read back as %q, want %q", got, bare.StampValue())
+	}
+}

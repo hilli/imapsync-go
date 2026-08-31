@@ -779,7 +779,7 @@ func (s *Syncer) indexDestination(ctx context.Context, dst imapx.Conn, folderID 
 		}
 		end := min(start+metaBatch, len(uids))
 
-		metas, err := dst.FetchMeta(ctx, uids[start:end], ident.Fields)
+		metas, err := dst.FetchMeta(ctx, uids[start:end], ident.FetchFields)
 		if err != nil {
 			return nil, fmt.Errorf("reading destination headers: %w", err)
 		}
@@ -1774,7 +1774,7 @@ func (s *Syncer) strangers(ctx context.Context, dst imapx.Conn, p *prepared, dst
 		}
 		end := min(start+metaBatch, len(unclaimed))
 
-		metas, err := dst.FetchMeta(ctx, unclaimed[start:end], ident.Fields)
+		metas, err := dst.FetchMeta(ctx, unclaimed[start:end], ident.FetchFields)
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading destination headers: %w", err)
 		}
@@ -1970,7 +1970,7 @@ func (s *Syncer) metaOnce(
 	if err = checkNumbering(lease, p, pair.Source); err != nil {
 		return nil, err
 	}
-	metas, err := lease.Conn().FetchMeta(ctx, chunk, ident.Fields)
+	metas, err := lease.Conn().FetchMeta(ctx, chunk, ident.FetchFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetching message metadata: %w", err)
 	}
@@ -2078,7 +2078,7 @@ func (s *Syncer) fetchOne(
 	}
 
 	var buf bytes.Buffer
-	if row.StampID != "" {
+	if row.StampID != "" && !id.AlreadyStamped() {
 		buf.Write(ident.StampBytes(row.StampID))
 	}
 
@@ -2476,7 +2476,7 @@ func (s *Syncer) recover(ctx context.Context, src, dst imapx.Conn, folderID int6
 // recovery would ever read. The set is bounded by how many appends were in
 // flight when the process died.
 func (s *Syncer) identify(ctx context.Context, src imapx.Conn, m state.Message) (ident.Identity, bool, error) {
-	metas, err := src.FetchMeta(ctx, []uint32{m.SrcUID}, ident.Fields)
+	metas, err := src.FetchMeta(ctx, []uint32{m.SrcUID}, ident.FetchFields)
 	if err != nil {
 		if errors.Is(err, imapx.ErrMessageGone) {
 			return ident.Identity{}, false, nil

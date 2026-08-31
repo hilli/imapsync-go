@@ -35,6 +35,15 @@ const StampHeader = "X-Imapsync-Go-Id"
 // it on the next run.
 var Fields = []string{"Message-ID", "Date", "Subject", "From", "To", "Cc"}
 
+// FetchFields are the headers to ask a server for.
+//
+// It is Fields plus the stamp, and the difference matters: the digest must not
+// cover the stamp, or stamping a message would change the identity the stamp
+// records. But a message already carrying one has to be *recognised* as
+// carrying one, or every sync adds another line to it. Fetching a field the
+// digest ignores is how both hold at once.
+var FetchFields = append(append([]string{}, Fields...), StampHeader)
+
 // The digest's framing bytes. Both are control characters that RFC 5322 does
 // not permit in a header value, so a value can never contain one.
 const (
@@ -53,14 +62,37 @@ type Identity struct {
 	// message apart from another. Adoption must not act on a weak identity: a
 	// wrong match silently drops a message instead of copying it.
 	Weak bool
+	// Stamp is the value of the StampHeader the message already carries, or ""
+	// if it carries none. It is only ever populated when the caller asked for
+	// FetchFields; Fields alone cannot see it.
+	Stamp string
 }
 
 // NeedsStamp reports whether a copy of this message should carry a stamp header
 // so it can be found again. Messages with a Message-ID are already findable.
 func (i Identity) NeedsStamp() bool { return i.MessageID == "" }
 
-// StampValue is the value to write into StampHeader for this message.
-func (i Identity) StampValue() string { return i.Digest }
+// StampValue is the value that identifies this message by stamp.
+//
+// A stamp the message already carries is preferred over a freshly computed
+// digest, because that is the value a destination can actually be searched
+// for. The two normally agree — the digest ignores the stamp, so stamping does
+// not change it — but a server that rewrote a digested header would make them
+// differ, and then the older stamp is the one written on the copies.
+func (i Identity) StampValue() string {
+	if i.Stamp != "" {
+		return i.Stamp
+	}
+	return i.Digest
+}
+
+// AlreadyStamped reports whether the message carries a stamp header.
+//
+// Writing a second one is not harmless. The stamp goes on at the front of the
+// message, so a message that keeps being copied — backed up, restored, backed
+// up again — grows by a header line each time, and every copy differs from the
+// last in a tool whose entire promise is that it does not alter mail.
+func (i Identity) AlreadyStamped() bool { return i.Stamp != "" }
 
 // Parse derives an identity from a raw header block, as returned by
 // FETCH BODY.PEEK[HEADER.FIELDS (...)].
@@ -97,6 +129,7 @@ func Parse(header []byte) Identity {
 	id := Identity{
 		Digest:    hex.EncodeToString(sum[:]),
 		MessageID: normalise(firstValue(fields, "Message-ID")),
+		Stamp:     normalise(firstValue(fields, StampHeader)),
 	}
 
 	// One surviving field is not enough to distinguish two messages: a shared
