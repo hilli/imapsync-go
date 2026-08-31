@@ -277,6 +277,18 @@ type FolderReport struct {
 	// refusal was decided, so the report can give the share rather than a bare
 	// count that means nothing on its own.
 	DestMessages int
+	// SourceHeaderless and DestHeaderless are messages a server returned an
+	// empty header for while reporting a non-zero size. That is a defect in the
+	// server rather than thin mail: the bytes exist and something between the
+	// mailbox and the wire declined to produce them.
+	//
+	// Counted because the damage is quiet. Such a message still copies, so no
+	// mail is lost and nothing in the run fails; what goes is the ability to
+	// identify it, which only shows up as a duplicate on some later run whose
+	// database is gone.
+	SourceHeaderless int
+	DestHeaderless   int
+
 	// Failed is how many were abandoned; see Errors.
 	Failed int
 
@@ -295,6 +307,15 @@ func (r Report) Totals() (copied, adopted, failed int) {
 		failed += f.Failed
 	}
 	return copied, adopted, failed
+}
+
+// Headerless sums the messages each side would not return a header for.
+func (r Report) Headerless() (source, dest int) {
+	for _, f := range r.Folders {
+		source += f.SourceHeaderless
+		dest += f.DestHeaderless
+	}
+	return source, dest
 }
 
 // Vanished sums the UIDs the sources listed and had no message for.
@@ -752,12 +773,27 @@ func (a adoption) take(id ident.Identity) (uint32, bool) {
 	return uids[0], true
 }
 
+// headerless reports that a server answered with no header at all for a message
+// it says has bytes.
+//
+// This is not a weak identity. A message carrying only a Subject is thin but
+// honest, and thin mail is ordinary. This is a server declining to produce bytes
+// it holds: mox stores a message whose header line is too long with its body
+// starting at offset 0, so BODY[HEADER] comes back empty while BODY[TEXT]
+// returns the header as well.
+//
+// The message still copies — the body is fetched separately — so nothing is lost
+// and nothing fails. What goes is identification: with no header there is
+// nothing to digest, so the copy is stamped instead and can never be adopted by
+// digest on a later run.
+func headerless(m imapx.MessageMeta) bool { return len(m.Header) == 0 && m.Size > 0 }
+
 // indexDestination reads the destination folder's headers and digests them.
 //
 // A stamped copy digests the same as its unstamped source, because the stamp
 // header is deliberately not part of the digest, so one index covers both
 // stamped and unstamped messages.
-func (s *Syncer) indexDestination(ctx context.Context, dst imapx.Conn, folderID int64, box imapx.Mailbox) (adoption, error) {
+func (s *Syncer) indexDestination(ctx context.Context, dst imapx.Conn, folderID int64, box imapx.Mailbox, lv *live) (adoption, error) {
 	uids, err := dst.AllUIDs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("enumerating destination messages: %w", err)
@@ -786,6 +822,9 @@ func (s *Syncer) indexDestination(ctx context.Context, dst imapx.Conn, folderID 
 		for _, meta := range metas {
 			if _, taken := claimed[meta.UID]; taken {
 				continue
+			}
+			if headerless(meta) {
+				lv.destHeaderless()
 			}
 			// A weak identity is one built from almost no header. It cannot
 			// tell two messages apart, so a match on it would adopt an
@@ -863,6 +902,18 @@ func (l *live) refused(n, population int) {
 	l.mu.Lock()
 	l.report.Refused += n
 	l.report.DestMessages = population
+	l.mu.Unlock()
+}
+
+func (l *live) sourceHeaderless() {
+	l.mu.Lock()
+	l.report.SourceHeaderless++
+	l.mu.Unlock()
+}
+
+func (l *live) destHeaderless() {
+	l.mu.Lock()
+	l.report.DestHeaderless++
 	l.mu.Unlock()
 }
 
@@ -1301,7 +1352,7 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	// a handful of targeted searches. Indexing then would mean reading every
 	// header in a 400k-message folder (§6.3) to learn nothing.
 	if len(p.todo) > 0 && dstBox.NumMessages > 0 && (row.LastSync.IsZero() || !kept) {
-		lv.index, err = s.indexDestination(ctx, dst, row.ID, dstBox)
+		lv.index, err = s.indexDestination(ctx, dst, row.ID, dstBox, lv)
 		if err != nil {
 			return nil, err
 		}
@@ -2038,6 +2089,9 @@ func (s *Syncer) fetchOne(
 	lv *live,
 ) error {
 	id := ident.Parse(meta.Header)
+	if headerless(meta) {
+		lv.sourceHeaderless()
+	}
 	flags := copyableFlags(meta.Flags)
 
 	row := state.Message{

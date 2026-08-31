@@ -498,3 +498,55 @@ func TestReportSaysWhatWidthEachSideSettledOn(t *testing.T) {
 		t.Errorf("the side that shrank must not be reported as holding, got:\n%s", got)
 	}
 }
+
+// TestReportNamesTheServerThatWouldNotReturnHeaders.
+//
+// The count has to survive into the text, because it is the only part of the run
+// that says anything at all: the messages copied, no folder failed, and the run
+// exits zero. It also has to name the side, since the first question on reading
+// it is which server to complain to, and the consequences differ — a headerless
+// source message gets stamped, a headerless destination message gets copied
+// twice.
+func TestReportNamesTheServerThatWouldNotReturnHeaders(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{
+			{Source: "INBOX", Dest: "INBOX", Messages: 40, Copied: 40, SourceHeaderless: 19},
+			{Source: "Sent", Dest: "Sent", Messages: 10, Copied: 10, DestHeaderless: 3},
+		},
+	}
+
+	var out bytes.Buffer
+	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "22 messages") {
+		t.Errorf("want the total across folders, got:\n%s", got)
+	}
+	if !strings.Contains(got, "19 on the source") || !strings.Contains(got, "3 on the destination") {
+		t.Errorf("want both sides named, got:\n%s", got)
+	}
+}
+
+// TestAHealthyRunSaysNothingAboutHeaders.
+//
+// A warning printed on every run is one nobody reads, and this one has to be
+// read on the day it appears.
+func TestAHealthyRunSaysNothingAboutHeaders(t *testing.T) {
+	t.Parallel()
+
+	report := syncer.Report{
+		Folders: []syncer.FolderReport{{Source: "INBOX", Dest: "INBOX", Messages: 40, Copied: 40}},
+	}
+
+	var out bytes.Buffer
+	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
+		t.Fatalf("writing report: %v", err)
+	}
+	if strings.Contains(out.String(), "no header") {
+		t.Errorf("a healthy run warned about headers:\n%s", out.String())
+	}
+}

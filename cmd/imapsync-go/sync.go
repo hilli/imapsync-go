@@ -395,6 +395,33 @@ func writeUncopiedNotes(p *printer, report syncer.Report) {
 	}
 }
 
+// writeHeaderlessNote reports a server that would not return headers.
+//
+// This reads like a warning because it is one, and nothing else in the run will
+// say so: the messages copied, no folder failed, and the exit code is zero. What
+// was lost is the ability to recognise those messages again, which stays
+// invisible until the day this database is gone and they are copied a second
+// time. The run that can still name the server is the run that has to.
+func writeHeaderlessNote(p *printer, report syncer.Report) {
+	source, dest := report.Headerless()
+	total := source + dest
+	if total == 0 {
+		return
+	}
+	var sides []string
+	if source > 0 {
+		sides = append(sides, fmt.Sprintf("%d on the source", source))
+	}
+	if dest > 0 {
+		sides = append(sides, fmt.Sprintf("%d on the destination", dest))
+	}
+	// The side counts go on a line of their own because their width varies with
+	// the numbers and with whether one side or both are named, and a clause of
+	// unknown length cannot be hand-wrapped into the middle of a paragraph.
+	p.printf("\n%d %s came back with no header at all, though the server gave each a size\n(%s).\nTheir bodies copied normally, but a message with no header cannot be identified,\nso each copy was stamped instead and none can be adopted by digest if this\ndatabase is lost. That is a defect in the server.\n",
+		total, plural(total, "message"), strings.Join(sides, ", "))
+}
+
 // autoConnections is the width each side opens when nobody has said otherwise.
 //
 // The governor can only ever give capacity up, so "auto" cannot discover a
@@ -1053,6 +1080,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
 
 	writeUncopiedNotes(p, report)
+	writeHeaderlessNote(p, report)
 	writeConnectionNote(p, conns)
 
 	// A refusal is the one thing here that asks the reader to do something, so
