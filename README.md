@@ -237,9 +237,35 @@ takes a few minutes and is the only route either provider offers.
   ```
 
   Microsoft's [Authenticate an IMAP, POP or SMTP connection using
-  OAuth][ms-oauth] is the reference. **Untested against a live tenant**: the
-  scope needs an administrator, and this tool's author does not have one to
-  test with. The Gmail path is verified end to end.
+  OAuth][ms-oauth] is the reference.
+
+  For a **personal** Microsoft account there is no administrator, so you
+  consent for yourself -- but registering the application still requires an
+  Entra tenant, which a personal account only gets by going through the Azure
+  free signup.
+
+### What is and is not verified
+
+Being precise about this, because "supports OAuth" is the kind of claim that is
+easy to make and expensive to discover the limits of mid-migration:
+
+| | |
+| --- | --- |
+| The XOAUTH2 exchange itself | **Verified.** Tested against a harness that decodes the SASL payload and insists on the exact `user=…\x01auth=Bearer …\x01\x01` framing, in front of a real IMAP server. |
+| A server refusing a token | **Verified against live servers** -- Exchange Online and iCloud. Both refuse without sending a challenge, which is why a refusal is treated structurally rather than by parsing one. |
+| Re-minting after a refusal | **Verified.** Including that a token minted and immediately refused stops rather than looping. |
+| `oauth login` and the refresh exchange | **Verified against a fake provider** that checks the PKCE verifier against the challenge rather than merely answering, plus a keychain round trip through the real `security(1)`. |
+| A *successful* handshake against Gmail or Exchange Online | **Not verified.** |
+
+The last row is a provider relationship rather than a piece of missing code.
+Gmail needs an annual CASA assessment to leave Testing mode; Exchange Online
+needs a tenant administrator, or an Azure signup for a personal account. Both
+were attempted and are documented above.
+
+What makes this acceptable rather than a lurking hole: **the untested part
+fails at `oauth login`, not mid-migration.** You will find out in the first ten
+seconds, before a single message moves. Confirm with `probe` before starting a
+long run and the risk is bounded.
 
 [ms-oauth]: https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
 

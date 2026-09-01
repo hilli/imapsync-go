@@ -329,8 +329,10 @@ Hiding one server line beats showing one client secret.
 - **O2** *(done, `739fd26`)* — compat translations, `probe`, configuration,
   documentation.
 - **O3** *(partly done; see §7.2)* — verification against real providers.
-- **O4** *(built; awaiting one live Gmail consent)* — `oauth login` and the
-  refresh exchange. See §10.
+- **O4** *(done, `b0c06e6`/`fd22e27`)* — `oauth login` and the refresh
+  exchange. See §10.
+- **O5** *(not attempted, deliberately)* — a successful handshake against a
+  live provider. See §11 for why this is where it stops.
 
 ## 9. Decisions and what they cost
 
@@ -425,8 +427,14 @@ no retry that helps.
 
 **Google's publishing status decides how long that takes to happen.** An app
 left in *Testing* issues refresh tokens that expire after **seven days**; *In
-production* issues long-lived ones, and is a separate axis from verification —
-unverified merely means a warning screen and a hundred-user cap.
+production* issues long-lived ones.
+
+*(Corrected in §10.6. This paragraph originally continued "and is a separate
+axis from verification — unverified merely means a warning screen and a hundred
+-user cap", which is true of sensitive scopes and false of restricted ones.
+`https://mail.google.com/` is restricted, and a live consent refused it. The
+wrong sentence is left described rather than silently deleted, because it is
+the belief anyone reading Google's documentation will arrive with.)*
 
 ### 10.4 The consent
 
@@ -525,3 +533,69 @@ The wrong version of this table was in the README for exactly one commit. The
 lesson is the one this project keeps relearning: **the provider decides, and
 the only way to know what it decided is to ask it.** No amount of reading the
 documentation produced the right table; one refused consent did.
+
+## 11. Where this stops, and why that is a decision rather than a failure
+
+Two providers were attempted end to end. Neither completed, and in both cases
+the obstacle was a **commercial gate rather than a technical one**:
+
+- **Gmail** — `https://mail.google.com/` is a restricted scope. Testing mode
+  works with a listed test user and costs a seven-day refresh token; leaving
+  Testing needs verification plus an annual CASA assessment. Not worth it for a
+  provider that still issues app passwords, which is the route the README now
+  recommends for a personal account.
+- **Exchange Online** — a work tenant needs an administrator to consent once.
+  A personal Microsoft account needs no administrator, but registering the
+  application still requires an Entra tenant, which a personal account only
+  gets through the Azure free signup.
+
+Shipping our own client ID -- the rclone approach -- was considered and
+declined. For Google it is impossible: the restricted scope makes public
+distribution require the CASA assessment. For Microsoft it would work, but it
+would help only personal accounts, since a work tenant's administrator has to
+consent to whatever client ID is used; and it would put a credential in the
+repository that one person owns indefinitely, whose withdrawal or abuse breaks
+every user at once. That is an ongoing obligation taken on before anyone has
+asked for it.
+
+### 11.1 What that leaves unproven, precisely
+
+Not "OAuth is untested". The gap is narrower than that, and naming it narrowly
+is the point:
+
+| Claim | Evidence |
+| --- | --- |
+| The SASL framing is right | The doorman harness decodes the payload and insists on the exact framing, in front of an honest IMAP server |
+| A refusal is handled | Live Exchange Online and live iCloud, both refusing without a challenge |
+| Expiry is survivable | A refused token re-mints; a freshly minted token that is refused stops instead of looping |
+| The consent flow is right | A fake provider that checks the PKCE verifier against the recorded challenge, rather than merely answering |
+| A live provider accepts a real token | **Nothing.** |
+
+The residual risk is concentrated in the *consent*, not the IMAP work -- and
+the consent is ordinary OAuth 2.0 with PKCE, the most heavily trodden path in
+the field.
+
+### 11.2 Why the failure mode makes this acceptable
+
+Every unverified step happens in `oauth login` or in the first authentication,
+**before a single message moves**. A user who hits a problem hits it in the
+first ten seconds of a command they ran deliberately, having just done an app
+registration and so already primed to debug it. `probe` exists to make that
+check explicit, and `--trace` shows the server's verdict with the token
+redacted.
+
+Contrast with where this project has actually been hurt: bugs that appear two
+hours into a run, in the largest folders only, after 135-message tests passed
+for weeks. That is the shape of defect worth spending money to prevent. This
+one is not that shape.
+
+### 11.3 What would reopen it
+
+- Someone with a tenant administrator, or an Azure account, offering to run
+  `oauth login` against Exchange Online once and report what happened.
+- A bug report describing a live refusal our tests do not reproduce; the trace
+  redactor was fixed by exactly that, and the harness to reproduce it exists.
+
+Until then the honest statement is the one in the README table: the exchange is
+verified, the refusal is verified against live servers, and a successful live
+handshake is not.
