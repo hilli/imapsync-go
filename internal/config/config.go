@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,9 +43,22 @@ const (
 	MapSpecialUse FolderMapMode = "special-use"
 	// MapName uses name-based rules only.
 	MapName FolderMapMode = "name"
-	// MapIdentity requires identical names on both sides.
-	MapIdentity FolderMapMode = "identity"
 )
+
+// folderMapModes is every mode Validate accepts, and the order the error lists
+// them in. The check reads this slice rather than naming the modes a second
+// time: a mode in one and not the other is accepted without being offered, or
+// offered without being accepted.
+//
+// There was a third, "identity", documented as requiring identical names on
+// both sides. Nothing ever read it. It was accepted by validation and then took
+// the same path as "name", which translates the hierarchy delimiter — so a
+// config asking for identical names got "Arkiv/DIR/Anja" renamed to
+// "Arkiv.DIR.Anja" against a server that separates with a dot. Removed rather
+// than implemented: no config in the wild can depend on behaviour it never had,
+// and a mode that means what its name says is a guard for same-layout
+// migrations that nobody has asked for.
+var folderMapModes = []FolderMapMode{MapSpecialUse, MapName}
 
 // Config is the top-level configuration document.
 type Config struct {
@@ -618,13 +632,30 @@ func (c *Config) Validate() error {
 			}
 		}
 
-		switch p.Folders.Map {
-		case MapSpecialUse, MapName, MapIdentity:
-		default:
-			return fmt.Errorf("pair %q: unknown folder map mode %q", p.Name, p.Folders.Map)
+		if !slices.Contains(folderMapModes, p.Folders.Map) {
+			return fmt.Errorf("pair %q: unknown folder map mode %q, want one of %s",
+				p.Name, p.Folders.Map, quotedModes())
 		}
 	}
 	return nil
+}
+
+// quotedModes renders the accepted folder map modes for an error message.
+func quotedModes() string {
+	quoted := make([]string, len(folderMapModes))
+	for i, m := range folderMapModes {
+		quoted[i] = strconv.Quote(string(m))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// FolderMapModes returns the accepted folder map modes.
+//
+// Exported so the code that consumes the mode can prove it does something
+// different with each one. Validation accepting a mode is not the same as the
+// mode meaning anything, which is how "identity" survived.
+func FolderMapModes() []FolderMapMode {
+	return slices.Clone(folderMapModes)
 }
 
 // Pair returns the named pair.

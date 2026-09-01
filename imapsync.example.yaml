@@ -41,9 +41,14 @@ pairs:
       max_inflight: 512MiB
 
     folders:
-      # Resolve Sent/Trash/Drafts/Junk/Archive by their SPECIAL-USE attribute
-      # rather than by name, so iCloud's "Sent Messages" maps onto mox's "Sent"
-      # without hand-written rules.
+      # How source folders find their destination. Two modes:
+      #   special-use  resolve Sent/Trash/Drafts/Junk/Archive by their
+      #                SPECIAL-USE attribute before falling back to the name,
+      #                so iCloud's "Sent Messages" maps onto mox's "Sent"
+      #                without hand-written rules.
+      #   name         name translation only. The hierarchy delimiter is still
+      #                converted, so "a/b" reaches a dot-separated server as
+      #                "a.b".
       map: special-use
       exclude:
         - "Notes"

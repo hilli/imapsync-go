@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -291,6 +294,15 @@ func TestParseRejectsBadConfigs(t *testing.T) {
 			wantErr: "unknown folder map mode",
 		},
 		{
+			// "identity" was accepted for the life of the tool and did nothing:
+			// it fell through to the same path as "name", which translates the
+			// hierarchy delimiter, so a config asking for identical names on
+			// both sides got them renamed. Rejecting it says so.
+			name:    "the inert identity map mode",
+			yaml:    "pairs:\n  - {name: p, source: {url: \"imaps://a@one.example\", password: {env: A}}, dest: {url: \"imaps://b@two.example\", password: {env: B}}, folders: {map: identity}}\n",
+			wantErr: "unknown folder map mode",
+		},
+		{
 			name:    "unknown field",
 			yaml:    "pairs:\n  - {name: p, sauce: nope, source: {url: \"imaps://a@one.example\", password: {env: A}}, dest: {url: \"imaps://b@two.example\", password: {env: B}}}\n",
 			wantErr: "field sauce not found",
@@ -307,6 +319,63 @@ func TestParseRejectsBadConfigs(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %q", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestTheMapModeErrorOffersOnlyModesThatWork closes the hole that let "identity"
+// live: a mode can be accepted by validation and mean nothing downstream. Every
+// mode the error names must parse, so the list cannot advertise a mode that does
+// not exist; the companion test in cmd/imapsync-go checks the other half, that
+// each one is distinguishable once consumed.
+func TestTheMapModeErrorOffersOnlyModesThatWork(t *testing.T) {
+	_, err := Parse([]byte(`
+pairs:
+  - name: p
+    source: {url: "imaps://a@one.example", password: {env: A}}
+    dest: {url: "imaps://b@two.example", password: {env: B}}
+    folders: {map: telepathy}
+`))
+	if err == nil {
+		t.Fatal("expected an error naming the accepted modes")
+	}
+
+	for _, mode := range folderMapModes {
+		if !strings.Contains(err.Error(), strconv.Quote(string(mode))) {
+			t.Errorf("error does not offer %q: %v", mode, err)
+		}
+		cfg, perr := Parse([]byte(fmt.Sprintf(`
+pairs:
+  - name: p
+    source: {url: "imaps://a@one.example", password: {env: A}}
+    dest: {url: "imaps://b@two.example", password: {env: B}}
+    folders: {map: %s}
+`, mode)))
+		if perr != nil {
+			t.Errorf("mode %q is offered but rejected: %v", mode, perr)
+			continue
+		}
+		if cfg.Pairs[0].Folders.Map != mode {
+			t.Errorf("mode %q parsed as %q", mode, cfg.Pairs[0].Folders.Map)
+		}
+	}
+}
+
+// TestFolderMapModesCannotBeScribbledOn guards the package's own list from its
+// callers. FolderMapModes is what Validate accepts, so a caller sorting or
+// appending to the returned slice would be editing the set of legal config
+// values from outside the package.
+func TestFolderMapModesCannotBeScribbledOn(t *testing.T) {
+	got := FolderMapModes()
+	if len(got) == 0 {
+		t.Fatal("no folder map modes")
+	}
+	got[0] = "telepathy"
+
+	if again := FolderMapModes(); again[0] == "telepathy" {
+		t.Error("FolderMapModes hands out the package's own slice")
+	}
+	if !slices.Contains(folderMapModes, MapSpecialUse) {
+		t.Errorf("the accepted modes were edited from outside: %v", folderMapModes)
 	}
 }
 

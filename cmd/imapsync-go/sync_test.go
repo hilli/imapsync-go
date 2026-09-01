@@ -230,6 +230,37 @@ func TestFolderOptionsMergesConfigAndFlags(t *testing.T) {
 	}
 }
 
+// TestEveryFolderMapModeIsDistinguishable is the test that would have caught
+// "identity", which config accepted for the life of the tool while nothing read
+// it: it produced the same folder.Options as "name", so a config asking for
+// identical names on both sides got the hierarchy delimiter translated like any
+// other run. A mode that cannot be told from another mode by its output is not a
+// mode, and the config file should not offer it.
+func TestEveryFolderMapModeIsDistinguishable(t *testing.T) {
+	t.Parallel()
+
+	seen := make(map[string][]config.FolderMapMode)
+	for _, mode := range config.FolderMapModes() {
+		opts, err := folderOptions(syncFlags{}, config.Folders{Map: mode})
+		if err != nil {
+			t.Fatalf("folderOptions(%q) error = %v", mode, err)
+		}
+		// None of these come from the map mode; they carry pointers and map
+		// iteration order that would make every mode look different for the
+		// wrong reason. Everything else is rendered, so a field added later is
+		// covered without this test being touched.
+		opts.Mappings, opts.Include, opts.Exclude, opts.Only = nil, nil, nil, nil
+		key := fmt.Sprintf("%+v", opts)
+		seen[key] = append(seen[key], mode)
+	}
+
+	for _, modes := range seen {
+		if len(modes) > 1 {
+			t.Errorf("folder map modes %v all produce the same options, so at most one of them does anything", modes)
+		}
+	}
+}
+
 // TestDerivePairIDDependsOnBothEndpoints guards a mix-up that would be nearly
 // impossible to diagnose: two migrations sharing a name in one state database,
 // so one's progress is read as the other's and messages are never copied.
