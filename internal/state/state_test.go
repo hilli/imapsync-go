@@ -445,7 +445,7 @@ func TestMirroredWillNotHandBackAMappingToARenumberedMailbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mirrored() error = %v", err)
 	}
-	if len(got) != 1 || got[0].SrcUID != 7 || got[0].DstUID != 70 {
+	if len(got) != 1 || got[7].SrcUID != 7 || got[7].DstUID != 70 {
 		t.Fatalf("Mirrored() = %v, want one mapping 7 -> 70", got)
 	}
 
@@ -477,7 +477,7 @@ func TestRecordFlagsIsWhatMirroredReadsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mirrored() error = %v", err)
 	}
-	if len(got) != 1 || got[0].Flags != "\\Answered \\Seen" {
+	if len(got) != 1 || got[7].Flags != "\\Answered \\Seen" {
 		t.Errorf("Mirrored() = %v, want the flags RecordFlags wrote", got)
 	}
 
@@ -489,8 +489,14 @@ func TestRecordFlagsIsWhatMirroredReadsBack(t *testing.T) {
 func seedFolder(t *testing.T, db *DB, srcUIDValidity, dstUIDValidity uint32) Folder {
 	t.Helper()
 
+	return seedFolderNamed(t, db, "INBOX", srcUIDValidity, dstUIDValidity)
+}
+
+func seedFolderNamed(t *testing.T, db *DB, name string, srcUIDValidity, dstUIDValidity uint32) Folder {
+	t.Helper()
+
 	ctx := context.Background()
-	f, err := db.EnsureFolder(ctx, "pair", "INBOX", "INBOX")
+	f, err := db.EnsureFolder(ctx, "pair", name, name)
 	if err != nil {
 		t.Fatalf("EnsureFolder() error = %v", err)
 	}
@@ -765,5 +771,44 @@ func TestAPathWithAPercentSignOpens(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("the database was not created where it was asked for: %v", err)
+	}
+}
+
+// TestMirroredReadsOnlyTheFolderAndUIDValidityAskedFor stands over the
+// assumption that makes the returned map safe to key by source UID.
+//
+// Source UIDs are unique per (folder, source UIDVALIDITY), not globally, so the
+// key holds only while the query filters on both. If it ever stops, the damage
+// is silent in the worst way: a map answers a second row for the same UID by
+// replacing the first, so the result still looks full, and the flag resync goes
+// on to STORE flags onto a destination message that belongs to a different
+// source message and records that as correct.
+//
+// The collision itself cannot be provoked -- the primary key forbids it -- so
+// this pins the scoping that keeps it unreachable. Rows outside the scope carry
+// distinct UIDs here on purpose: a widened read then lengthens the map, which
+// fails loudly, rather than colliding into it, which would not.
+func TestMirroredReadsOnlyTheFolderAndUIDValidityAskedFor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	f := seedFolder(t, db, 111, 222)
+	other := seedFolderNamed(t, db, "Other", 111, 222)
+	seedDone(t, db, f.ID, 111, 7, 222, 70)
+	seedDone(t, db, other.ID, 111, 8, 222, 71) // another folder
+	seedDone(t, db, f.ID, 110, 9, 222, 72)     // an earlier source UIDVALIDITY
+
+	got, err := db.Mirrored(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("Mirrored() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Mirrored() = %v, want only the one row in scope: a row from "+
+			"another folder or another source UIDVALIDITY was read as this folder's", got)
+	}
+	if got[7].DstUID != 70 {
+		t.Errorf("Mirrored()[7].DstUID = %d, want 70", got[7].DstUID)
 	}
 }

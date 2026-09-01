@@ -423,7 +423,24 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND state = ?`
 }
 
 // Mirrored returns the messages of a folder that are known to exist on both
-// sides, with the destination UID that names each one.
+// sides, keyed by source UID, with the destination UID that names each one.
+//
+// A map rather than a slice because every caller wants one. Returning a slice
+// meant the largest folder existed twice over at the moment it was needed: once
+// as 413,972 rows and again as the map the flag resync built from them, which
+// measured at roughly 19 MB of a 100 MB run. Scanning straight into the map
+// costs nothing and keeps one copy.
+//
+// The key is unique only because the primary key is
+// (folder_id, src_uidvalidity, src_uid) and this query filters on the first
+// two. Anything that widens the scope breaks that quietly, because a map
+// answers a second row for the same UID by replacing the first rather than
+// growing: the result still looks full, and the flag resync goes on to STORE
+// onto a destination message belonging to a different source message. There is
+// no runtime check for it -- the primary key makes the collision unreachable,
+// so a check could never fire or be tested -- which is exactly why the scoping
+// is load-bearing and TestMirroredReadsOnlyTheFolderAndUIDValidityAskedFor
+// stands over it.
 //
 // The destination UIDVALIDITY is part of the question rather than an
 // afterthought. A dst_uid recorded under a different validity names a message
@@ -431,7 +448,7 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND state = ?`
 // that number now — silently marking a stranger read. When the destination has
 // been renumbered this returns nothing, which is the right answer: there is no
 // mapping left to update through.
-func (d *DB) Mirrored(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) ([]Mirror, error) {
+func (d *DB) Mirrored(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) (map[uint32]Mirror, error) {
 	const query = `
 SELECT src_uid, dst_uid, flags FROM messages
 WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = ? AND dst_uid != 0`
@@ -442,13 +459,13 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = 
 	}
 	defer func() { _ = rows.Close() }()
 
-	var out []Mirror
+	out := make(map[uint32]Mirror)
 	for rows.Next() {
 		var m Mirror
 		if err := rows.Scan(&m.SrcUID, &m.DstUID, &m.Flags); err != nil {
 			return nil, fmt.Errorf("reading the message map for folder %d: %w", folderID, err)
 		}
-		out = append(out, m)
+		out[m.SrcUID] = m
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("reading the message map for folder %d: %w", folderID, err)

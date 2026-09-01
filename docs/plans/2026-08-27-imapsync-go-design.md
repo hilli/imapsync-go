@@ -276,6 +276,30 @@ and read into memory anyway, because refusing to copy it would be worse and
 blocking for ever would be worse still. If a mailbox of very large attachments
 ever justifies spooling, adding it inside `internal/budget` is contained.
 
+**The message map, not the message bodies, was where the memory went.** The
+budget bounds what is in flight, so the obvious next suspect was the other
+unbounded read: `FetchFlags` collected a `[]FlagSet` for every message in the
+folder, 413,972 of them on the account this is measured against, to find the
+three whose flags had moved. It was converted to a streaming callback, and the
+peak did not move — 100.5 MB before, 101.1 MB after.
+
+Measuring the phase rather than the change found the real holder. Running the
+same folder with `--noresyncflags` came in at 81.5 MB, so the flag resync cost
+19 MB; and it cost that in `resyncFlags`, which read the folder's message map
+into a slice and then copied it wholesale into a map keyed by source UID. The
+folder existed twice over, and neither copy was the thing being streamed.
+`Mirrored` now scans straight into the map. Peak RSS 84.5 MB, stable across
+runs: 16 MB off a 100 MB run, leaving the flag phase costing 3 MB against a
+floor of 81.5.
+
+The streaming change was reverted rather than kept alongside. It was correct and
+it was tested, but it bought nothing measurable, and a change that survives on
+the argument it was written with rather than the number it produced is how a
+codebase fills with plausible work. The lesson is narrower than "measure first",
+which was done: the *baseline* has to be the same workload. The first reading
+compared against an earlier run that had copied 47 messages, and would have
+reported a 9 MB win that was entirely those copies.
+
 The budget is charged *after* the check for a message already at the destination,
 not before. Ordering it the other way would make a run that lost its state
 database queue and pay for bodies it is about to discard; with the check first,
