@@ -96,6 +96,9 @@ func (c *Conn) CreateFolder(ctx context.Context, name string) error {
 // SubscribeFolder records a folder as subscribed, so a restore can put the
 // subscription back.
 func (c *Conn) SubscribeFolder(ctx context.Context, name string) error {
+	if c.store.readOnly {
+		return ErrReadOnly
+	}
 	f, err := c.store.open(ctx, name)
 	if err != nil {
 		return err
@@ -177,6 +180,9 @@ func (c *Conn) FetchBody(_ context.Context, uid uint32, w io.Writer) (int64, err
 // rename and the database row leaves a message that reconciliation adopts,
 // with the right date, on the next run.
 func (c *Conn) Append(ctx context.Context, mailbox string, msg imapx.AppendMessage) (imapx.AppendResult, error) {
+	if c.store.readOnly {
+		return imapx.AppendResult{}, ErrReadOnly
+	}
 	f, err := c.store.open(ctx, mailbox)
 	if err != nil {
 		return imapx.AppendResult{}, err
@@ -304,6 +310,9 @@ func (c *Conn) StoreFlags(ctx context.Context, uid uint32, flags []string) error
 	if c.sel == nil {
 		return ErrNoMailbox
 	}
+	if c.store.readOnly {
+		return ErrReadOnly
+	}
 	if c.readOnly {
 		return fmt.Errorf("storing flags on %d: mailbox is open read-only", uid)
 	}
@@ -319,6 +328,9 @@ func (c *Conn) StoreFlags(ctx context.Context, uid uint32, flags []string) error
 func (c *Conn) DeleteMessages(ctx context.Context, uids []uint32) error {
 	if c.sel == nil {
 		return ErrNoMailbox
+	}
+	if c.store.readOnly {
+		return ErrReadOnly
 	}
 	if c.readOnly {
 		return errors.New("deleting messages: mailbox is open read-only")

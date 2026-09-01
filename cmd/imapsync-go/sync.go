@@ -765,14 +765,27 @@ func endpoint(ep config.Endpoint, f syncFlags, insecure bool, trace io.Writer, s
 		}
 	}
 
-	// A dry run promises to change nothing, and creating the destination tree
-	// is a change. Where the directory is not there yet, an empty scratch store
-	// answers every question the run actually asks — no folders, no messages —
-	// and is the truth rather than a stand-in for it.
+	// A dry run promises to change nothing, and both halves of this are needed
+	// to keep that promise.
+	//
+	// Where the directory is not there yet, an empty scratch store answers
+	// every question the run actually asks — no folders, no messages — and is
+	// the truth rather than a stand-in for it.
+	//
+	// Where it is there, the run has to read it or report a backup it has
+	// already made as entirely uncopied. Opening it the ordinary way writes:
+	// Open creates an INBOX inside it, and selecting a folder reconciles,
+	// which renames stray files and rewrites rows. OpenReadOnly reads the same
+	// answers and refuses every write.
 	if side == sideDest && f.dryRun {
 		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 			return scratchStore()
 		}
+		store, err := localstore.OpenReadOnly(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		return store.Connect, store, nil
 	}
 
 	store, err := localstore.Open(path)

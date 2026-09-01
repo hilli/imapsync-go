@@ -23,10 +23,18 @@ import (
 type Store struct {
 	root string
 
+	// readOnly stores belong to a dry run. Every write refuses rather than
+	// being merely unused, because "nothing calls it" is not a guarantee and
+	// this one is made to a backup.
+	readOnly bool
+
 	mu      sync.Mutex
 	folders map[string]*folder
 	closed  bool
 }
+
+// ErrReadOnly is what every write reports on a store opened for a dry run.
+var ErrReadOnly = errors.New("this store is open read-only for a dry run")
 
 // Open opens or creates a store rooted at dir.
 func Open(dir string) (*Store, error) {
@@ -47,6 +55,32 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens an existing store for a dry run, creating nothing.
+//
+// Open is not usable for this. It creates the root directory and then an
+// INBOX inside it, so pointing a dry run at a directory the user had already
+// made would materialise a mail store in it — and opening a folder would go on
+// to adopt stray files by renaming them. Both were reachable, and the second
+// rewrites mail the run had promised to leave alone.
+//
+// The directory has to exist, because the caller that has one that does not
+// uses a scratch store instead: an empty store is the honest answer to "what
+// is already at the destination" when the answer is nothing.
+func OpenReadOnly(dir string) (*Store, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening store %s: %w", dir, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("opening store %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("opening store %s: not a directory", abs)
+	}
+	return &Store{root: abs, readOnly: true, folders: make(map[string]*folder)}, nil
 }
 
 // Root is the directory the store lives in.
@@ -144,7 +178,11 @@ func (s *Store) open(ctx context.Context, name string) (*folder, error) {
 		return nil, fmt.Errorf("selecting %q: %w", name, fs.ErrNotExist)
 	}
 
-	f, err := openFolder(ctx, dir)
+	open := openFolder
+	if s.readOnly {
+		open = openFolderReadOnly
+	}
+	f, err := open(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +201,9 @@ func (s *Store) open(ctx context.Context, name string) (*folder, error) {
 // create makes a folder, refusing a name that would collide with an existing
 // one on a case-insensitive filesystem.
 func (s *Store) create(ctx context.Context, name string) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	dir := s.dir(name)
 	// The collision check comes first, because on a case-insensitive
 	// filesystem the existence check below cannot tell "this folder already
@@ -259,7 +300,14 @@ func (s *Store) trueName(ctx context.Context, dir string) string {
 	}
 	s.mu.Unlock()
 
-	db, err := sql.Open("sqlite", dsn(filepath.Join(dir, dbName)))
+	// A read-only store reads even this with the immutable handle: listing the
+	// folders is enough to open every database in the tree, and the read-write
+	// URI would leave -wal and -shm beside each one.
+	uri := dsn(filepath.Join(dir, dbName))
+	if s.readOnly {
+		uri = roDSN(filepath.Join(dir, dbName))
+	}
+	db, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return ""
 	}

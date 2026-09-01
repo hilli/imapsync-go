@@ -17,6 +17,7 @@
 # Local configuration that may reference real accounts
 /imapsync.yaml
 /imapsync.local.yaml
+/config-localstore.yaml
 
 # Worktrees, if adopted later
 /.worktrees/

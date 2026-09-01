@@ -94,6 +94,18 @@ tasks:
       - coverage.out
       - coverage.html
 
+  docs:
+    desc: Regenerate docs/imapsync-options.md from the compat table and the command help
+    aliases: [d]
+    cmds:
+      - go generate ./...
+    sources:
+      - cmd/**/*.go
+      - internal/compat/*.go
+      - internal/docsgen/*.go
+    generates:
+      - docs/imapsync-options.md
+
   check:
     desc: Run all checks (lint + test)
     aliases: [ck]
@@ -102,12 +114,13 @@ tasks:
       - task: test
 
   all:
-    desc: Run everything (lint, build, test, complete)
+    desc: Run everything (lint, build, test, docs, complete)
     aliases: [a]
     cmds:
       - task: lint
       - task: build
       - task: test
+      - task: docs
       - task: complete
 
   release-test:

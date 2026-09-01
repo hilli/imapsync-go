@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS messages (
 type folder struct {
 	name string // the true IMAP name, as the server spelled it
 	dir  string
-	db   *sql.DB
+	db   *sql.DB // nil when the cache could not be read and was done without
 
 	mu          sync.Mutex
 	uidNext     uint32
@@ -71,6 +71,24 @@ func dsn(path string) string {
 // escapeDSNPath hides from SQLite's URI parser the three characters that mean
 // something to it.
 var escapeDSNPath = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace
+
+// roDSN builds the URI for reading a folder database without touching it.
+//
+// Both halves are load-bearing, and the second was measured rather than
+// assumed. mode=ro alone refuses writes but still creates -wal and -shm beside
+// the database on open, and leaves them there after close: a write into the
+// very directory a dry run promised not to touch. Adding immutable=1 creates
+// neither.
+//
+// immutable=1 asserts the file will not change while it is open. This handle
+// cannot break that promise itself, since SQLite refuses its writes outright.
+// A real sync running against the same store at the same time would make the
+// preview stale — the reader ignores the WAL and sees the last checkpoint —
+// and staleness in a preview is the right side to fail on, because no read can
+// damage the store.
+func roDSN(path string) string {
+	return "file:" + escapeDSNPath(path) + "?mode=ro&immutable=1"
+}
 
 // createFolder makes the directory, its staging area and its database.
 func createFolder(ctx context.Context, dir, name string) error {
@@ -169,6 +187,60 @@ func openFolder(ctx context.Context, dir string) (*folder, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// openFolderReadOnly opens a folder for a dry run, which has to leave the
+// directory exactly as it found it.
+//
+// It differs from openFolder in what it refuses to do rather than in what it
+// can answer: no schema is applied, no missing folder row is written, no
+// unusable database is rebuilt, and the reconcile pass does not run.
+//
+// Skipping reconcile costs far less than it looks like it should, because
+// existence is read from the directory and never from the database — uids()
+// scans either way. What is given up is the annotations for a message dropped
+// into the folder by hand and not yet adopted: the dry run reports it as
+// present with no flags rather than renaming somebody's file mid-preview.
+func openFolderReadOnly(ctx context.Context, dir string) (*folder, error) {
+	f := &folder{dir: dir}
+
+	db, err := sql.Open("sqlite", roDSN(filepath.Join(dir, dbName)))
+	if err == nil {
+		if err = db.PingContext(ctx); err == nil {
+			err = f.loadReadOnly(ctx, db)
+		}
+		if err != nil {
+			_ = db.Close()
+		}
+	}
+	if err != nil {
+		// The database is a cache, and this run is not allowed to repair or
+		// replace one. The mail beside it is still the truth and still
+		// readable, so the folder does without: unknown flags rather than a
+		// dry run that fails on a file it was never going to write.
+		f.db = nil
+		f.name = folderName(filepath.Base(dir))
+		if found, serr := scan(dir); serr == nil {
+			f.uidNext = found.maxUID + 1
+		}
+		return f, nil
+	}
+	f.db = db
+	return f, nil
+}
+
+// loadReadOnly reads the folder row without the INSERT that load falls back on.
+func (f *folder) loadReadOnly(ctx context.Context, db *sql.DB) error {
+	var subscribed int
+	err := db.QueryRowContext(ctx,
+		`SELECT name, uidvalidity, uidnext, subscribed FROM folder WHERE id = 1`).
+		Scan(&f.name, &f.uidValidity, &f.uidNext, &subscribed)
+	if err != nil {
+		return fmt.Errorf("reading folder %s: %w", f.dir, err)
+	}
+	noteUIDValidity(f.uidValidity)
+	f.subscribed = subscribed != 0
+	return nil
 }
 
 func healthy(ctx context.Context, db *sql.DB) error {
@@ -451,6 +523,9 @@ func (f *folder) records(ctx context.Context, uids []uint32) ([]record, error) {
 	if err != nil {
 		return nil, err
 	}
+	if f.db == nil {
+		return f.diskRecords(present, uids)
+	}
 	live := make(map[uint32]struct{}, len(present))
 	for _, uid := range present {
 		live[uid] = struct{}{}
@@ -496,6 +571,34 @@ func (f *folder) records(ctx context.Context, uids []uint32) ([]record, error) {
 	return out, nil
 }
 
+// diskRecords answers from the filesystem alone, for a read-only folder whose
+// database could not be read and may not be rebuilt.
+//
+// The modification time stands in for the internal date and the flags are
+// empty, which is precisely what reconcile records for a message it finds on
+// disk with no row of its own.
+func (f *folder) diskRecords(present, uids []uint32) ([]record, error) {
+	wanted := make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		wanted[uid] = struct{}{}
+	}
+
+	var out []record
+	for _, uid := range present {
+		if uids != nil {
+			if _, ok := wanted[uid]; !ok {
+				continue
+			}
+		}
+		info, err := os.Stat(f.path(uid))
+		if err != nil {
+			continue // vanished mid-scan
+		}
+		out = append(out, record{uid: uid, date: info.ModTime(), size: info.Size()})
+	}
+	return out, nil
+}
+
 func (f *folder) path(uid uint32) string {
 	return filepath.Join(f.dir, messageRel(uid))
 }
@@ -531,6 +634,9 @@ func joinFlags(flags []string) string {
 // removes the -wal and -shm files instead of leaving them empty, so a store at
 // rest is a tree of messages and one quiescent database per folder.
 func (f *folder) close() error {
+	if f.db == nil {
+		return nil // a folder read without its cache has nothing to close
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, err := f.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
