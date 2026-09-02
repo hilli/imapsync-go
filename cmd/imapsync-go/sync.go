@@ -99,13 +99,15 @@ type syncFlags struct {
 	memoryLimitSet bool
 	delete2Set     bool
 
-	progressEvery  time.Duration
-	full           bool
-	resyncFlags    bool
-	noResyncFlags  bool
-	verifyDest     bool
-	syncDuplicates bool
-	subscribe      bool
+	progressEvery        time.Duration
+	full                 bool
+	resyncFlags          bool
+	noResyncFlags        bool
+	verifyDest           bool
+	syncDuplicates       bool
+	delete2Duplicates    bool
+	delete2DuplicatesSet bool
+	subscribe            bool
 
 	delete2       bool
 	deleteCeiling float64
@@ -144,6 +146,7 @@ watch for authentication failures.`,
 			f.dstConnsSet = cmd.Flags().Changed("dest-connections")
 			f.memoryLimitSet = cmd.Flags().Changed("memory-limit")
 			f.delete2Set = cmd.Flags().Changed("delete2")
+			f.delete2DuplicatesSet = cmd.Flags().Changed("delete2duplicates")
 			return runSync(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
@@ -204,6 +207,7 @@ watch for authentication failures.`,
 	// is the way off.
 	cmd.Flags().BoolVar(&f.verifyDest, "verify-dest", true, "check the destination still holds the copies the state database recorded, and copy back any it does not")
 	cmd.Flags().BoolVar(&f.syncDuplicates, "sync-duplicates", false, "copy a folder's repeated messages once each instead of once in total")
+	cmd.Flags().BoolVar(&f.delete2Duplicates, "delete2duplicates", false, "remove messages the destination holds more than once, keeping one (implied by --delete2; give --delete2duplicates=false to decline)")
 	cmd.Flags().BoolVar(&f.subscribe, "subscribe", true, "subscribe to destination folders as they are created, so clients show them")
 	cmd.Flags().BoolVar(&f.delete2, "delete2", false, "delete destination messages whose source counterpart is gone")
 	cmd.Flags().Float64Var(&f.deleteCeiling, "delete2-ceiling", 0.10, "refuse to delete more than this fraction of a folder's copied messages in one run")
@@ -224,6 +228,19 @@ watch for authentication failures.`,
 		"dest-oauth-refresh-env", "dest-oauth-refresh-file", "dest-oauth-refresh-keychain")
 
 	return cmd
+}
+
+// duplicateRemoval resolves --delete2duplicates against --delete2.
+//
+// Given explicitly the flag decides both ways; left alone it follows --delete2.
+// Read through Changed rather than through the value, because a plain boolean
+// check could only ever turn destruction on -- which is exactly the bug that
+// let a config saying delete2: true be silently ignored, in reverse.
+func (f *syncFlags) duplicateRemoval() (on, off bool) {
+	if !f.delete2DuplicatesSet {
+		return false, false
+	}
+	return f.delete2Duplicates, !f.delete2Duplicates
 }
 
 func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
@@ -287,24 +304,28 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		}
 	}
 
+	dedupOn, dedupOff := f.duplicateRemoval()
+
 	started := time.Now()
 	report, err := syncer.New(srcPool, dstPool, db, bytesInFlight, syncer.Options{
-		PairID:         pairName,
-		Folders:        opts,
-		DryRun:         f.dryRun,
-		Full:           f.full,
-		Filter:         messages,
-		SourceSearch:   sourceSearch,
-		DestSearch:     destSearch,
-		NoResyncFlags:  f.noResyncFlags || !f.resyncFlags,
-		NoVerifyDest:   !f.verifyDest,
-		SyncDuplicates: f.syncDuplicates,
-		NoSubscribe:    !f.subscribe,
-		Delete2:        resolveDelete2(f, pair),
-		DeleteCeiling:  f.deleteCeiling,
-		Force:          f.force,
-		ProgressEvery:  f.progressEvery,
-		Logger:         slog.Default(),
+		PairID:              pairName,
+		Folders:             opts,
+		DryRun:              f.dryRun,
+		Full:                f.full,
+		Filter:              messages,
+		SourceSearch:        sourceSearch,
+		DestSearch:          destSearch,
+		NoResyncFlags:       f.noResyncFlags || !f.resyncFlags,
+		NoVerifyDest:        !f.verifyDest,
+		SyncDuplicates:      f.syncDuplicates,
+		Delete2Duplicates:   dedupOn,
+		NoDelete2Duplicates: dedupOff,
+		NoSubscribe:         !f.subscribe,
+		Delete2:             resolveDelete2(f, pair),
+		DeleteCeiling:       f.deleteCeiling,
+		Force:               f.force,
+		ProgressEvery:       f.progressEvery,
+		Logger:              slog.Default(),
 	}).Run(ctx)
 
 	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun, connections{
@@ -478,6 +499,31 @@ func writeDuplicatesNote(p *printer, report syncer.Report) {
 	p.printf("\n%d source %s byte for byte identical to one already copied and %s not copied a second time.\n"+
 		"The destination holds one copy of %s. Use --sync-duplicates to copy every one.\n",
 		n, subject, verb, each)
+}
+
+// writeRemovedNote reports duplicates taken off the destination.
+//
+// Separate from the deletion column because the two are different events. A
+// deleted message left the source and so left the destination; a removed one is
+// still there under another UID, and nothing was lost.
+//
+// The sentence says the bodies were compared in full, because a reader who sees
+// a mail tool report destroying mail wants to know at once what it decided on.
+func writeRemovedNote(p *printer, report syncer.Report, dryRun bool) {
+	n := report.Removed()
+	if n == 0 {
+		return
+	}
+	subject, kept := "messages the destination held", "one copy of each was kept"
+	if n == 1 {
+		subject, kept = "message the destination held", "one copy was kept"
+	}
+	if dryRun {
+		p.printf("\n%d %s more than once would be removed by a real run.\n", n, subject)
+		return
+	}
+	p.printf("\n%d %s more than once were removed, and %s.\nNothing was decided on a guess: the whole message was compared, byte for byte.\n",
+		n, subject, kept)
 }
 
 // writeHeaderlessNote reports a server that would not return headers.
@@ -1232,6 +1278,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	writeUncopiedNotes(p, report)
 	writeMissingNote(p, report, dryRun)
 	writeDuplicatesNote(p, report)
+	writeRemovedNote(p, report, dryRun)
 	writeHeaderlessNote(p, report)
 	writeConnectionNote(p, conns)
 

@@ -323,6 +323,7 @@ Flags:
       --config string                               path to a configuration file
       --delete2                                     delete destination messages whose source counterpart is gone
       --delete2-ceiling float                       refuse to delete more than this fraction of a folder's copied messages in one run (default 0.1)
+      --delete2duplicates                           remove messages the destination holds more than once, keeping one (implied by --delete2; give --delete2duplicates=false to decline)
       --dest-connections int                        connections to open to the destination; overrides the config's concurrency.dest (default 16)
       --dest-insecure                               skip TLS certificate verification for the destination, for example a self-signed server on your own network
       --dest-oauth-cmd string                       command printing an OAuth access token for the destination

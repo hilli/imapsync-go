@@ -611,7 +611,12 @@ func TestASecondCopyOfSomethingTheSourceHasIsKept(t *testing.T) {
 	twin := testMessage("twin", "twin@example.test")
 	h.src.stuff(t, "INBOX", twin)
 
-	opts := syncer.Options{Delete2: true, Full: true, Force: true}
+	// Duplicate removal is off, because this test is about the other rule.
+	// --delete2 implies --delete2duplicates, which would take the second copy
+	// away for repeating the first rather than for anything to do with the
+	// source, and a test that cannot say which rule acted proves neither.
+	// TestDelete2ImpliesRemovingDuplicates covers the implication.
+	opts := syncer.Options{Delete2: true, Full: true, Force: true, NoDelete2Duplicates: true}
 	if _, err := syncFlaky(t, h, 1, 1, opts, nil, nil); err != nil {
 		t.Fatalf("first run: %v", err)
 	}

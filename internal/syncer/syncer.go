@@ -149,6 +149,25 @@ type Options struct {
 	// as though it had never been sent.
 	NoVerifyDest bool
 
+	// Delete2Duplicates removes messages a destination folder holds more than
+	// once, keeping one.
+	//
+	// Off by default and implied by Delete2, as in imapsync: a run asked to
+	// make the destination look like the source, that then left it holding two
+	// copies of things the source holds one of, would be contradicting the
+	// request.
+	Delete2Duplicates bool
+
+	// NoDelete2Duplicates declines the implication, so that Delete2 can mirror
+	// deletions while leaving duplicates where they are.
+	//
+	// It exists for the same reason --delete2=false must override a config
+	// saying true: an option that can only ever turn destruction on is not an
+	// option. Named negatively to match NoVerifyDest and NoResyncFlags, and
+	// because the affirmative reading -- Delete2Duplicates being false meaning
+	// "off" -- is already taken by the default.
+	NoDelete2Duplicates bool
+
 	// SyncDuplicates copies a source folder's repeated messages once each
 	// instead of once in total.
 	//
@@ -312,6 +331,13 @@ type FolderReport struct {
 	// They are recorded as done against that one copy, so they are counted once
 	// — in the run that recognised them — and never again.
 	Duplicates int
+	// Removed is how many destination messages were deleted for repeating
+	// another message in the same folder.
+	//
+	// Counted apart from Deleted because the two answer different questions. A
+	// deleted message left the source; a removed one never did, and the folder
+	// still holds it under another UID.
+	Removed int
 	// Filtered is how many the message selection left out. Like Vanished this
 	// is neither work done nor work failed, but unlike Vanished it can change
 	// its mind: a message excluded by --minage today is copied once it is old
@@ -407,6 +433,16 @@ func (r Report) Duplicates() int {
 	n := 0
 	for _, f := range r.Folders {
 		n += f.Duplicates
+	}
+	return n
+}
+
+// Removed is how many destination messages were deleted for repeating another
+// in the same folder.
+func (r Report) Removed() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Removed
 	}
 	return n
 }
@@ -1008,6 +1044,15 @@ func (l *live) duplicate(uid, survivor uint32) {
 	l.mu.Unlock()
 }
 
+func (l *live) removedDuplicates(n int) {
+	if n == 0 {
+		return
+	}
+	l.mu.Lock()
+	l.report.Removed += n
+	l.mu.Unlock()
+}
+
 func (l *live) deduplicated(n int) {
 	l.mu.Lock()
 	l.report.Duplicates += n
@@ -1223,6 +1268,10 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	}
 
 	if err := s.deleteVanished(ctx, pair, p, lv); err != nil {
+		return lv.snapshot(), err
+	}
+
+	if err := s.removeDestDuplicates(ctx, pair, p, lv); err != nil {
 		return lv.snapshot(), err
 	}
 
@@ -2179,10 +2228,7 @@ func (s *Syncer) condemned(ctx context.Context, dst imapx.Conn, p *prepared, dst
 	// answers a listing with nothing or a fraction of the truth, and that
 	// arrives as a large share of the destination being nominated at once.
 	share = float64(len(victims)) / float64(population)
-	if len(victims) <= defaultDeleteFloor {
-		return victims, population, true, share, nil
-	}
-	return victims, population, share <= s.ceiling() || s.opts.Force, share, nil
+	return victims, population, s.allowedToDelete(len(victims), population), share, nil
 }
 
 // stillClaimed reduces a list of per-row nominations to one entry per
@@ -2333,6 +2379,53 @@ func (s *Syncer) sourceIdents(ctx context.Context, p *prepared) (map[string]stru
 	return held, nil
 }
 
+// removeDestDuplicates cleans one destination folder of messages it holds more
+// than once.
+//
+// After deleteVanished rather than before, so that a message about to be
+// removed for having left the source is not first fetched twice to prove it
+// repeats another message that is also about to go.
+//
+// A folder the fast path skipped is left alone, which is a real limitation and
+// is documented as one. Duplicates arriving on the destination do not move the
+// source's HIGHESTMODSEQ, so such a folder still looks settled, and there is no
+// sound free trigger: a destination legitimately holds messages we never put
+// there, so holding more than we claim proves nothing. The standalone dedup
+// command exists for those folders.
+//
+// Unlike deleteVanished this does not stand down when the folder failed to copy
+// everything. That guard is about an incomplete picture of the *source*, and
+// this question is not asked of the source at all: two destination messages are
+// either identical or they are not, and the bodies are compared in full before
+// either is touched.
+func (s *Syncer) removeDestDuplicates(ctx context.Context, pair folder.Pair, p *prepared, lv *live) (err error) {
+	if !s.opts.dedupeDest() || p.skipped {
+		return nil
+	}
+
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection for deduplication: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	dst := lease.Conn()
+
+	dstBox, err := dst.Select(ctx, pair.Dest, imapx.SelectOptions{})
+	if err != nil {
+		return fmt.Errorf("selecting destination mailbox for deduplication: %w", err)
+	}
+
+	res, err := s.dedupeDest(ctx, dst, dstBox, p.folderID, p.src.UIDValidity, false)
+	if err != nil {
+		return err
+	}
+	lv.removedDuplicates(res.Removed)
+	if res.Refused > 0 {
+		lv.refused(res.Refused, res.Population)
+	}
+	return nil
+}
+
 // deleteVanished removes destination messages the source no longer accounts
 // for, so that the destination ends up looking like the source.
 func (s *Syncer) deleteVanished(ctx context.Context, pair folder.Pair, p *prepared, lv *live) (err error) {
@@ -2408,6 +2501,14 @@ func (s *Syncer) deleteVanished(ctx context.Context, pair folder.Pair, p *prepar
 	s.log.Info("deleted messages the source no longer has",
 		"dest", pair.Dest, "messages", len(doomed))
 	return nil
+}
+
+// dedupeDest reports whether destination duplicates are to be removed.
+//
+// Delete2 implies it rather than setting it, so that the report and the logs
+// can still say which of the two the user actually asked for.
+func (o Options) dedupeDest() bool {
+	return (o.Delete2Duplicates || o.Delete2) && !o.NoDelete2Duplicates
 }
 
 // ceiling is the configured deletion ceiling, or the default.
@@ -2857,7 +2958,48 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 			return fr, err
 		}
 	}
+	if err := s.dryRunDuplicates(ctx, pair, row.ID, srcBox, &fr); err != nil {
+		return fr, err
+	}
 	return fr, nil
+}
+
+// dryRunDuplicates previews what duplicate removal would take off the
+// destination.
+//
+// The same code as the real run, with the two writes withheld, which is the
+// only reason a preview is worth anything: one computed by a second
+// implementation previews that implementation.
+//
+// It costs what the real pass costs -- a metadata sweep of the folder and a
+// body fetch per candidate -- because the answer cannot be reached any other
+// way. Nothing is guessed here: a message this reports is one whose bytes were
+// compared in full against the copy that would survive it.
+func (s *Syncer) dryRunDuplicates(ctx context.Context, pair folder.Pair, folderID int64, srcBox imapx.Mailbox, fr *FolderReport) (err error) {
+	if !s.opts.dedupeDest() {
+		return nil
+	}
+
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	// Read-only, like dryRunVerify and for the same reason: a preview must not
+	// be able to change the destination even by accident.
+	dstBox, err := lease.Conn().Select(ctx, pair.Dest, imapx.SelectOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+
+	res, err := s.dedupeDest(ctx, lease.Conn(), dstBox, folderID, srcBox.UIDValidity, true)
+	if err != nil {
+		return err
+	}
+	fr.Removed = res.Removed
+	fr.Refused += res.Refused
+	return nil
 }
 
 // dryRunVerify names the source UIDs whose recorded destination copy is gone,
