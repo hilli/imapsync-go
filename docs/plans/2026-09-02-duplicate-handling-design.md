@@ -52,17 +52,33 @@ than failing to copy it. Weak messages are never grouped, never skipped and
 never deleted. They are simply carried, which is the behaviour that loses
 nothing.
 
-### Byte-verification before deletion
+### Verification before acting — on both halves, not just deletion
 
 Before any message is deleted as a duplicate, the survivor and the victim are
-fetched in full and compared byte for byte. Unequal means not a duplicate, and
-both stay.
+fetched in full and compared. Unequal means not a duplicate, and both stay.
+
+**The same applies to B, which the first draft of this design missed.** Skipping
+a copy is not the harmless half: a message that is never copied is as absent
+from the destination as one that was deleted from it. The draft treated
+verification as something deletion needed and copying did not, which was wrong.
+
+The case is concrete rather than theoretical. `ident` marks an identity weak
+only when a message has no Message-ID *and* fewer than two other identity
+headers survived, so a message with no Message-ID but an ordinary Subject and
+From is fully strong and is digested from five headers. Two automated
+notifications sent in the same second — same subject, same sender, same
+recipient, same Date — agree on all five, and if their bodies happen to be the
+same length the key matches while the mail differs.
+
+B's saving is therefore the upload, not the download: it must fetch the second
+body to compare it, but it need not APPEND it. That is still the expensive half
+on every real migration.
 
 Digest plus size is a statement about six headers and a number the *server*
 supplied — `MessageMeta.Size` is documented in this codebase as a claim rather
-than a measurement. Deletion is irreversible and needs proof rather than strong
-evidence. The cost is proportional to the duplicates found, not to the folder,
-and it is only ever paid by a run that was explicitly asked to delete.
+than a measurement. Neither destroying mail nor withholding it should rest on
+strong evidence when proof is one fetch away. The cost is proportional to the
+duplicates found, not to the folder.
 
 ## Which copy survives
 
@@ -174,8 +190,24 @@ run during the previous piece of work.
 
 ## Build order
 
-1. The grouping primitive, alone and tested.
-2. B — skip source duplicates.
+1. **The grouping primitive, alone and tested.** Done — `internal/dedup`.
+   `Candidates` returns groups of possible duplicates; `Group.Partition` names
+   the survivor and the victims together, in one call, so no caller can pair a
+   survivor from one rule with victims from another and delete every copy.
+
+   The package is named for what it returns: *candidates*, never conclusions.
+   Nothing in it ever sees a body, so nothing in it can confirm a duplicate.
+
+   Three guards keep an unidentifiable message out of every group, and each is
+   there because grouping one would lose mail: a weak identity, an empty digest
+   — which is `Message`'s zero value, not an exotic case — and a size the server
+   never reported, which would silently collapse the key to the digest alone.
+
+   Twelve mutations, all caught. The one that first survived was the loss of
+   the within-group sort, because every test fed UIDs in ascending order and
+   the sort had nothing to do. iCloud's `UID SEARCH ALL` returns them unsorted,
+   so the test now does too.
+2. B — skip source duplicates, verifying before the skip.
 3. A — delete destination duplicates.
 4. The `dedup` command.
 5. Compat wiring and documentation.
