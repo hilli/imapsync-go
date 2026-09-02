@@ -27,6 +27,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
 	"github.com/hilli/imapsync-go/internal/syncer"
+	"github.com/hilli/imapsync-go/internal/throttle"
 )
 
 // The two sides, named once. They reach the user in three different places —
@@ -90,6 +91,9 @@ type syncFlags struct {
 	dstConns    int
 	memoryLimit string
 
+	maxBytesPerSecond    string
+	maxMessagesPerSecond float64
+
 	// Whether the three above were named on the command line. A flag that was
 	// not given has no opinion, and the config file's answer stands; a flag
 	// that was given overrides it. Without this the flag defaults would be
@@ -98,6 +102,9 @@ type syncFlags struct {
 	dstConnsSet    bool
 	memoryLimitSet bool
 	delete2Set     bool
+
+	maxBytesPerSecondSet    bool
+	maxMessagesPerSecondSet bool
 
 	progressEvery        time.Duration
 	full                 bool
@@ -145,6 +152,8 @@ watch for authentication failures.`,
 			f.srcConnsSet = cmd.Flags().Changed("source-connections")
 			f.dstConnsSet = cmd.Flags().Changed("dest-connections")
 			f.memoryLimitSet = cmd.Flags().Changed("memory-limit")
+			f.maxBytesPerSecondSet = cmd.Flags().Changed("max-bytes-per-second")
+			f.maxMessagesPerSecondSet = cmd.Flags().Changed("max-messages-per-second")
 			f.delete2Set = cmd.Flags().Changed("delete2")
 			f.delete2DuplicatesSet = cmd.Flags().Changed("delete2duplicates")
 			return runSync(cmd.Context(), cmd.OutOrStdout(), f)
@@ -196,6 +205,11 @@ watch for authentication failures.`,
 	cmd.Flags().IntVar(&f.srcConns, "source-connections", autoConnections, "connections to open to the source; overrides the config's concurrency.source")
 	cmd.Flags().IntVar(&f.dstConns, "dest-connections", autoConnections, "connections to open to the destination; overrides the config's concurrency.dest")
 	cmd.Flags().StringVar(&f.memoryLimit, "memory-limit", "256MiB", "how much message data may be held in memory at once; overrides the config's concurrency.max_inflight")
+
+	cmd.Flags().StringVar(&f.maxBytesPerSecond, "max-bytes-per-second", "",
+		"hold the whole run to this much message data per second, for example 2MiB; a message is counted once and crosses the wire twice, so expect about double this in network traffic")
+	cmd.Flags().Float64Var(&f.maxMessagesPerSecond, "max-messages-per-second", 0,
+		"hold the whole run to this many messages per second whatever their size; fractions are allowed")
 
 	cmd.Flags().BoolVar(&f.full, "full", false, "examine every folder, even ones the server says have not changed")
 	// Both spellings, because imapsync has both and this is meant to be a
@@ -281,17 +295,17 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		trace = os.Stderr
 	}
 
-	srcConns, dstConns, limit, err := resolveConcurrency(f, pair.Concurrency)
+	conc, err := resolveConcurrency(f, pair.Concurrency)
 	if err != nil {
 		return err
 	}
 
-	bytesInFlight, err := budget.New(limit)
+	bytesInFlight, err := budget.New(conc.inflight)
 	if err != nil {
 		return fmt.Errorf("invalid --memory-limit: %w", err)
 	}
 
-	srcPool, dstPool, release, err := pools(ctx, pair, f, trace, srcConns, dstConns)
+	srcPool, dstPool, release, err := pools(ctx, pair, f, trace, conc.src, conc.dst)
 	if err != nil {
 		return err
 	}
@@ -325,13 +339,14 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		DeleteCeiling:       f.deleteCeiling,
 		Force:               f.force,
 		ProgressEvery:       f.progressEvery,
+		Throttle:            conc.rate,
 		Logger:              slog.Default(),
 	}).Run(ctx)
 
 	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun, connections{
-		{"source", sideSource + "-connections", srcConns, srcPool.Width()},
-		{"destination", sideDest + "-connections", dstConns, dstPool.Width()},
-	})
+		{"source", sideSource + "-connections", conc.src, srcPool.Width()},
+		{"destination", sideDest + "-connections", conc.dst, dstPool.Width()},
+	}, conc.rate.Stats())
 
 	// A run that ended badly still copied something, and after an interruption
 	// or a run the engine gave up on, what was copied is the thing worth
@@ -588,7 +603,8 @@ func resolveDelete2(f syncFlags, pair config.Pair) bool {
 	return pair.Delete2
 }
 
-// resolveConcurrency decides the two pool widths and the in-flight byte budget.
+// resolveConcurrency decides the two pool widths, the in-flight byte budget and
+// the rate allowance.
 //
 // Three sources of truth, in falling order of precedence: a flag named on the
 // command line, the pair's `concurrency:` block, and the built-in default.
@@ -617,19 +633,52 @@ func pickWidth(flagSet bool, flagVal int, limit config.Limit) int {
 	}
 }
 
-func resolveConcurrency(f syncFlags, c config.Concurrency) (src, dst int, inflight int64, err error) {
-	src = pickWidth(f.srcConnsSet, f.srcConns, c.Source)
-	dst = pickWidth(f.dstConnsSet, f.dstConns, c.Dest)
+// concurrency is everything the `concurrency:` block and its flags decide.
+//
+// A struct rather than a list of return values, and for a specific reason: the
+// function this replaces returned four of the pair's five fields, and the two
+// it left behind were inert for the life of the tool. A struct makes a new
+// field arrive at the call site whether or not anyone remembered it.
+type concurrency struct {
+	src, dst int
+	inflight int64
+	rate     *throttle.Limiter
+}
+
+func resolveConcurrency(f syncFlags, c config.Concurrency) (concurrency, error) {
+	out := concurrency{
+		src: pickWidth(f.srcConnsSet, f.srcConns, c.Source),
+		dst: pickWidth(f.dstConnsSet, f.dstConns, c.Dest),
+	}
 
 	switch {
 	case f.memoryLimitSet || c.MaxInflight == 0:
-		if inflight, err = parseBytes(f.memoryLimit); err != nil {
-			return 0, 0, 0, fmt.Errorf("invalid --memory-limit: %w", err)
+		var err error
+		if out.inflight, err = parseBytes(f.memoryLimit); err != nil {
+			return concurrency{}, fmt.Errorf("invalid --memory-limit: %w", err)
 		}
 	default:
-		inflight = int64(c.MaxInflight)
+		out.inflight = int64(c.MaxInflight)
 	}
-	return src, dst, inflight, nil
+
+	bytesPerSec := int64(c.MaxBytesPerSecond)
+	if f.maxBytesPerSecondSet {
+		var err error
+		if bytesPerSec, err = parseBytes(f.maxBytesPerSecond); err != nil {
+			return concurrency{}, fmt.Errorf("invalid --max-bytes-per-second: %w", err)
+		}
+	}
+
+	messagesPerSec := c.MaxMessagesPerSecond
+	if f.maxMessagesPerSecondSet {
+		if f.maxMessagesPerSecond <= 0 {
+			return concurrency{}, fmt.Errorf("--max-messages-per-second must be greater than zero, got %v; leave it off for no limit", f.maxMessagesPerSecond)
+		}
+		messagesPerSec = f.maxMessagesPerSecond
+	}
+
+	out.rate = throttle.New(bytesPerSec, messagesPerSec)
+	return out, nil
 }
 
 // syncPair resolves the whole pair, from a config file or from flags.
@@ -1263,7 +1312,77 @@ type connection struct {
 
 type connections []connection
 
-func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration, dryRun bool, conns connections) error {
+// writeThrottleNote reports the rate limit that was in force and what it cost.
+//
+// It speaks whenever a limit was set, not only when the limit bound, for the
+// reason the connection note learned the hard way: a note that speaks only in
+// the interesting case leaves "nothing happened" and "nothing was measured"
+// indistinguishable from the outside, and two full runs went by unable to
+// answer questions the instrumentation was supposed to have answered.
+//
+// The waiting time is the number worth having. Without it a throttled run and a
+// slow server look exactly alike, and the reader cannot tell whether their own
+// brake or the network is what they are watching. It is summed across workers,
+// so it routinely exceeds the wall clock -- which is why it is reported as a
+// duration rather than as a share of the run.
+func writeThrottleNote(p *printer, s throttle.Stats) {
+	var limits []string
+	if s.BytesPerSec > 0 {
+		limits = append(limits, fmt.Sprintf("%s/second", flagBytes(s.BytesPerSec)))
+	}
+	if s.MessagesPerSec > 0 {
+		limits = append(limits, fmt.Sprintf("%g messages/second", s.MessagesPerSec))
+	}
+	if len(limits) == 0 {
+		return
+	}
+
+	p.printf("\nRate limited to %s.\n", strings.Join(limits, " and "))
+	switch {
+	case s.Waited <= 0:
+		p.println("Nothing ever waited on it, so the limit was never what held the run back.")
+	default:
+		p.printf("Workers waited %s on it in total, summed across them, having moved\n%s of message data.\n",
+			s.Waited.Round(time.Millisecond), humanBytes(s.Moved))
+	}
+}
+
+// flagBytes writes a byte count that parseBytes will read back exactly, so the
+// limit in the report is the limit for the next command line.
+//
+// It steps down to a unit the number divides evenly by, rather than rounding,
+// because parseBytes takes an integer: "1.465KiB" is a perfectly good
+// description of 1500 bytes and is rejected by the flag it is describing.
+// Limits people set are round, so the fallback to plain bytes is rare and is
+// still correct when it happens.
+func flagBytes(n int64) string {
+	for _, u := range []struct {
+		suffix string
+		size   int64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}} {
+		if n >= u.size && n%u.size == 0 {
+			return fmt.Sprintf("%d%s", n/u.size, u.suffix)
+		}
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
+// humanBytes writes a byte count for prose, where being readable matters more
+// than being exact. Nobody pastes the amount of data a run moved into a flag.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.4gGiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.4gMiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.4gKiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration, dryRun bool, conns connections, throttled throttle.Stats) error {
 	p := &printer{w: out}
 
 	if dryRun {
@@ -1313,6 +1432,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 	writeRemovedNote(p, report, dryRun)
 	writeHeaderlessNote(p, report)
 	writeConnectionNote(p, conns)
+	writeThrottleNote(p, throttled)
 
 	// A refusal is the one thing here that asks the reader to do something, so
 	// it says which folders and what to do about it rather than leaving a

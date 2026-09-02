@@ -346,10 +346,10 @@ func messageOptions() []*option {
 		tr("syncduplicates!", "--sync-duplicates"),
 		no("skipcrossduplicates!", "duplicates are found within a folder, not across folders; a message in two mailboxes is filed twice, not repeated"),
 		no("debugcrossduplicates!", "duplicates are found within a folder, not across folders"),
-		no("maxmessagespersecond=f", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
-		no("maxbytespersecond=i", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
-		no("maxbytesafter=i", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
-		no("maxsleep=f", "rate limiting is not implemented"),
+		tr("maxmessagespersecond=f", "--max-messages-per-second"),
+		tr("maxbytespersecond=i", "--max-bytes-per-second"),
+		no("maxbytesafter=i", "it asks for the rate limit to begin only once a number of bytes has moved; --max-bytes-per-second applies from the start of the run"),
+		no("maxsleep=f", "it caps the sleep imapsync inserts between messages, and --max-bytes-per-second is a shared allowance rather than a per-message sleep, so there is nothing to cap"),
 		no("subscribed", "copying only subscribed folders is not implemented; name them with --folder or --include"),
 		no("subscribeall|subscribe_all!", "this tool subscribes the folders it creates and leaves every other folder alone"),
 	}
@@ -428,7 +428,7 @@ func reportingOptions() []*option {
 // machineryOptions are about how the program runs.
 func machineryOptions() []*option {
 	return []*option{
-		ig("tmpdir=s", "this tool writes no temporary files").
+		ig("tmpdir=s", "an IMAP-to-IMAP sync writes no temporary files; message bodies are held in memory, bounded by --memory-limit").
 			offIgnores(alreadyTheCase),
 		ig("pidfile=s", "this tool writes no pid file"),
 		ig("pidfilelocking!", "this tool writes no pid file").offIgnores(alreadyTheCase),

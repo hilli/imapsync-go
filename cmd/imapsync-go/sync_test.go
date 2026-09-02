@@ -19,6 +19,7 @@ import (
 
 	"github.com/hilli/imapsync-go/internal/folder"
 	"github.com/hilli/imapsync-go/internal/syncer"
+	"github.com/hilli/imapsync-go/internal/throttle"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -443,7 +444,7 @@ func TestReportSeparatesRequestedSkipsFromOurOwn(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, false, nil, throttle.Stats{}); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()
@@ -471,7 +472,7 @@ func TestDryRunReportDoesNotClaimToHaveCopied(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, true, nil); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, true, nil, throttle.Stats{}); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()
@@ -507,7 +508,7 @@ func TestReportSaysWhatWidthEachSideSettledOn(t *testing.T) {
 	err := writeSyncReport(&out, report, time.Second, false, connections{
 		{"source", "source-connections", 16, 16},
 		{"destination", "dest-connections", 16, 5},
-	})
+	}, throttle.Stats{})
 	if err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
@@ -549,7 +550,7 @@ func TestReportNamesTheServerThatWouldNotReturnHeaders(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, false, nil, throttle.Stats{}); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()
@@ -574,7 +575,7 @@ func TestAHealthyRunSaysNothingAboutHeaders(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, time.Second, false, nil); err != nil {
+	if err := writeSyncReport(&out, report, time.Second, false, nil, throttle.Stats{}); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	if strings.Contains(out.String(), "no header") {
@@ -599,7 +600,7 @@ func TestTheRateSaysWhatItCounted(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeSyncReport(&out, report, 38*time.Second, false, nil); err != nil {
+	if err := writeSyncReport(&out, report, 38*time.Second, false, nil, throttle.Stats{}); err != nil {
 		t.Fatalf("writing report: %v", err)
 	}
 	got := out.String()

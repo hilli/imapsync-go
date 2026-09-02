@@ -128,6 +128,11 @@ func TestParseByteSize(t *testing.T) {
 		{in: " 8 MiB ", want: 8 << 20},
 		{in: "", wantErr: true},
 		{in: "-1MiB", wantErr: true},
+		// A bare negative was accepted for the life of the function while
+		// "-1MiB" was refused, so the spelling that needs least thought was
+		// the one that got through. Every field parsed here is a ceiling.
+		{in: "-1", wantErr: true},
+		{in: "-1048576", wantErr: true},
 		{in: "banana", wantErr: true},
 	}
 
@@ -287,6 +292,23 @@ func TestParseRejectsBadConfigs(t *testing.T) {
 			name:    "no secret source",
 			yaml:    "pairs:\n  - {name: p, source: {url: \"imaps://a@one.example\", password: {}}, dest: {url: \"imaps://b@two.example\", password: {env: B}}}\n",
 			wantErr: "no secret source",
+		},
+		{
+			// Zero already means unlimited, so a negative is a typo, and
+			// reading a typo as "no brake at all" is the wrong way to be wrong
+			// about the one option whose purpose is to hold the run back.
+			name:    "negative message rate",
+			yaml:    "pairs:\n  - {name: p, source: {url: \"imaps://a@one.example\", password: {env: A}}, dest: {url: \"imaps://b@two.example\", password: {env: B}}, concurrency: {max_messages_per_second: -1}}\n",
+			wantErr: "max_messages_per_second is negative",
+		},
+		{
+			// Refused by ParseByteSize rather than by Validate, which is why
+			// Validate carries no check for it. Asserted here all the same:
+			// what matters is that the config is refused, not which layer
+			// refuses it, and this is the test that notices if that moves.
+			name:    "negative byte rate",
+			yaml:    "pairs:\n  - {name: p, source: {url: \"imaps://a@one.example\", password: {env: A}}, dest: {url: \"imaps://b@two.example\", password: {env: B}}, concurrency: {max_bytes_per_second: \"-1\"}}\n",
+			wantErr: "must not be negative",
 		},
 		{
 			name:    "unknown folder map mode",

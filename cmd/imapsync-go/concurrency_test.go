@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -675,13 +679,20 @@ func TestConfigConcurrencyIsActuallyUsed(t *testing.T) {
 		flags               syncFlags
 		wantSrc, wantDst    int
 		wantInflightInBytes int64
+		wantBytesPerSecond  int64
+		wantMessagesPerSec  float64
 	}{{
-		name:                "config numbers are obeyed",
-		conc:                config.Concurrency{Source: 40, Dest: 24, MaxInflight: 512 << 20},
+		name: "config numbers are obeyed",
+		conc: config.Concurrency{
+			Source: 40, Dest: 24, MaxInflight: 512 << 20,
+			MaxBytesPerSecond: 2 << 20, MaxMessagesPerSecond: 12,
+		},
 		flags:               syncFlags{srcConns: 4, dstConns: 8, memoryLimit: "256MiB"},
 		wantSrc:             40,
 		wantDst:             24,
 		wantInflightInBytes: 512 << 20,
+		wantBytesPerSecond:  2 << 20,
+		wantMessagesPerSec:  12,
 	}, {
 		name:                "auto falls back to the built-in width",
 		conc:                config.Concurrency{Source: 0, Dest: 0, MaxInflight: 512 << 20},
@@ -691,15 +702,22 @@ func TestConfigConcurrencyIsActuallyUsed(t *testing.T) {
 		wantInflightInBytes: 512 << 20,
 	}, {
 		name: "a flag named on the command line beats the config",
-		conc: config.Concurrency{Source: 40, Dest: 24, MaxInflight: 512 << 20},
+		conc: config.Concurrency{
+			Source: 40, Dest: 24, MaxInflight: 512 << 20,
+			MaxBytesPerSecond: 2 << 20, MaxMessagesPerSecond: 12,
+		},
 		flags: syncFlags{
 			srcConns: 3, srcConnsSet: true,
 			dstConns:    8,
 			memoryLimit: "32MiB", memoryLimitSet: true,
+			maxBytesPerSecond: "512KiB", maxBytesPerSecondSet: true,
+			maxMessagesPerSecond: 3, maxMessagesPerSecondSet: true,
 		},
 		wantSrc:             3,
 		wantDst:             24,
 		wantInflightInBytes: 32 << 20,
+		wantBytesPerSecond:  512 << 10,
+		wantMessagesPerSec:  3,
 	}, {
 		name:                "no config at all still works",
 		conc:                config.Concurrency{},
@@ -711,16 +729,24 @@ func TestConfigConcurrencyIsActuallyUsed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			src, dst, inflight, err := resolveConcurrency(tc.flags, tc.conc)
+			got, err := resolveConcurrency(tc.flags, tc.conc)
 			if err != nil {
 				t.Fatalf("resolveConcurrency: %v", err)
 			}
-			if src != tc.wantSrc || dst != tc.wantDst {
+			if got.src != tc.wantSrc || got.dst != tc.wantDst {
 				t.Errorf("resolved %d source and %d destination connections, want %d and %d",
-					src, dst, tc.wantSrc, tc.wantDst)
+					got.src, got.dst, tc.wantSrc, tc.wantDst)
 			}
-			if inflight != tc.wantInflightInBytes {
-				t.Errorf("resolved a budget of %d bytes, want %d", inflight, tc.wantInflightInBytes)
+			if got.inflight != tc.wantInflightInBytes {
+				t.Errorf("resolved a budget of %d bytes, want %d", got.inflight, tc.wantInflightInBytes)
+			}
+
+			rate := got.rate.Stats()
+			if rate.BytesPerSec != tc.wantBytesPerSecond {
+				t.Errorf("resolved a rate of %d bytes/second, want %d", rate.BytesPerSec, tc.wantBytesPerSecond)
+			}
+			if rate.MessagesPerSec != tc.wantMessagesPerSec {
+				t.Errorf("resolved a rate of %v messages/second, want %v", rate.MessagesPerSec, tc.wantMessagesPerSec)
 			}
 		})
 	}
@@ -882,5 +908,314 @@ func TestConfigDelete2IsActuallyUsed(t *testing.T) {
 				t.Errorf("destination holds %d messages, want %d:\n%s", got, want, out)
 			}
 		})
+	}
+}
+
+// TestEveryConcurrencyFieldIsConsumed is the test that would have caught both
+// of the bugs above, and it is here because they were not one bug twice.
+//
+// `concurrency:` lost its widths and its memory limit, silently, for the life
+// of the tool; `delete2:` was lost by the same function on the same day it was
+// found. Each was fixed by remembering to read one more field, which is a fix
+// that works exactly until the next field is added.
+//
+// So this asserts the shape rather than the values: every exported field of
+// config.Concurrency must be named somewhere inside resolveConcurrency. It
+// fails when a sixth field is added and nobody wires it up, which is the moment
+// the knowledge is lost rather than the moment somebody notices their config
+// did nothing.
+//
+// The check is scoped to that function's body, parsed rather than grepped. A
+// test that asserts a name appears somewhere in a file is nearly worthless: the
+// name would still be there if the line that used it moved into a comment, and
+// this file mentions every one of these fields in its table tests already.
+func TestEveryConcurrencyFieldIsConsumed(t *testing.T) {
+	t.Parallel()
+
+	const fn = "resolveConcurrency"
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "sync.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parsing sync.go: %v", err)
+	}
+
+	var body *ast.BlockStmt
+	for _, decl := range file.Decls {
+		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Name.Name == fn {
+			body = fd.Body
+			break
+		}
+	}
+	if body == nil {
+		t.Fatalf("sync.go has no %s; this test is asserting something that no longer exists", fn)
+	}
+
+	read := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			read[sel.Sel.Name] = true
+		}
+		return true
+	})
+
+	fields := reflect.TypeOf(config.Concurrency{})
+	for i := range fields.NumField() {
+		name := fields.Field(i).Name
+		if !read[name] {
+			t.Errorf("%s never reads config.Concurrency.%s (yaml: %s).\n"+
+				"A field parsed, validated and then dropped is worse than no field at all:\n"+
+				"it is a setting people tune, measure against, and believe.",
+				fn, name, fields.Field(i).Tag.Get("yaml"))
+		}
+	}
+}
+
+// TestConfigRateLimitReachesTheRunItself.
+//
+// Two assertions, and both are needed. The report would name the limit even if
+// nothing ever charged it, because it reads the limiter that was built rather
+// than the work that was done — so the elapsed time is what proves the copy
+// path actually waits. And the elapsed time alone would not prove the number
+// came from the config rather than from a flag default.
+//
+// The timing assertion is a lower bound, deliberately. rate.Limiter starts full,
+// so n messages at r a second with a burst of r take at least (n-r)/r seconds;
+// load can only make that longer. An upper bound here would be the flaky kind.
+func TestConfigRateLimitReachesTheRunItself(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	const (
+		messages  = 10
+		perSecond = 6
+	)
+	// Ten messages against a bucket that starts holding six, refilling at six a
+	// second.
+	const atLeast = (messages - perSecond) * time.Second / perSecond
+
+	srcAddr, srcUser := startAccount(t, "Work")
+	dstAddr, _ := startAccount(t)
+	for i := range messages {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		if _, err := srcUser.Append("Work", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "imapsync.yaml")
+	cfg := fmt.Sprintf(`pairs:
+  - name: throttled
+    source:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    dest:
+      url: imap+insecure://%s@%s
+      password: {env: TEST_IMAP_PASSWORD}
+    concurrency:
+      max_messages_per_second: %d
+`, cliUser, srcAddr, cliUser, dstAddr, perSecond)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	started := time.Now()
+	out := runCLI(t, []string{
+		"sync",
+		"--config", cfgPath,
+		"--state", filepath.Join(dir, "state.db"),
+		"--log-level", "error",
+	})
+	elapsed := time.Since(started)
+
+	if elapsed < atLeast {
+		t.Errorf("copied %d messages in %s under a configured limit of %d a second;\n"+
+			"that is at least %s of work, so the config's rate limit is not reaching the copy path:\n%s",
+			messages, elapsed, perSecond, atLeast, out)
+	}
+	if want := fmt.Sprintf("Rate limited to %d messages/second", perSecond); !strings.Contains(out, want) {
+		t.Errorf("the report does not name the configured rate limit %q:\n%s", want, out)
+	}
+	if !strings.Contains(out, "Workers waited") {
+		t.Errorf("the report does not say how long the run waited on its own brake:\n%s", out)
+	}
+}
+
+// TestTheRateLimitIsSharedAcrossFolders.
+//
+// The limiter is held by the Syncer and folders run concurrently, so the
+// allowance has to cover the whole run rather than each folder. Five folders of
+// four messages each, against the same limit as the single-folder case above,
+// must take the same time — a per-folder allowance would finish five times
+// faster because each folder's twenty messages would fit inside its own burst.
+func TestTheRateLimitIsSharedAcrossFolders(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	const (
+		folders   = 5
+		each      = 4
+		perSecond = 6
+	)
+	const atLeast = (folders*each - perSecond) * time.Second / perSecond
+
+	names := make([]string, folders)
+	for i := range names {
+		names[i] = fmt.Sprintf("Box%d", i)
+	}
+	srcAddr, srcUser := startAccount(t, names...)
+	dstAddr, _ := startAccount(t)
+	for _, name := range names {
+		for i := range each {
+			body := cliMessage(fmt.Sprintf("%s-%03d", name, i), fmt.Sprintf("%s-%d@example.test", name, i))
+			if _, err := srcUser.Append(name, bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+				t.Fatalf("seeding %s: %v", name, err)
+			}
+		}
+	}
+
+	dir := t.TempDir()
+	started := time.Now()
+	out := runCLI(t, []string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(dir, "state.db"),
+		"--max-messages-per-second", fmt.Sprint(perSecond),
+		"--log-level", "error",
+	})
+	elapsed := time.Since(started)
+
+	if elapsed < atLeast {
+		t.Errorf("copied %d messages across %d folders in %s under a limit of %d a second;\n"+
+			"that is at least %s of work, so each folder is being given its own allowance:\n%s",
+			folders*each, folders, elapsed, perSecond, atLeast, out)
+	}
+}
+
+// TestAnAdoptedMessageIsNotRateLimited.
+//
+// The charge sits after the adoption check, so a message already on the
+// destination costs nothing. Without that, re-running a settled account — which
+// is the fast, common case this tool is built around, 776,802 messages in 1m27s
+// — would be throttled to the copy rate despite copying nothing.
+func TestAnAdoptedMessageIsNotRateLimited(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	const messages = 20
+
+	srcAddr, srcUser := startAccount(t, "Work")
+	dstAddr, dstUser := startAccount(t, "Work")
+	for i := range messages {
+		body := cliMessage(fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i))
+		for _, u := range []*imapmemserver.User{srcUser, dstUser} {
+			if _, err := u.Append("Work", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+				t.Fatalf("seeding: %v", err)
+			}
+		}
+	}
+
+	dir := t.TempDir()
+	out := runCLI(t, []string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(dir, "state.db"),
+		"--max-messages-per-second", "1",
+		"--log-level", "error",
+	})
+
+	if !strings.Contains(out, fmt.Sprintf("%d adopted", messages)) {
+		t.Fatalf("the run did not adopt all %d messages, so this proves nothing:\n%s", messages, out)
+	}
+	// The assertion is on the report rather than on the clock, and it is exact:
+	// nothing was charged, so nothing waited. A limit of one message a second
+	// would otherwise have made this take nineteen seconds, but "it was quick"
+	// is a weaker claim than "it never asked".
+	if !strings.Contains(out, "Nothing ever waited on it") {
+		t.Errorf("adopting %d messages charged the rate allowance for bytes that never crossed the wire:\n%s",
+			messages, out)
+	}
+}
+
+// paddedMessage is a message of exactly size bytes, or the smallest message
+// larger than that if the headers alone already exceed it.
+//
+// The byte allowance can only be tested with messages whose size is known, and
+// known exactly: the test below asserts the volume the report names, which is
+// the assertion that would have caught a charge of the wrong number.
+func paddedMessage(t *testing.T, subject, messageID string, size int) []byte {
+	t.Helper()
+
+	body := cliMessage(subject, messageID)
+	if len(body) >= size {
+		t.Fatalf("a %d-byte message cannot be padded down to %d", len(body), size)
+	}
+	// Two bytes of the shortfall are the closing CRLF of the filler line.
+	return append(body[:len(body)-2], append(bytes.Repeat([]byte("x"), size-len(body)), "\r\n"...)...)
+}
+
+// TestTheByteAllowanceIsChargedTheMessagesSize.
+//
+// Written because a mutation survived. Both rate tests above use the message
+// limit, so replacing meta.Size with 0 at the charge site changed nothing they
+// could see: a zero-byte message still costs one message, and the run still
+// took as long. Nothing asserted that the size reaching the byte allowance was
+// the message's own.
+//
+// That is the same shape as the bug that lost concurrency: and delete2: for the
+// life of the tool — a value parsed, validated, carried most of the way, and
+// then quietly not used. The flag would have been accepted, the report would
+// have named the limit, and the limit would have bounded nothing.
+//
+// The volume assertion is exact rather than approximate, so it fails if the
+// charge is the wrong number as well as if it is absent. The timing assertion
+// is a lower bound for the usual reason.
+func TestTheByteAllowanceIsChargedTheMessagesSize(t *testing.T) {
+	t.Setenv("TEST_IMAP_PASSWORD", cliPassword)
+
+	const (
+		messages = 4
+		each     = 2048
+		perSec   = 4096
+		total    = messages * each
+	)
+	// A bucket that starts holding one second's worth, refilling at the same
+	// rate: total bytes take at least (total-perSec)/perSec seconds.
+	const atLeast = (total - perSec) * time.Second / perSec
+
+	srcAddr, srcUser := startAccount(t, "Work")
+	dstAddr, _ := startAccount(t)
+	for i := range messages {
+		body := paddedMessage(t, fmt.Sprintf("subject-%03d", i), fmt.Sprintf("m%d@example.test", i), each)
+		if _, err := srcUser.Append("Work", bytes.NewReader(body), &imap.AppendOptions{}); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+
+	dir := t.TempDir()
+	started := time.Now()
+	out := runCLI(t, []string{
+		"sync",
+		"--source-url", "imap+insecure://" + cliUser + "@" + srcAddr,
+		"--source-password-env", "TEST_IMAP_PASSWORD",
+		"--dest-url", "imap+insecure://" + cliUser + "@" + dstAddr,
+		"--dest-password-env", "TEST_IMAP_PASSWORD",
+		"--state", filepath.Join(dir, "state.db"),
+		"--max-bytes-per-second", fmt.Sprint(perSec),
+		"--log-level", "error",
+	})
+	elapsed := time.Since(started)
+
+	if elapsed < atLeast {
+		t.Errorf("moved %d bytes in %s under a limit of %d a second; that is at least %s of work,\n"+
+			"so the byte allowance is not being charged what the messages weigh:\n%s",
+			total, elapsed, perSec, atLeast, out)
+	}
+	if want := "having moved\n" + humanBytes(total) + " of message data"; !strings.Contains(out, want) {
+		t.Errorf("the report does not say it moved %q; the charge is not the message's size:\n%s", want, out)
 	}
 }

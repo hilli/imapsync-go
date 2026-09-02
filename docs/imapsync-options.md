@@ -14,7 +14,7 @@ commands, which are what `imapsync-go sync` takes directly.
 
 ## imapsync options
 
-218 options: 37 translate to a native flag, 16 build an endpoint URL, 70 are accepted and do nothing, and 95 are refused.
+218 options: 39 translate to a native flag, 16 build an endpoint URL, 70 are accepted and do nothing, and 93 are refused.
 
 A **refused** option stops the run rather than being quietly dropped: an
 option that changes which messages move, or where they land, is not something to
@@ -47,6 +47,8 @@ happens here.
 | `--folder` | string (repeatable) | becomes `--folder` |
 | `--include` | string | becomes `--include` |
 | `--maxage` | number | becomes `--max-age` |
+| `--maxbytespersecond` | integer | becomes `--max-bytes-per-second` |
+| `--maxmessagespersecond` | number | becomes `--max-messages-per-second` |
 | `--maxsize` | integer | becomes `--max-size` |
 | `--minage` | number | becomes `--min-age` |
 | `--minsize` | integer | becomes `--min-size` |
@@ -151,7 +153,7 @@ happens here.
 | `--tail` | on/off | this tool logs to stderr; redirect it, or use --log-json<br>`--notail`: ignored, this tool logs to stderr; redirect it, or use --log-json |
 | `--timeout1` | number | one timeout covers both ends here; use --dial-timeout |
 | `--timeout2` | number | one timeout covers both ends here; use --dial-timeout |
-| `--tmpdir` | string | this tool writes no temporary files<br>`--notmpdir`: ignored, this is already what happens |
+| `--tmpdir` | string | an IMAP-to-IMAP sync writes no temporary files; message bodies are held in memory, bounded by --memory-limit<br>`--notmpdir`: ignored, this is already what happens |
 | `--trylogin` | on/off | this is already what happens<br>`--notrylogin`: ignored, logging in is not optional |
 | `--uid1` | on/off | the state database records what has been copied, so this is not needed<br>`--nouid1`: ignored, the state database records what has been copied, so this is not needed |
 | `--uid2` | on/off | the state database records what has been copied, so this is not needed<br>`--nouid2`: ignored, the state database records what has been copied, so this is not needed |
@@ -204,10 +206,8 @@ happens here.
 | `--justfolders` | on/off | copying folders without their messages is not implemented; --dry-run reports the plan instead |
 | `--justfoldersizes` | on/off | folder sizes are not counted |
 | `--justlogin` | on/off | run: imapsync-go probe --url imaps://user@host --password-env VAR |
-| `--maxbytesafter` | integer | rate limiting is not implemented; reduce --source-connections and --dest-connections instead |
-| `--maxbytespersecond` | integer | rate limiting is not implemented; reduce --source-connections and --dest-connections instead |
-| `--maxmessagespersecond` | number | rate limiting is not implemented; reduce --source-connections and --dest-connections instead |
-| `--maxsleep` | number | rate limiting is not implemented |
+| `--maxbytesafter` | integer | it asks for the rate limit to begin only once a number of bytes has moved; --max-bytes-per-second applies from the start of the run |
+| `--maxsleep` | number | it caps the sleep imapsync inserts between messages, and --max-bytes-per-second is a shared allowance rather than a per-message sleep, so there is nothing to cap |
 | `--memorystress` | on/off | an imapsync test hook |
 | `--messageidnodomain` | on/off | the headers a message is identified by are fixed |
 | `--mixfolders` | on/off | this tool always copies into the mapped destination folder |
@@ -348,6 +348,8 @@ Flags:
       --include-virtual                             copy virtual mailboxes such as Gmail's All Mail, which duplicate the account
       --map stringArray                             explicit folder mapping as source=dest (repeatable)
       --max-age string                              skip messages older than this, for example 30d
+      --max-bytes-per-second string                 hold the whole run to this much message data per second, for example 2MiB; a message is counted once and crosses the wire twice, so expect about double this in network traffic
+      --max-messages-per-second float               hold the whole run to this many messages per second whatever their size; fractions are allowed
       --max-size string                             skip messages this large or larger, for example 25MiB
       --memory-limit string                         how much message data may be held in memory at once; overrides the config's concurrency.max_inflight (default "256MiB")
       --min-age string                              skip messages newer than this

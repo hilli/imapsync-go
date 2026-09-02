@@ -148,11 +148,29 @@ func (o OAuth) Validate() error {
 	}
 }
 
-// Concurrency bounds the connection pools and in-flight memory for a pair.
+// Concurrency bounds the connection pools, the in-flight memory, and the rate
+// for a pair.
+//
+// Every field here answers the same question — how hard to push — which is why
+// the brakes live beside the accelerator rather than in a block of their own.
 type Concurrency struct {
 	Source      Limit    `yaml:"source"`
 	Dest        Limit    `yaml:"dest"`
 	MaxInflight ByteSize `yaml:"max_inflight"`
+
+	// MaxBytesPerSecond bounds message data moved per second across the whole
+	// run. Zero is unlimited.
+	//
+	// Message bytes, which is what imapsync counts, so a limit carried across
+	// from an imapsync command line means the same thing. A message is charged
+	// once and crosses the wire twice, so the real network traffic is about
+	// double this, split between the two servers.
+	MaxBytesPerSecond ByteSize `yaml:"max_bytes_per_second"`
+
+	// MaxMessagesPerSecond bounds messages copied per second across the whole
+	// run, whatever their size. Zero is unlimited, and fractions are allowed:
+	// 0.5 is one message every two seconds.
+	MaxMessagesPerSecond float64 `yaml:"max_messages_per_second"`
 }
 
 // Folders controls which folders are synchronised and how they are mapped.
@@ -234,6 +252,14 @@ func ParseByteSize(s string) (ByteSize, error) {
 	v, err := strconv.ParseInt(trimmed, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid byte size %q: %w", s, err)
+	}
+	// The same refusal as the unit branch above. It was missing here, so
+	// "-1MiB" was rejected and a bare "-1" was accepted — and a bare number is
+	// the likelier way to write one, since it is the spelling that needs no
+	// thought. Every field parsed through here is a ceiling, and a negative
+	// ceiling means whatever the code downstream happens to do with it.
+	if v < 0 {
+		return 0, fmt.Errorf("byte size must not be negative: %q", s)
 	}
 	return ByteSize(v), nil
 }
@@ -635,6 +661,19 @@ func (c *Config) Validate() error {
 		if !slices.Contains(folderMapModes, p.Folders.Map) {
 			return fmt.Errorf("pair %q: unknown folder map mode %q, want one of %s",
 				p.Name, p.Folders.Map, quotedModes())
+		}
+
+		// A negative rate is refused rather than read as "unlimited". Zero
+		// already means unlimited, so a negative number is a typo, and reading
+		// a typo as "no brake at all" is the wrong way to be wrong about an
+		// option whose entire purpose is to hold the run back.
+		//
+		// Only the message rate is checked. max_bytes_per_second is a ByteSize
+		// and ParseByteSize refuses a negative outright, so a check here could
+		// never fire; max_messages_per_second is a plain float and arrives
+		// exactly as written.
+		if p.Concurrency.MaxMessagesPerSecond < 0 {
+			return fmt.Errorf("pair %q: max_messages_per_second is negative", p.Name)
 		}
 	}
 	return nil

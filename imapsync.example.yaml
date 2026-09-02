@@ -24,10 +24,10 @@ pairs:
         keychain: mox-imap
 
     concurrency:
-      # "auto" opens 16 to each side and lets the governor shrink toward
-      # whatever the server will actually hold. It cannot find the limit from
-      # below — the governor only ever gives capacity up — so 16 is a safe
-      # starting guess rather than a measurement.
+      # "auto" opens 16 to each side. The governor narrows the pool when the
+      # server refuses and climbs back, one connection at a time, while it does
+      # not — but it never climbs past the number set here, so 16 is a ceiling
+      # rather than a target.
       #
       # For a real migration, measure it instead:
       #     imapsync-go probe --url imaps://you@imap.mail.me.com
@@ -39,6 +39,12 @@ pairs:
       # bytes rather than message count so a handful of large attachments
       # cannot exhaust memory.
       max_inflight: 512MiB
+      # The brake. One allowance shared by the whole run, not one per
+      # connection, so the number means the same at any width. Omit either for
+      # no limit. A message is charged once and crosses the wire twice, so
+      # 1MiB/second here is about 2MiB/second of real traffic.
+      #max_bytes_per_second: 1MiB
+      #max_messages_per_second: 10
 
     folders:
       # How source folders find their destination. Two modes:

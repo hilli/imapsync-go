@@ -214,7 +214,8 @@ func TestARefusalSaysWhatToDoInstead(t *testing.T) {
 	tests := []struct{ option, wants string }{
 		{"--folderrec=Parent", "--include"},
 		{"--regextrans2=s/a/b/", "--map"},
-		{"--maxbytespersecond=1000", "--dest-connections"},
+		{"--maxbytesafter=1000", "--max-bytes-per-second"},
+		{"--maxsleep=3", "--max-bytes-per-second"},
 		{"--justconnect", "imapsync-go probe"},
 		{"--gmail1", "--host1"},
 		{"--version", "--version"},

@@ -336,18 +336,26 @@ source only has to read one back.
 Asking for more connections than a server will hold is not a disaster. When a
 connection is refused while the others are working normally, the pool takes that
 as the server's answer, drops to the number currently open, and closes what it
-cannot keep. The refused operation retries; nothing is lost. The run ends by
-telling you the width it settled on and which flag to set to start there next
-time, which is the only measurement of that server anyone has:
+cannot keep. Nothing is lost: a worker that meets the narrower pool waits for a
+connection rather than failing its folder. The run ends by telling you the width
+it finished on and which flag to set to start there next time, which is the only
+measurement of that server anyone has:
 
 ```
-The destination server would not hold 16 connections; the run settled on 12.
-Pass --dest-connections=12 next time to start there and skip the refusals.
+The destination server would not hold 16 connections; the run ended on 12.
+That is where the width finished rather than a fixed limit: it narrows when the
+server refuses and climbs back while it does not. Pass --dest-connections=12
+next time to start nearer and skip the opening refusals.
 ```
 
-The pool never grows back within a run. Servers do not announce that a limit has
-lifted, so growing means probing for a refusal, and a refusal is what we were
-avoiding.
+The pool climbs back, one connection at a time, once a refusal is half a minute
+behind it. That is not optimism about the server changing its mind: the limit is
+usually what the *other* clients on the account are not using at that moment, and
+the same server has been observed refusing past 30, holding 36, then refusing
+past 29 inside twelve minutes. A pool that only ever narrowed would take the
+worst second of its first minute and keep it for the rest of the run — and this
+tool is built for runs measured in hours. It never climbs past the width you
+asked for.
 
 Raise the counts gradually all the same. Not every server says plainly that you
 have opened too many, and a limit met as a stall rather than a refusal is
@@ -359,6 +367,63 @@ Bodies are held in memory between the fetch and the append, never spooled to
 disk. `--memory-limit` bounds that. A message larger than the whole limit is
 still copied, alone, so no message is too big to sync. Accepts `512MiB`, `2GB`,
 `1G` or a plain byte count.
+
+### Going slower on purpose
+
+Everything above is about going faster, and a tool built to go fast needs a
+brake. Two flags provide one:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--max-bytes-per-second` | unlimited | Ceiling on message data moved per second |
+| `--max-messages-per-second` | unlimited | Ceiling on messages copied per second |
+
+Either may be given alone or both together, in which case a message waits for
+whichever allowance is short. `--max-bytes-per-second` takes the same sizes as
+`--memory-limit`; `--max-messages-per-second` takes a fraction, so `0.5` is one
+message every two seconds.
+
+The allowance is **one allowance shared by the whole run**, not one per
+connection. This is the part that differs from imapsync, and it has to: imapsync
+sleeps between messages, which is a rate limit because imapsync is sequential.
+Forty fetchers each sleeping the same interval would move forty times the rate,
+and the faster you configured the run the further off the number would land. So
+`--max-bytes-per-second 1MiB` means one mebibyte a second whether the run has one
+connection or a hundred, and turning the connection counts up cannot make a
+limited run move faster than its limit.
+
+Two things it does not count, both of which imapsync also does not count:
+
+- **A message is charged once and crosses the wire twice**, once off the source
+  and once onto the destination. `--max-bytes-per-second 1MiB` therefore produces
+  around 2 MiB/s of real network traffic. Halve the number if what you are
+  protecting is a link rather than a server.
+- **Header and metadata sweeps are not charged.** The limit governs message
+  bodies. The sweep that decides what to copy is small per message but runs over
+  every message in a folder, so the opening minutes of a large run can move more
+  than the limit suggests.
+
+The run reports what the brake cost, and reports the limit in a form that can be
+pasted straight back into the flag:
+
+```
+Rate limited to 1MiB/second.
+Workers waited 4m12s on it in total, summed across them, having moved
+1.043GiB of message data.
+```
+
+The wait is summed across workers, so it routinely exceeds the wall clock — with
+sixteen connections, sixteen seconds of waiting can pass in one second. It is a
+measure of how hard the brake was pressed, not of how long the run was delayed.
+If nothing ever waited, the report says so plainly, which is the answer to "is
+this limit doing anything?"
+
+A message the destination already holds is never charged. A re-run over settled
+mail copies nothing, so a limit set for copying does not throttle the pass that
+finds there is nothing to copy.
+
+Both flags can be set in the config file under `concurrency:`, and a flag given
+on the command line wins over the config.
 
 ### When the network misbehaves
 

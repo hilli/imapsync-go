@@ -38,6 +38,7 @@ import (
 	"github.com/hilli/imapsync-go/internal/searchkey"
 	"github.com/hilli/imapsync-go/internal/selection"
 	"github.com/hilli/imapsync-go/internal/state"
+	"github.com/hilli/imapsync-go/internal/throttle"
 )
 
 // metaBatch is how many messages are described in one FETCH.
@@ -218,6 +219,12 @@ type Options struct {
 	// silences it, which is the right default for a caller that has its own
 	// idea of what to report; the command line sets its own interval.
 	ProgressEvery time.Duration
+
+	// Throttle bounds how fast message data moves, and may be nil for no
+	// limit. It is one allowance shared by every worker in the run rather than
+	// a delay each applies to itself, which is the only shape that means
+	// anything at this concurrency (see internal/throttle).
+	Throttle *throttle.Limiter
 
 	Logger *slog.Logger
 }
@@ -2675,6 +2682,19 @@ func (s *Syncer) fetchOne(
 		}
 		lv.adopted(1)
 		return nil
+	}
+
+	// Waited for before the budget is charged, and that order is the point: a
+	// worker that took its share of the budget and then waited on the rate
+	// allowance would hold memory for the whole of a wait that can run to
+	// seconds, starving workers that were ready to move bytes now. Waiting
+	// first costs nothing while it waits.
+	//
+	// After the adoption check above, so a message already on the destination
+	// is not charged for bytes that never cross the wire — which is what keeps
+	// a re-run of a settled account from being throttled to a crawl.
+	if err := s.opts.Throttle.Wait(ctx, meta.Size); err != nil {
+		return err
 	}
 
 	// Charged before the body is read and refunded once it has been appended,
