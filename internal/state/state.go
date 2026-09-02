@@ -473,14 +473,23 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = 
 	return out, nil
 }
 
-// ClaimedCount is how many messages this folder claims to have on the
-// destination.
+// ClaimedCount is how many distinct destination messages this folder claims.
 //
-// It answers the same question as len(Mirrored(...)) and must be kept scoped
-// identically, which is why the WHERE clause is a copy of that one rather than
-// a simplification of it. The reason it exists separately is memory: the
-// caller wants one integer, and materialising 413k rows to take their length
-// is the mistake that cost 19 MB in the flag resync.
+// Distinct is the whole point, and it is why this is not len(Mirrored(...)).
+// Mirrored is keyed by source UID, and two source UIDs legitimately name one
+// destination message: a folder holding the same message twice is copied once
+// and both rows point at that copy. Counting rows would then report two claims
+// against a folder holding one message, and the caller reads exactly that
+// comparison as proof of loss — so every deduplicated folder would be verified
+// on every run, for ever, and find nothing wrong each time.
+//
+// The scoping is otherwise a copy of Mirrored's rather than a simplification of
+// it, and must stay so: both ask which destination messages this folder's rows
+// claim, and only the counting differs.
+//
+// It exists separately for memory: the caller wants one integer, and
+// materialising 413k rows to take their length is the mistake that cost 19 MB
+// in the flag resync.
 //
 // The number is a floor on what the destination should hold, never a ceiling.
 // A destination legitimately carries messages we never put there, so
@@ -489,7 +498,7 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = 
 // callers may read.
 func (d *DB) ClaimedCount(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) (int, error) {
 	const query = `
-SELECT COUNT(*) FROM messages
+SELECT COUNT(DISTINCT dst_uid) FROM messages
 WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = ? AND dst_uid != 0`
 
 	var n int

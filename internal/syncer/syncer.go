@@ -17,6 +17,7 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -147,6 +148,22 @@ type Options struct {
 	// honour is dropped, and the ordinary copy path picks the message up again
 	// as though it had never been sent.
 	NoVerifyDest bool
+
+	// SyncDuplicates copies a source folder's repeated messages once each
+	// instead of once in total.
+	//
+	// Negative, like the two above, because imapsync skips duplicates by
+	// default and this is a drop-in: a user who knows what --syncduplicates
+	// does should not have to discover that we redefined it.
+	//
+	// It reverses a decision this tool made deliberately, and the reversal is
+	// worth naming. Adoption still holds that "two identical messages in the
+	// source are two messages, not one" — because adoption matches on a digest
+	// of six headers, which is evidence and not proof, and a wrong match there
+	// silently drops a message. The skip below rests on the whole message
+	// matching byte for byte, which is proof, so it can do what a digest may
+	// not.
+	SyncDuplicates bool
 
 	// NoSubscribe leaves destination folders this run creates unsubscribed.
 	//
@@ -289,6 +306,12 @@ type FolderReport struct {
 	// can notice them and then fail to copy them, and the two numbers are worth
 	// being able to disagree.
 	Missing int
+	// Duplicates is how many source messages this folder did not copy because
+	// an identical message, byte for byte, was copied for it.
+	//
+	// They are recorded as done against that one copy, so they are counted once
+	// — in the run that recognised them — and never again.
+	Duplicates int
 	// Filtered is how many the message selection left out. Like Vanished this
 	// is neither work done nor work failed, but unlike Vanished it can change
 	// its mind: a message excluded by --minage today is copied once it is old
@@ -374,6 +397,16 @@ func (r Report) Missing() int {
 	n := 0
 	for _, f := range r.Folders {
 		n += f.Missing
+	}
+	return n
+}
+
+// Duplicates is how many source messages were represented by a copy made for an
+// identical one rather than copied again.
+func (r Report) Duplicates() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Duplicates
 	}
 	return n
 }
@@ -917,8 +950,68 @@ type live struct {
 	report FolderReport
 	index  adoption
 
+	// bodies maps the SHA-256 of a message this folder has fetched to the
+	// source UID it was fetched for. It is how a repeated message is
+	// recognised, and the hash is of the whole message rather than of selected
+	// headers: two messages whose every byte agrees are the same message, which
+	// is proof, where six matching headers would only be evidence.
+	//
+	// Fetching is concurrent across chunks, so a repeat may be seen by a
+	// different worker from the original. The mutex this shares with the
+	// counters is what makes claiming a hash and reading the incumbent one
+	// step.
+	bodies map[[sha256.Size]byte]uint32
+	// dupes pairs each skipped source UID with the source UID whose copy
+	// represents it. They are settled after the copy pass rather than during
+	// it, because the survivor's destination UID is not known until its APPEND
+	// returns, and a fetcher that waited for an appender could deadlock the
+	// folder.
+	dupes []dupe
+
 	// health is shared with every other folder in the run.
 	health *health
+}
+
+// dupe is one source message that was not copied, and the source message whose
+// copy stands for it.
+type dupe struct{ uid, survivor uint32 }
+
+// firstCopyOf records that a message with this hash was fetched for uid, and
+// reports the earlier source UID if one already had it.
+//
+// The first caller for a hash always gets ok=false and is copied. Every later
+// one is told which message represents it, so the survivor is whichever the
+// fetchers happened to reach first — arbitrary, but recorded, so the folder's
+// outcome does not depend on it.
+func (l *live) firstCopyOf(sum [sha256.Size]byte, uid uint32) (uint32, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if survivor, ok := l.bodies[sum]; ok {
+		return survivor, true
+	}
+	if l.bodies == nil {
+		l.bodies = make(map[[sha256.Size]byte]uint32)
+	}
+	l.bodies[sum] = uid
+	return 0, false
+}
+
+// duplicate notes a message that was not appended because an identical one was.
+//
+// It is not counted in the report here. Nothing is owed to the reader until the
+// row is written, and the row cannot be written until the survivor has landed —
+// so a run whose survivor failed reports no duplicates, which is the truth: it
+// copied one message and will be asked to copy both again.
+func (l *live) duplicate(uid, survivor uint32) {
+	l.mu.Lock()
+	l.dupes = append(l.dupes, dupe{uid: uid, survivor: survivor})
+	l.mu.Unlock()
+}
+
+func (l *live) deduplicated(n int) {
+	l.mu.Lock()
+	l.report.Duplicates += n
+	l.mu.Unlock()
 }
 
 // adopt claims a destination message for a source identity, if one is free.
@@ -1054,6 +1147,55 @@ func (s *Syncer) mirrored(ctx context.Context, p *prepared) (map[uint32]state.Mi
 	return rows, nil
 }
 
+// settleDuplicates records each skipped message against the copy that stands
+// for it, now that the copy pass has finished and every survivor's destination
+// UID is known.
+//
+// It runs here rather than inside the copy because the survivor's destination
+// UID is not known until its APPEND returns, and a fetch worker that waited for
+// an append worker could deadlock a folder — the two stages are deliberately
+// joined by a channel in one direction only.
+//
+// A survivor that failed to land has no destination UID, so its duplicates are
+// left unrecorded and their rows stay in flight. The next run fetches them
+// again, which is the right outcome: nothing on the destination represents them
+// yet, and a row claiming otherwise would be a lie no later run corrects.
+//
+// The DstUID check is redundant today — Mirrored already declines to return a
+// row naming destination UID 0 — and is kept because it states locally what
+// this function needs. Whether a settled row may name nothing is a question
+// about this write, and answering it by reading another package's WHERE clause
+// is how a guard goes missing.
+func (s *Syncer) settleDuplicates(ctx context.Context, p *prepared, lv *live) error {
+	lv.mu.Lock()
+	dupes := lv.dupes
+	lv.mu.Unlock()
+	if len(dupes) == 0 {
+		return nil
+	}
+
+	mirrors, err := s.mirrored(ctx, p)
+	if err != nil {
+		return err
+	}
+
+	settled := 0
+	for _, d := range dupes {
+		m, ok := mirrors[d.survivor]
+		if !ok || m.DstUID == 0 {
+			s.log.Warn("a repeated message was left for the next run because the copy standing for it did not land",
+				"uid", d.uid, "survivor", d.survivor)
+			continue
+		}
+		if err := s.db.CompleteAppend(ctx, p.folderID, p.src.UIDValidity, d.uid, p.dst.UIDValidity, m.DstUID); err != nil {
+			return fmt.Errorf("recording message %d as a repeat of %d: %w", d.uid, d.survivor, err)
+		}
+		settled++
+	}
+	lv.deduplicated(settled)
+	return nil
+}
+
 // syncFolder copies one mailbox.
 func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (FolderReport, error) {
 	if s.opts.DryRun {
@@ -1069,6 +1211,10 @@ func (s *Syncer) syncFolder(ctx context.Context, pair folder.Pair, hp *health) (
 	// copyFolder is a no-op on an empty list, so the two paths need no
 	// distinguishing beyond that.
 	if err := s.copyFolder(ctx, pair, p, lv); err != nil {
+		return lv.snapshot(), err
+	}
+
+	if err := s.settleDuplicates(ctx, p, lv); err != nil {
 		return lv.snapshot(), err
 	}
 
@@ -1970,6 +2116,16 @@ func (s *Syncer) condemned(ctx context.Context, dst imapx.Conn, p *prepared, dst
 			victims = append(victims, victim{DstUID: m.DstUID, SrcUID: m.SrcUID})
 		}
 	}
+	// One destination copy may stand for more than one source message: a folder
+	// holding the same message twice is copied once, and both rows point at
+	// that copy. Nominating per row would delete it as soon as either source
+	// message went, while the other was still there — deleting mail the source
+	// still holds, which is the one thing deletion must never do.
+	//
+	// The extra pass is bounded by the nominations rather than by the folder,
+	// because the ceiling keeps that list short while the folder may hold 400k
+	// rows.
+	victims = stillClaimed(victims, mirrors, p.live)
 	// Deliberately not sorted, though the map above hands these back in a
 	// different order every run. Nothing downstream can see the order: the UIDs
 	// become an imap.UIDSet, which merges on insertion and so encodes to the
@@ -2027,6 +2183,55 @@ func (s *Syncer) condemned(ctx context.Context, dst imapx.Conn, p *prepared, dst
 		return victims, population, true, share, nil
 	}
 	return victims, population, share <= s.ceiling() || s.opts.Force, share, nil
+}
+
+// stillClaimed reduces a list of per-row nominations to one entry per
+// destination message, dropping any whose message a source message that is
+// still there also names.
+//
+// Both halves follow from the same change. A nomination means "the source
+// message that named this copy is gone", while deletion needs "no source
+// message names it any more", and the two were the same question only while
+// every copy stood for exactly one source message — which stopped being true
+// when repeated messages began sharing one.
+//
+// Collapsing matters as much as sparing. Two rows naming one copy would
+// otherwise be counted as two deletions against a destination that lost one,
+// and that count is what the ceiling is measured against: a folder full of
+// settled repeats could refuse a handful of real deletions on a ratio it
+// invented.
+func stillClaimed(victims []victim, mirrors map[uint32]state.Mirror, live []uint32) []victim {
+	if len(victims) == 0 {
+		return victims
+	}
+	nominated := make(map[uint32]struct{}, len(victims))
+	for _, v := range victims {
+		nominated[v.DstUID] = struct{}{}
+	}
+
+	spared := make(map[uint32]struct{})
+	for _, m := range mirrors {
+		if _, ok := nominated[m.DstUID]; !ok {
+			continue
+		}
+		if _, found := slices.BinarySearch(live, m.SrcUID); found {
+			spared[m.DstUID] = struct{}{}
+		}
+	}
+
+	seen := make(map[uint32]struct{}, len(victims))
+	kept := victims[:0]
+	for _, v := range victims {
+		if _, ok := spared[v.DstUID]; ok {
+			continue
+		}
+		if _, ok := seen[v.DstUID]; ok {
+			continue
+		}
+		seen[v.DstUID] = struct{}{}
+		kept = append(kept, v)
+	}
+	return kept
 }
 
 // strangers finds destination messages nothing recorded putting there and asks
@@ -2400,6 +2605,28 @@ func (s *Syncer) fetchOne(
 			return nil
 		}
 		return fmt.Errorf("fetching message %d: %w", meta.UID, err)
+	}
+
+	// A message this folder has already fetched, byte for byte. Appending it
+	// again would put a second copy of one message on the destination, which is
+	// what imapsync declines to do by default.
+	//
+	// The test is the whole message rather than a digest of its headers, and
+	// that is what makes it safe to act on. Not copying a message loses it just
+	// as surely as deleting one, so the evidence adoption is allowed to work
+	// from — six headers that servers do not rewrite — is not enough here: a
+	// message with no Message-ID is digested from five headers, and two
+	// automated notifications sent in the same second agree on all five while
+	// their bodies differ. Comparing everything cannot make that mistake.
+	//
+	// It costs no round trip. The bytes are in hand because they were about to
+	// be appended.
+	if !s.opts.SyncDuplicates {
+		if survivor, dup := lv.firstCopyOf(sha256.Sum256(buf.Bytes()), meta.UID); dup {
+			release()
+			lv.duplicate(meta.UID, survivor)
+			return nil
+		}
 	}
 
 	item := &pendingAppend{

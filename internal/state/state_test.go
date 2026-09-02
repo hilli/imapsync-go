@@ -825,10 +825,11 @@ func TestMirroredReadsOnlyTheFolderAndUIDValidityAskedFor(t *testing.T) {
 // the check stops looking, which is the state this whole feature exists to
 // remove.
 //
-// It is asserted against len(Mirrored) rather than a literal, because the two
-// must answer the same question: the count decides whether the enumeration
-// happens and Mirrored decides what it finds, so they cannot be allowed to
-// disagree about which rows are in scope.
+// It is asserted against Mirrored rather than against a literal alone, because
+// the two must scope identically: the count decides whether the enumeration
+// happens and Mirrored decides what it finds. The comparison is against the
+// number of distinct destination UIDs Mirrored names, not the number of rows,
+// since two source UIDs may name one destination message.
 func TestClaimedCountAsksTheSameQuestionAsMirrored(t *testing.T) {
 	t.Parallel()
 
@@ -856,9 +857,39 @@ func TestClaimedCountAsksTheSameQuestionAsMirrored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mirrored() error = %v", err)
 	}
-	if got != len(mirrors) {
-		t.Errorf("ClaimedCount() = %d but Mirrored() returned %d rows; the count that "+
-			"decides whether to enumerate must scope identically to the read that follows it",
-			got, len(mirrors))
+	seen := make(map[uint32]struct{})
+	for _, m := range mirrors {
+		seen[m.DstUID] = struct{}{}
+	}
+	if got != len(seen) {
+		t.Errorf("ClaimedCount() = %d but Mirrored() names %d distinct destination messages; "+
+			"the count that decides whether to enumerate must scope identically to the read "+
+			"that follows it", got, len(seen))
+	}
+}
+
+// A folder holding the same message twice is copied once, and both source rows
+// point at that one copy. Counting rows would claim two messages against a
+// destination holding one -- which the caller reads as proof that a copy is
+// gone, so it would enumerate the whole destination on every run and find
+// nothing wrong every time.
+func TestTwoSourceMessagesSharingOneCopyAreClaimedOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	f := seedFolder(t, db, 111, 222)
+	seedDone(t, db, f.ID, 111, 7, 222, 70)
+	seedDone(t, db, f.ID, 111, 8, 222, 70) // the duplicate, sharing the survivor's copy
+	seedDone(t, db, f.ID, 111, 9, 222, 71)
+
+	got, err := db.ClaimedCount(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("ClaimedCount() error = %v", err)
+	}
+	if got != 2 {
+		t.Errorf("ClaimedCount() = %d, want 2: three rows naming two destination "+
+			"messages claim two messages, not three", got)
 	}
 }

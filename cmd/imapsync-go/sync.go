@@ -99,12 +99,13 @@ type syncFlags struct {
 	memoryLimitSet bool
 	delete2Set     bool
 
-	progressEvery time.Duration
-	full          bool
-	resyncFlags   bool
-	noResyncFlags bool
-	verifyDest    bool
-	subscribe     bool
+	progressEvery  time.Duration
+	full           bool
+	resyncFlags    bool
+	noResyncFlags  bool
+	verifyDest     bool
+	syncDuplicates bool
+	subscribe      bool
 
 	delete2       bool
 	deleteCeiling float64
@@ -202,6 +203,7 @@ watch for authentication failures.`,
 	// because imapsync has both, and this option is ours. --verify-dest=false
 	// is the way off.
 	cmd.Flags().BoolVar(&f.verifyDest, "verify-dest", true, "check the destination still holds the copies the state database recorded, and copy back any it does not")
+	cmd.Flags().BoolVar(&f.syncDuplicates, "sync-duplicates", false, "copy a folder's repeated messages once each instead of once in total")
 	cmd.Flags().BoolVar(&f.subscribe, "subscribe", true, "subscribe to destination folders as they are created, so clients show them")
 	cmd.Flags().BoolVar(&f.delete2, "delete2", false, "delete destination messages whose source counterpart is gone")
 	cmd.Flags().Float64Var(&f.deleteCeiling, "delete2-ceiling", 0.10, "refuse to delete more than this fraction of a folder's copied messages in one run")
@@ -287,21 +289,22 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 
 	started := time.Now()
 	report, err := syncer.New(srcPool, dstPool, db, bytesInFlight, syncer.Options{
-		PairID:        pairName,
-		Folders:       opts,
-		DryRun:        f.dryRun,
-		Full:          f.full,
-		Filter:        messages,
-		SourceSearch:  sourceSearch,
-		DestSearch:    destSearch,
-		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
-		NoVerifyDest:  !f.verifyDest,
-		NoSubscribe:   !f.subscribe,
-		Delete2:       resolveDelete2(f, pair),
-		DeleteCeiling: f.deleteCeiling,
-		Force:         f.force,
-		ProgressEvery: f.progressEvery,
-		Logger:        slog.Default(),
+		PairID:         pairName,
+		Folders:        opts,
+		DryRun:         f.dryRun,
+		Full:           f.full,
+		Filter:         messages,
+		SourceSearch:   sourceSearch,
+		DestSearch:     destSearch,
+		NoResyncFlags:  f.noResyncFlags || !f.resyncFlags,
+		NoVerifyDest:   !f.verifyDest,
+		SyncDuplicates: f.syncDuplicates,
+		NoSubscribe:    !f.subscribe,
+		Delete2:        resolveDelete2(f, pair),
+		DeleteCeiling:  f.deleteCeiling,
+		Force:          f.force,
+		ProgressEvery:  f.progressEvery,
+		Logger:         slog.Default(),
 	}).Run(ctx)
 
 	writeErr := writeSyncReport(out, report, time.Since(started), f.dryRun, connections{
@@ -450,6 +453,31 @@ func writeMissingNote(p *printer, report syncer.Report, dryRun bool) {
 	}
 	p.printf("\n%d %s recorded as copied %s no longer on the destination.\nSomething other than this run removed %s, and %s.\n",
 		missing, plural(missing, "message"), verb, object, tail)
+}
+
+// writeDuplicatesNote reports source messages that repeated one another.
+//
+// A note rather than a column, because it is zero on almost every account and
+// the table is wide already. It is not a warning: nothing went wrong, and the
+// destination holds every distinct message the source did.
+//
+// It says "byte for byte" plainly, because the reader's first question is
+// whether mail was dropped on a guess. It was not, and --sync-duplicates is
+// named in the note so that anyone who wants every copy can have them.
+func writeDuplicatesNote(p *printer, report syncer.Report) {
+	n := report.Duplicates()
+	if n == 0 {
+		return
+	}
+	// Agreement by hand, as in writeMissingNote: this report has been wrong
+	// about its own run often enough to be worth the four words.
+	subject, verb, each := "messages were", "were", "each"
+	if n == 1 {
+		subject, verb, each = "message was", "was", "it"
+	}
+	p.printf("\n%d source %s byte for byte identical to one already copied and %s not copied a second time.\n"+
+		"The destination holds one copy of %s. Use --sync-duplicates to copy every one.\n",
+		n, subject, verb, each)
 }
 
 // writeHeaderlessNote reports a server that would not return headers.
@@ -1203,6 +1231,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 
 	writeUncopiedNotes(p, report)
 	writeMissingNote(p, report, dryRun)
+	writeDuplicatesNote(p, report)
 	writeHeaderlessNote(p, report)
 	writeConnectionNote(p, conns)
 

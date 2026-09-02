@@ -369,6 +369,7 @@ Flags:
       --state string                                path to the state database (default: per-user application state directory)
       --subfolder2 string                           nest the whole copied tree under this destination folder
       --subscribe                                   subscribe to destination folders as they are created, so clients show them (default true)
+      --sync-duplicates                             copy a folder's repeated messages once each instead of once in total
       --trace                                       print the raw IMAP conversation to stderr, with credentials redacted
       --verify-dest                                 check the destination still holds the copies the state database recorded, and copy back any it does not (default true)
 
