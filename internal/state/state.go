@@ -219,6 +219,48 @@ FROM folders WHERE pair_id = ? AND source = ?`
 	return f, nil
 }
 
+// FoldersByDest returns the rows for a pair that copy into a destination
+// mailbox.
+//
+// It returns every match rather than the first because more than one is not an
+// ambiguity a caller can resolve by picking: two source folders copying into
+// one destination means two sets of claims over the same messages, and
+// re-pointing one set while leaving the other would leave rows naming a message
+// that has been deleted. Planning refuses that collision, so the plural case
+// should never arise -- but "should never" is the reason to report it rather
+// than to assume it.
+func (d *DB) FoldersByDest(ctx context.Context, pairID, dest string) ([]Folder, error) {
+	const query = `
+SELECT id, pair_id, source, dest, src_uidvalidity, dst_uidvalidity, src_highestmodseq, src_deleted_through, last_sync
+FROM folders WHERE pair_id = ? AND dest = ? ORDER BY id`
+
+	rows, err := d.db.QueryContext(ctx, query, pairID, dest)
+	if err != nil {
+		return nil, fmt.Errorf("reading folders copying into %q: %w", dest, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Folder
+	for rows.Next() {
+		var (
+			f        Folder
+			lastSync int64
+		)
+		if err := rows.Scan(&f.ID, &f.PairID, &f.Source, &f.Dest,
+			&f.SrcUIDValidity, &f.DstUIDValidity, &f.SrcHighestModSeq, &f.SrcDeletedThrough, &lastSync); err != nil {
+			return nil, fmt.Errorf("reading folders copying into %q: %w", dest, err)
+		}
+		if lastSync != 0 {
+			f.LastSync = time.Unix(lastSync, 0).UTC()
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading folders copying into %q: %w", dest, err)
+	}
+	return out, nil
+}
+
 // FenceUIDValidity reconciles the stored UIDVALIDITY pair with what the servers
 // currently report, and reports whether the stored message rows survived.
 //

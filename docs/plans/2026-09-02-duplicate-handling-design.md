@@ -37,9 +37,25 @@ That same shortness is why the digest alone cannot decide a deletion. Six
 headers matching is very strong evidence and not proof — a resent message, a
 Message-ID reused by a broken client, a mailing list posting the same
 announcement twice with different bodies. Size is a cheap second opinion and,
-crucially, a free one: `FetchMeta` already asks for `RFC822.SIZE` on every
-message it enumerates, for every folder, today. **Duplicate detection therefore
-costs no extra round trips at all.**
+crucially, a free one on the source side: `FetchMeta` already asks for
+`RFC822.SIZE` on every message it enumerates, for every folder, today.
+
+**Corrected after building it.** That freedom is real for B and false for A, and
+the difference is worth stating plainly because it is what makes A opt-in.
+
+B costs no extra round trips at all — but not for the reason given here. It
+ended up using neither the digest nor the size, and never calls into `dedup`.
+`fetchOne` holds the whole message in memory immediately before APPEND, so two
+source messages whose every byte agrees *are* the same message: proof rather
+than evidence, obtained from bytes already in hand.
+
+A cannot reuse any of it. `messages.size` and `messages.ident_hash` describe the
+**source** message, and a copy this tool made carries a stamp header the source
+did not, so its size differs by that line. Comparing a source-claimed size with
+a destination-claimed one would put two copies of one message in different
+groups. Every key A builds therefore comes from one server's answers about its
+own messages, which costs a metadata pass over the destination folder. That is
+the honest price of the feature and the reason it is off unless asked for.
 
 ### Weak identities are excluded outright
 
@@ -207,7 +223,41 @@ run during the previous piece of work.
    the within-group sort, because every test fed UIDs in ascending order and
    the sort had nothing to do. iCloud's `UID SEARCH ALL` returns them unsorted,
    so the test now does too.
-2. B — skip source duplicates, verifying before the skip.
-3. A — delete destination duplicates.
-4. The `dedup` command.
-5. Compat wiring and documentation.
+2. B — skip source duplicates, verifying before the skip. Done, commit
+   `17ce056`. Twelve mutations. The one that survived twice was a repeat
+   recorded against a copy that never landed, and it survived because
+   `Mirrored` and `ClaimedCount` both already filter `AND dst_uid != 0` — the
+   false row was invisible through every accessor the tests had. The assertion
+   now goes under them with raw SQL.
+3. A — delete destination duplicates. Done. Thirteen mutations, twelve caught.
+   The outstanding one is the claimed-copy preference, which the syncer cannot
+   distinguish: adoption always takes the lowest matching UID, so no run this
+   harness can stage puts a claimed copy above an unclaimed twin.
+   `internal/dedup` asserts it directly, where the UIDs can be chosen.
+
+   Two things settled while building it. `--delete2` implies
+   `--delete2duplicates`, and the escape hatch is read through `Changed()`
+   rather than through the value, because a plain boolean check could only ever
+   turn destruction on. And the dry run pays the full cost and previews it
+   exactly, rather than computing a preview with a second implementation —
+   which would preview that implementation, on the one option where it matters
+   most.
+4. The `dedup` command. Done. The claim it makes — one account examined, the
+   other never contacted — is enforced rather than documented: the syncer is
+   constructed with a nil source pool, so a run that reaches for the source
+   fails loudly. Mutation-tested by adding a source listing to `Dedup`, which
+   the tests caught. At the command level a listener that counts connections
+   stands over the same promise, since building a pool dials nothing and a
+   merely-unroutable address would prove only that the failure was survivable.
+
+   The source is still *named*, because the records are filed under the pair
+   and reading the wrong pair's would find no claims at all — every copy would
+   look unclaimed, and a later sync would remake the duplicate. It is named and
+   not validated, so no source credential is required.
+5. Compat wiring and documentation. Done. `--syncduplicates` and
+   `--delete2duplicates` both translate, in both polarities:
+   `--nodelete2duplicates` becomes `--delete2duplicates=false`, which is the
+   escape hatch built in step 3 and a confirmation that its shape matches
+   imapsync's. `--skipcrossduplicates` and `--debugcrossduplicates` stay
+   refused, with the honest reason: duplicates are found within a folder, and a
+   message in two mailboxes is filed twice rather than repeated.

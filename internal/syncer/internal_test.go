@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/hilli/imapsync-go/internal/ident"
+	"github.com/hilli/imapsync-go/internal/imapx"
 )
 
 // TestCopyableFlagsDropsRecent is white-box because the property is invisible
@@ -72,4 +73,29 @@ func TestTakeRefusesUnknownIdentities(t *testing.T) {
 
 func identityOf(digest string) ident.Identity {
 	return ident.Identity{Digest: digest}
+}
+
+// TestDeduplicationSkipsMailboxesThatCannotBeOpened is white-box because the
+// in-memory server used everywhere else cannot produce a \Noselect mailbox.
+// Real ones do -- Courier's INBOX. and Dovecot's namespace nodes are hierarchy
+// nodes holding no messages -- and SELECT on one fails, so without this the
+// command would report a failure and exit non-zero on every server that has a
+// folder tree. A black-box test would prove only that the fake server has none.
+func TestDeduplicationSkipsMailboxesThatCannotBeOpened(t *testing.T) {
+	t.Parallel()
+
+	targets, skips := DedupSelection{}.apply([]imapx.Folder{
+		{Name: "Lists", Selectable: false},
+		{Name: "Lists/go", Selectable: true},
+	})
+
+	if !slices.Equal(targets, []string{"Lists/go"}) {
+		t.Errorf("would examine %v, want only the mailbox that can be opened", targets)
+	}
+	if len(skips) != 1 || skips[0].Dest != "Lists" {
+		t.Fatalf("skipped %v, want the \\Noselect node", skips)
+	}
+	if skips[0].Reason == "" {
+		t.Error("skipped a mailbox without saying why")
+	}
 }

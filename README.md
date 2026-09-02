@@ -558,6 +558,78 @@ says have not changed — otherwise the deletions made while the flag was off
 would never be carried out. After that the fast path resumes as normal, and a
 refusal is offered again on the next run rather than being final.
 
+### Duplicates
+
+A mailbox can hold the same message more than once, and there are two separate
+questions about that: whether to copy a repeat, and what to do about repeats the
+destination already has.
+
+**Copying.** By default a source message identical to one this run has already
+copied is not copied again, matching imapsync's default. The comparison is the
+whole message, byte for byte, made at the moment the copy is about to be
+appended — so it is proof rather than evidence, and it costs nothing: the bytes
+are already in hand. `--sync-duplicates` copies each repeat separately, as
+imapsync's `--syncduplicates` does.
+
+This is stricter than imapsync, which compares a digest of selected headers. A
+message the source stored twice with an extra `Received:` header on one copy is
+two different messages here and one there. That is the safe direction to differ
+in: the worst case is a duplicate that survives.
+
+**Removing.** `--delete2duplicates` removes messages the *destination* folder
+holds more than one copy of, keeping one. It is implied by `--delete2`, since a
+run asked to make the destination look like the source and then leaving it
+holding two copies of something the source holds one of would be contradicting
+the request. `--delete2duplicates=false` declines the implication.
+
+Candidates are grouped by Message-ID, Date, From, To, Cc and Subject together
+with the size the server reports — imapsync's key — and nothing is removed on
+that alone. Both messages are fetched and compared in full first, because two
+automated notifications sent in the same second can agree on every one of those
+and still say different things. The cost is proportional to the duplicates
+found, not to the folder.
+
+Which copy survives is not arbitrary. Where the state database records that a
+particular destination message answers for a source message, that is the one
+kept, and the records are re-pointed at it before anything is deleted.
+Otherwise the two features would fight: removing a recorded copy would leave the
+record naming nothing, destination verification would find the copy missing and
+make a third, and the folder would grow every time it was cleaned.
+
+The same safety valve as `--delete2` applies, measured the same way — a run that
+would remove more than `--delete2-ceiling` of a folder refuses and exits
+non-zero, and `--force` overrides it.
+
+Two limitations are worth knowing. Duplicates are found **within** a folder, not
+across folders: a message filed in both `INBOX` and `Archive` is filed twice,
+not repeated, so imapsync's `--skipcrossduplicates` has no equivalent here. And
+a folder the fast path skips because the server says it has not changed is not
+examined; `--full` looks at everything.
+
+#### Cleaning up an account on its own
+
+The mess this cleans up is usually not one this tool made. It is the mess a
+mailbox already has when someone arrives with it — from a migration that ran
+twice, or a client that re-uploaded — and configuring a copying tool to tidy one
+account is more than that needs. The `dedup` command does it alone:
+
+```console
+imapsync-go dedup --config imapsync.yaml --pair icloud-to-mox --dry-run
+imapsync-go dedup --config imapsync.yaml --pair icloud-to-mox --folder Archive
+```
+
+It copies nothing and opens no connection to the source. Folders no sync has
+ever recorded are examined all the same, which is the usual case for an account
+that arrived with duplicates in it. `--folder`, `--include` and `--exclude`
+select mailboxes by their destination names; `--dry-run`, `--force` and
+`--delete2-ceiling` mean what they do for `sync`.
+
+The source is still named, by `--config` or `--source-url`, and never contacted.
+The records that say which copy to keep are filed under the pair, so reading the
+wrong pair's records would mean finding no claims at all — every copy would look
+unclaimed, and a later sync would find its recorded copy gone and make the
+duplicate again.
+
 ### Choosing folders
 
 | Flag | Effect |

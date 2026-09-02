@@ -464,9 +464,9 @@ func writeMissingNote(p *printer, report syncer.Report, dryRun bool) {
 	// Agreement is done by hand because both halves of the sentence carry the
 	// number: "1 message ... were ... them" reads as a bug in the report, and
 	// this report has already been wrong about a run three times.
-	verb, object, subject, have := "were", "them", "they", "have"
+	verb, object, subject, have := was(missing), "them", "they", "have"
 	if missing == 1 {
-		verb, object, subject, have = "was", "it", "it", "has"
+		object, subject, have = "it", "it", "has"
 	}
 	tail := fmt.Sprintf("%s %s been copied again", subject, have)
 	if dryRun {
@@ -599,19 +599,27 @@ func resolveDelete2(f syncFlags, pair config.Pair) bool {
 // this tool's life, so a pair asking for 40 connections got 4, and the 512 MiB
 // `max_inflight` was silently 256 MiB. A knob that does nothing is worse than
 // no knob: it is a setting people tune, and measure against, and believe.
-func resolveConcurrency(f syncFlags, c config.Concurrency) (src, dst int, inflight int64, err error) {
-	pick := func(flagSet bool, flagVal int, limit config.Limit) int {
-		switch {
-		case flagSet:
-			return flagVal
-		case !limit.Auto():
-			return int(limit)
-		default:
-			return autoConnections
-		}
+// pickWidth applies the precedence: the flag if it was given, then the config,
+// then the default.
+//
+// It asks whether the flag was given rather than what it holds because zero is
+// already rejected further down, so a zero value cannot mean "unset" -- and
+// reading a value as a sentinel is how the config block came to be ignored for
+// the life of the tool.
+func pickWidth(flagSet bool, flagVal int, limit config.Limit) int {
+	switch {
+	case flagSet:
+		return flagVal
+	case !limit.Auto():
+		return int(limit)
+	default:
+		return autoConnections
 	}
-	src = pick(f.srcConnsSet, f.srcConns, c.Source)
-	dst = pick(f.dstConnsSet, f.dstConns, c.Dest)
+}
+
+func resolveConcurrency(f syncFlags, c config.Concurrency) (src, dst int, inflight int64, err error) {
+	src = pickWidth(f.srcConnsSet, f.srcConns, c.Source)
+	dst = pickWidth(f.dstConnsSet, f.dstConns, c.Dest)
 
 	switch {
 	case f.memoryLimitSet || c.MaxInflight == 0:
@@ -813,11 +821,11 @@ func pools(
 	}
 	closers = append(closers, func() { closeStore(srcStore, sideSource) })
 
-	dstDial, dstStore, err := endpoint(pair.Dest, f, f.insecureDst, trace, sideDest)
+	dstPool, releaseDst, err := destPool(ctx, pair, f, trace, dstConns)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("destination: %w", err)
+		return nil, nil, nil, err
 	}
-	closers = append(closers, func() { closeStore(dstStore, sideDest) })
+	closers = append(closers, releaseDst)
 
 	// EXAMINE on the source: reading a message must not mark it \Seen, which
 	// would rewrite an account this tool is only supposed to read.
@@ -832,17 +840,41 @@ func pools(
 	}
 	closers = append(closers, func() { closePool(ctx, srcPool, sideSource) })
 
+	return srcPool, dstPool, unwind, nil
+}
+
+// destPool prepares the destination side alone.
+//
+// Split out because the dedup command needs exactly this and nothing else. A
+// second copy of it would be a second place for the store's closer to be
+// forgotten, which is the one thing on this path that cannot be noticed by
+// running it.
+func destPool(
+	ctx context.Context,
+	pair config.Pair,
+	f syncFlags,
+	trace io.Writer,
+	conns int,
+) (*pool.Pool, func(), error) {
+	dstDial, dstStore, err := endpoint(pair.Dest, f, f.insecureDst, trace, sideDest)
+	if err != nil {
+		return nil, nil, fmt.Errorf("destination: %w", err)
+	}
+
 	dstPool, err := pool.New(pool.Options{
-		Cap:      dstConns,
+		Cap:      conns,
 		Dial:     dstDial,
 		OnShrink: shrinkLogger(sideDest),
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("destination connections: %w", err)
+		closeStore(dstStore, sideDest)
+		return nil, nil, fmt.Errorf("destination connections: %w", err)
 	}
-	closers = append(closers, func() { closePool(ctx, dstPool, sideDest) })
 
-	return srcPool, dstPool, unwind, nil
+	return dstPool, func() {
+		closePool(ctx, dstPool, sideDest)
+		closeStore(dstStore, sideDest)
+	}, nil
 }
 
 // endpoint prepares one side of a pair for its pool.
@@ -1348,6 +1380,18 @@ func rate(copied int, elapsed time.Duration, dryRun bool) string {
 		return ""
 	}
 	return fmt.Sprintf(" (%.1f copied/second)", float64(copied)/elapsed.Seconds())
+}
+
+// was agrees a verb with a count.
+//
+// One helper rather than a literal at each site, because both reports have
+// sentences carrying the number twice and "1 message ... were" reads as a bug
+// in the report -- which this report has already been three times.
+func was(n int) string {
+	if n == 1 {
+		return "was"
+	}
+	return "were"
 }
 
 func plural(n int, word string) string {

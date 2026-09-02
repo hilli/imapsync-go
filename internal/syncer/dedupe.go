@@ -5,6 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/hilli/imapsync-go/internal/dedup"
 	"github.com/hilli/imapsync-go/internal/ident"
@@ -64,13 +70,20 @@ func (s *Syncer) dedupeDest(
 		return res, nil
 	}
 
-	mirrors, err := s.db.Mirrored(ctx, folderID, srcUIDValidity, box.UIDValidity)
-	if err != nil {
-		return res, err
-	}
-	claimedBy := make(map[uint32][]uint32, len(mirrors))
-	for _, m := range mirrors {
-		claimedBy[m.DstUID] = append(claimedBy[m.DstUID], m.SrcUID)
+	// A zero folder is a mailbox no sync has recorded anything about, which the
+	// standalone dedup command meets on every folder of an account it has never
+	// synchronised. Asking anyway would answer nothing; asking explicitly says
+	// so, rather than relying on a query that happens to return no rows.
+	claimedBy := map[uint32][]uint32{}
+	if folderID != 0 {
+		mirrors, err := s.db.Mirrored(ctx, folderID, srcUIDValidity, box.UIDValidity)
+		if err != nil {
+			return res, err
+		}
+		claimedBy = make(map[uint32][]uint32, len(mirrors))
+		for _, m := range mirrors {
+			claimedBy[m.DstUID] = append(claimedBy[m.DstUID], m.SrcUID)
+		}
 	}
 
 	victims, unequal, err := s.confirmDuplicates(ctx, dst, groups, claimedBy)
@@ -230,4 +243,199 @@ func (s *Syncer) allowedToDelete(nominated, population int) bool {
 		return true
 	}
 	return float64(nominated)/float64(population) <= s.ceiling() || s.opts.Force
+}
+
+// DedupSelection chooses which destination mailboxes a standalone
+// deduplication run examines.
+//
+// The patterns match destination names rather than source names, because this
+// run has no source. Whether one mailbox holds the same message twice is a
+// question about that mailbox, and it is answered without contacting the other
+// account at all.
+type DedupSelection struct {
+	// Only restricts the run to these exact destination mailbox names.
+	Only []string
+	// Include, when non-empty, keeps only mailboxes matching one of the
+	// patterns. Exclude then drops any that match.
+	Include []*regexp.Regexp
+	Exclude []*regexp.Regexp
+}
+
+// DedupSkip is a destination mailbox left out of a deduplication run.
+type DedupSkip struct {
+	Dest   string
+	Reason string
+}
+
+// DedupFolderReport is what one destination mailbox contributed.
+type DedupFolderReport struct {
+	Dest       string
+	Population int
+	Removed    int
+	Refused    int
+	Unequal    int
+	Err        error
+}
+
+// DedupReport is the whole standalone run.
+type DedupReport struct {
+	Folders []DedupFolderReport
+	Skips   []DedupSkip
+}
+
+// Totals sums the folder reports.
+func (r DedupReport) Totals() (population, removed, refused, unequal int) {
+	for _, fr := range r.Folders {
+		population += fr.Population
+		removed += fr.Removed
+		refused += fr.Refused
+		unequal += fr.Unequal
+	}
+	return population, removed, refused, unequal
+}
+
+// Dedup removes duplicates from a destination account without a source.
+//
+// It exists because the mess this feature cleans up is not one a sync makes.
+// It is the mess a mailbox already has when someone arrives with it -- from a
+// migration that ran twice, or a client that re-uploaded -- and asking someone
+// to configure and run a full sync to tidy up one account is asking them to
+// point a copying tool at mail they only want examined.
+//
+// The syncer is constructed with a nil source pool for this, which is the whole
+// claim being made: a run that cannot reach the source cannot be secretly
+// depending on it.
+func (s *Syncer) Dedup(ctx context.Context, sel DedupSelection) (DedupReport, error) {
+	boxes, _, err := s.list(ctx, s.dst)
+	if err != nil {
+		return DedupReport{}, fmt.Errorf("listing destination folders: %w", err)
+	}
+
+	targets, skips := sel.apply(boxes)
+	report := DedupReport{Skips: skips}
+	s.log.Info("planned deduplication run", "folders", len(targets), "skipped", len(skips))
+
+	var mu sync.Mutex
+	var g errgroup.Group
+	g.SetLimit(s.dst.Cap())
+	for _, dest := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			fr, err := s.dedupOne(ctx, dest)
+			if err != nil {
+				fr.Err = err
+				s.log.Error("folder failed", "dest", dest, "error", err)
+			}
+			mu.Lock()
+			report.Folders = append(report.Folders, fr)
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	slices.SortFunc(report.Folders, func(a, b DedupFolderReport) int {
+		return strings.Compare(a.Dest, b.Dest)
+	})
+	return report, ctx.Err()
+}
+
+// apply resolves the selection against what the server listed.
+func (sel DedupSelection) apply(boxes []imapx.Folder) (targets []string, skips []DedupSkip) {
+	for _, b := range boxes {
+		switch {
+		case !b.Selectable:
+			// A \Noselect mailbox holds no messages and cannot be opened. Its
+			// children are listed separately and examined on their own merits.
+			skips = append(skips, DedupSkip{Dest: b.Name, Reason: "not selectable"})
+		case len(sel.Only) > 0 && !slices.Contains(sel.Only, b.Name):
+			skips = append(skips, DedupSkip{Dest: b.Name, Reason: "not in --folder"})
+		case len(sel.Include) > 0 && !matchesAny(sel.Include, b.Name):
+			skips = append(skips, DedupSkip{Dest: b.Name, Reason: "does not match --include"})
+		case matchesAny(sel.Exclude, b.Name):
+			skips = append(skips, DedupSkip{Dest: b.Name, Reason: "matches --exclude"})
+		default:
+			targets = append(targets, b.Name)
+		}
+	}
+	return targets, skips
+}
+
+func matchesAny(patterns []*regexp.Regexp, name string) bool {
+	for _, p := range patterns {
+		if p.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupOne examines a single destination mailbox.
+func (s *Syncer) dedupOne(ctx context.Context, dest string) (fr DedupFolderReport, err error) {
+	fr.Dest = dest
+
+	folderID, srcUIDValidity, stored, err := s.claimsOver(ctx, dest)
+	if err != nil {
+		return fr, err
+	}
+
+	lease, err := s.dst.Acquire(ctx, dest)
+	if err != nil {
+		return fr, fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+	dst := lease.Conn()
+
+	box, err := dst.Select(ctx, dest, imapx.SelectOptions{})
+	if err != nil {
+		return fr, fmt.Errorf("selecting %q: %w", dest, err)
+	}
+
+	// A destination whose UIDVALIDITY has moved since the last sync has state
+	// rows that name UIDs the server has renumbered. Mirrored filters them out,
+	// so nothing here is corrupted by it -- but it means no copy in this folder
+	// counts as claimed, and the next sync will re-adopt by digest whatever
+	// survives. Said out loud because a silently unclaimed folder looks exactly
+	// like a folder with no claims in it.
+	if stored != 0 && stored != box.UIDValidity {
+		s.log.Warn("the destination mailbox has been renumbered since the last sync; deduplicating it without regard to which copies are recorded",
+			"dest", dest, "recorded_uidvalidity", stored, "now", box.UIDValidity)
+	}
+
+	res, err := s.dedupeDest(ctx, dst, box, folderID, srcUIDValidity, s.opts.DryRun)
+	if err != nil {
+		return fr, err
+	}
+	fr.Population, fr.Removed, fr.Refused, fr.Unequal = res.Population, res.Removed, res.Refused, res.Unequal
+	return fr, nil
+}
+
+// claimsOver finds the state rows recording copies into a destination mailbox.
+//
+// A mailbox no sync has written into has none, and that is the ordinary case
+// for this command rather than an error: an account someone arrives with is
+// exactly the thing worth deduplicating, and none of its folders are recorded
+// anywhere. A zero folder means every message is a stranger, every survivor is
+// chosen by UID, and nothing is re-pointed.
+func (s *Syncer) claimsOver(ctx context.Context, dest string) (folderID int64, srcUIDValidity, dstUIDValidity uint32, err error) {
+	rows, err := s.db.FoldersByDest(ctx, s.opts.PairID, dest)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	switch len(rows) {
+	case 0:
+		return 0, 0, 0, nil
+	case 1:
+		return rows[0].ID, rows[0].SrcUIDValidity, rows[0].DstUIDValidity, nil
+	default:
+		sources := make([]string, 0, len(rows))
+		for _, r := range rows {
+			sources = append(sources, r.Source)
+		}
+		return 0, 0, 0, fmt.Errorf(
+			"refusing to deduplicate %q: %d source folders are recorded as copying into it (%s), so removing a copy would leave the other's records naming a message that is gone",
+			dest, len(rows), strings.Join(sources, ", "))
+	}
 }

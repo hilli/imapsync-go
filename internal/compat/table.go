@@ -343,9 +343,9 @@ func messageOptions() []*option {
 		no("resynclabels!", "Gmail labels are not implemented"),
 		no("syncacls!", "access control lists are not copied"),
 		no("idatefromheader!", "this tool takes INTERNALDATE from the source's INTERNALDATE, not from the Date header"),
-		no("syncduplicates!", "duplicate handling is not configurable"),
-		no("skipcrossduplicates!", "duplicate handling is not configurable"),
-		no("debugcrossduplicates!", "duplicate handling is not configurable"),
+		tr("syncduplicates!", "--sync-duplicates"),
+		no("skipcrossduplicates!", "duplicates are found within a folder, not across folders; a message in two mailboxes is filed twice, not repeated"),
+		no("debugcrossduplicates!", "duplicates are found within a folder, not across folders"),
 		no("maxmessagespersecond=f", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
 		no("maxbytespersecond=i", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
 		no("maxbytesafter=i", "rate limiting is not implemented; reduce --source-connections and --dest-connections instead"),
@@ -367,7 +367,7 @@ func deletionOptions() []*option {
 
 		no("delete1!", "this tool opens the source read-only and will not delete from it"),
 		no("expunge1|expunge!", "this tool opens the source read-only and will not expunge it"),
-		no("delete2duplicates!", "deleting duplicates on the destination is not implemented"),
+		tr("delete2duplicates!", "--delete2duplicates"),
 		no("delete1emptyfolders", "this tool never deletes folders"),
 		no("delete2folders!", "this tool never deletes folders"),
 	}

@@ -14,7 +14,7 @@ commands, which are what `imapsync-go sync` takes directly.
 
 ## imapsync options
 
-218 options: 35 translate to a native flag, 16 build an endpoint URL, 70 are accepted and do nothing, and 97 are refused.
+218 options: 37 translate to a native flag, 16 build an endpoint URL, 70 are accepted and do nothing, and 95 are refused.
 
 A **refused** option stops the run rather than being quietly dropped: an
 option that changes which messages move, or where they land, is not something to
@@ -40,6 +40,7 @@ happens here.
 | `--debugmemory` | on/off | becomes `--log-level debug` |
 | `--debugsig` | on/off | becomes `--log-level debug` |
 | `--delete2` | on/off | becomes `--delete2` |
+| `--delete2duplicates` | on/off | becomes `--delete2duplicates` |
 | `--dry` | on/off | becomes `--dry-run` |
 | `--exclude` | string | becomes `--exclude` |
 | `--f1f2` | string (repeatable) | becomes `--map` |
@@ -59,6 +60,7 @@ happens here.
 | `--search2` | string | becomes `--dest-search` |
 | `--subfolder2` | string | becomes `--subfolder2` |
 | `--subscribe` | on/off | becomes `--subscribe` |
+| `--syncduplicates` | on/off | becomes `--sync-duplicates` |
 | `--timeout` | number | becomes `--dial-timeout` |
 
 ### Folded into the endpoint URLs
@@ -167,11 +169,10 @@ happens here.
 | `--authmech2` | string | the mechanism follows from the credential; see --authmech1 |
 | `--authuser1` | string | authenticating as one user to act as another is not implemented |
 | `--authuser2` | string | authenticating as one user to act as another is not implemented |
-| `--debugcrossduplicates` | on/off | duplicate handling is not configurable |
+| `--debugcrossduplicates` | on/off | duplicates are found within a folder, not across folders |
 | `--debugsleep` | number | an imapsync test hook |
 | `--delete1` | on/off | this tool opens the source read-only and will not delete from it |
 | `--delete1emptyfolders` | — | this tool never deletes folders |
-| `--delete2duplicates` | on/off | deleting duplicates on the destination is not implemented |
 | `--delete2folders` | on/off | this tool never deletes folders |
 | `--delete2foldersbutnot` | string | this tool never deletes folders |
 | `--delete2foldersonly` | string | this tool never deletes folders |
@@ -232,7 +233,7 @@ happens here.
 | `--sigignore` | string (repeatable) | signal handling is not configurable |
 | `--sigreconnect` | string (repeatable) | signal handling is not configurable |
 | `--simulong` | number | an imapsync test hook |
-| `--skipcrossduplicates` | on/off | duplicate handling is not configurable |
+| `--skipcrossduplicates` | on/off | duplicates are found within a folder, not across folders; a message in two mailboxes is filed twice, not repeated |
 | `--skipemptyfolders` | on/off | an empty source folder is always created on the destination, so that the two trees match |
 | `--skipheader` | string | the headers a message is identified by are fixed; changing them changes which messages count as duplicates |
 | `--skipmess` | string | it changes which messages are copied, and this tool would copy all of them instead |
@@ -244,7 +245,6 @@ happens here.
 | `--subscribeall`<br>`--subscribe_all` | on/off | this tool subscribes the folders it creates and leaves every other folder alone |
 | `--subscribed` | — | copying only subscribed folders is not implemented; name them with --folder or --include |
 | `--syncacls` | on/off | access control lists are not copied |
-| `--syncduplicates` | on/off | duplicate handling is not configurable |
 | `--syncflagsaftercopy` | on/off | flags are set as part of the copy, not afterwards |
 | `--synclabels` | on/off | Gmail labels are not implemented |
 | `--tests` | on/off | an imapsync test hook |
@@ -274,6 +274,7 @@ Usage:
 Available Commands:
   compat      Run a sync from an imapsync command line
   completion  Generate the autocompletion script for the specified shell
+  dedup       Remove messages a destination account holds more than once
   help        Help about any command
   oauth       Obtain and store OAuth credentials
   probe       Inspect an IMAP server's capabilities, folders and connection ceiling

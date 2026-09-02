@@ -79,6 +79,7 @@ func newRootCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&g.logJSON, "log-json", false, "force JSON logs (default: JSON when stderr is not a terminal)")
 
 	cmd.AddCommand(newCompatCmd())
+	cmd.AddCommand(newDedupCmd())
 	cmd.AddCommand(newOAuthCmd())
 	cmd.AddCommand(newProbeCmd())
 	cmd.AddCommand(newSyncCmd())
