@@ -473,6 +473,33 @@ WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = 
 	return out, nil
 }
 
+// ClaimedCount is how many messages this folder claims to have on the
+// destination.
+//
+// It answers the same question as len(Mirrored(...)) and must be kept scoped
+// identically, which is why the WHERE clause is a copy of that one rather than
+// a simplification of it. The reason it exists separately is memory: the
+// caller wants one integer, and materialising 413k rows to take their length
+// is the mistake that cost 19 MB in the flag resync.
+//
+// The number is a floor on what the destination should hold, never a ceiling.
+// A destination legitimately carries messages we never put there, so
+// ClaimedCount below the mailbox's message count says nothing at all. Above it
+// is proof that copies we recorded are gone, and that is the only direction
+// callers may read.
+func (d *DB) ClaimedCount(ctx context.Context, folderID int64, srcUIDValidity, dstUIDValidity uint32) (int, error) {
+	const query = `
+SELECT COUNT(*) FROM messages
+WHERE folder_id = ? AND src_uidvalidity = ? AND dst_uidvalidity = ? AND state = ? AND dst_uid != 0`
+
+	var n int
+	row := d.db.QueryRowContext(ctx, query, folderID, srcUIDValidity, dstUIDValidity, StateDone)
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("counting the messages claimed on the destination for folder %d: %w", folderID, err)
+	}
+	return n, nil
+}
+
 // RecordFlags remembers the flags a message now carries on the destination.
 //
 // This is written after the STORE, not before. The two orderings fail

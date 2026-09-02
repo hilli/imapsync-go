@@ -370,6 +370,7 @@ Flags:
       --subfolder2 string                           nest the whole copied tree under this destination folder
       --subscribe                                   subscribe to destination folders as they are created, so clients show them (default true)
       --trace                                       print the raw IMAP conversation to stderr, with credentials redacted
+      --verify-dest                                 check the destination still holds the copies the state database recorded, and copy back any it does not (default true)
 
 Global Flags:
       --log-json           force JSON logs (default: JSON when stderr is not a terminal)

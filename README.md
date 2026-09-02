@@ -420,9 +420,28 @@ The number is only recorded by a run that finished the folder with nothing
 failed, so a message that could not be copied is always tried again rather than
 being silently written off.
 
-What this cannot see is the destination. A message deleted at the far end, or a
-mailbox renumbered there, leaves the source's number untouched. `--full` ignores
-the shortcut and compares every folder properly:
+What this cannot see on its own is the destination. A message deleted at the far
+end leaves the source's number untouched, so the folder still looks settled —
+and `--full` is no help, because what it re-examines is the source.
+
+So the destination is counted as well. If a folder holds fewer messages than
+this tool has recorded putting there, copies have gone missing, and the folder
+is compared properly however settled the source looks. The comparison is one
+message count, fetched with the folder listing itself on a server that supports
+LIST-STATUS, and the messages are copied again in the same run:
+
+```
+WARN destination is missing copies this run recorded; missing=2
+```
+
+A folder nothing has touched still costs a single number. `--verify-dest=false`
+turns the check off.
+
+Note that a message you *moved* out of the destination will come back, because a
+move is a delete plus an append elsewhere and only the delete is visible here.
+imapsync behaves the same way.
+
+`--full` remains available and ignores the shortcut entirely:
 
 ```sh
 imapsync-go sync ... --full

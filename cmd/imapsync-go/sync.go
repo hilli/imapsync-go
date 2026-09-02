@@ -103,6 +103,7 @@ type syncFlags struct {
 	full          bool
 	resyncFlags   bool
 	noResyncFlags bool
+	verifyDest    bool
 	subscribe     bool
 
 	delete2       bool
@@ -197,6 +198,10 @@ watch for authentication failures.`,
 	// drop-in. The positive one carries the default so --help states it.
 	cmd.Flags().BoolVar(&f.resyncFlags, "resyncflags", true, "bring flags on already-copied messages back into line with the source")
 	cmd.Flags().BoolVar(&f.noResyncFlags, "noresyncflags", false, "leave flags on already-copied messages alone")
+	// Only the positive spelling, unlike the pair above: that pair exists
+	// because imapsync has both, and this option is ours. --verify-dest=false
+	// is the way off.
+	cmd.Flags().BoolVar(&f.verifyDest, "verify-dest", true, "check the destination still holds the copies the state database recorded, and copy back any it does not")
 	cmd.Flags().BoolVar(&f.subscribe, "subscribe", true, "subscribe to destination folders as they are created, so clients show them")
 	cmd.Flags().BoolVar(&f.delete2, "delete2", false, "delete destination messages whose source counterpart is gone")
 	cmd.Flags().Float64Var(&f.deleteCeiling, "delete2-ceiling", 0.10, "refuse to delete more than this fraction of a folder's copied messages in one run")
@@ -290,6 +295,7 @@ func runSync(ctx context.Context, out io.Writer, f syncFlags) error {
 		SourceSearch:  sourceSearch,
 		DestSearch:    destSearch,
 		NoResyncFlags: f.noResyncFlags || !f.resyncFlags,
+		NoVerifyDest:  !f.verifyDest,
 		NoSubscribe:   !f.subscribe,
 		Delete2:       resolveDelete2(f, pair),
 		DeleteCeiling: f.deleteCeiling,
@@ -417,6 +423,33 @@ func writeUncopiedNotes(p *printer, report syncer.Report) {
 		p.printf("\n%d %s left out by the message selection. They are not on the destination\nand are not recorded as copied, so they will be picked up by a later run whose\nselection admits them.\n",
 			filtered, plural(filtered, "message"))
 	}
+}
+
+// writeMissingNote reports copies that had gone from the destination.
+//
+// A note rather than a column, because on a healthy account it is always zero
+// and the table is wide already. It reads as a warning because it is the one
+// number in the report that describes something outside this tool deleting
+// mail: the run put those messages there, recorded them, and found them gone.
+// Repairing it silently would hide a destination that is losing mail.
+func writeMissingNote(p *printer, report syncer.Report, dryRun bool) {
+	missing := report.Missing()
+	if missing == 0 {
+		return
+	}
+	// Agreement is done by hand because both halves of the sentence carry the
+	// number: "1 message ... were ... them" reads as a bug in the report, and
+	// this report has already been wrong about a run three times.
+	verb, object, subject, have := "were", "them", "they", "have"
+	if missing == 1 {
+		verb, object, subject, have = "was", "it", "it", "has"
+	}
+	tail := fmt.Sprintf("%s %s been copied again", subject, have)
+	if dryRun {
+		tail = fmt.Sprintf("a real run would copy %s again", object)
+	}
+	p.printf("\n%d %s recorded as copied %s no longer on the destination.\nSomething other than this run removed %s, and %s.\n",
+		missing, plural(missing, "message"), verb, object, tail)
 }
 
 // writeHeaderlessNote reports a server that would not return headers.
@@ -1169,6 +1202,7 @@ func writeSyncReport(out io.Writer, report syncer.Report, elapsed time.Duration,
 		elapsed.Round(time.Millisecond), rate(copied, elapsed, dryRun))
 
 	writeUncopiedNotes(p, report)
+	writeMissingNote(p, report, dryRun)
 	writeHeaderlessNote(p, report)
 	writeConnectionNote(p, conns)
 

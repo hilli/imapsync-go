@@ -133,6 +133,21 @@ type Options struct {
 	// waiting for someone to construct Options without thinking about it.
 	NoResyncFlags bool
 
+	// NoVerifyDest turns off checking that the destination still holds the
+	// copies the state database claims for it.
+	//
+	// Negative for the same reason as NoResyncFlags: verifying is the default,
+	// because without it a copy deleted from the destination behind our back
+	// is never noticed and never re-made. The source UID is recorded as done,
+	// so every later run — including --full, which only re-diffs the source —
+	// counts it as already there and the message is silently lost.
+	//
+	// The name says "verify" rather than "repair" because the check is the
+	// expensive half and the repair is free: a claim the destination cannot
+	// honour is dropped, and the ordinary copy path picks the message up again
+	// as though it had never been sent.
+	NoVerifyDest bool
+
 	// NoSubscribe leaves destination folders this run creates unsubscribed.
 	//
 	// Negative for the same reason as NoResyncFlags: subscribing is imapsync's
@@ -189,6 +204,15 @@ type Syncer struct {
 	// last, and two messages a second apart could fall on opposite sides of the
 	// same bound. imapsync fixes its own start time for the same reason.
 	started time.Time
+	// destStatus is what LIST reported about each destination folder, by name.
+	// Written by plan before any folder starts and only read afterwards, which
+	// is what makes it safe to share across the folder workers.
+	//
+	// The counts go stale the moment the run starts appending, and that is
+	// harmless: the only reader compares them against claims recorded by
+	// earlier runs, so a count that is too low by this run's own copies cannot
+	// make it miss anything — it can only make it look, and looking is correct.
+	destStatus map[string]imapx.Folder
 }
 
 // New returns a syncer over two connection pools.
@@ -258,6 +282,13 @@ type FolderReport struct {
 	// Not a failure: there is nothing at that number to copy, and there never
 	// will be.
 	Vanished int
+	// Missing is how many copies the state database claimed on the destination
+	// that the destination no longer held. They are re-copied by the ordinary
+	// path, so most runs will see this alongside an equal rise in Copied — but
+	// it is named for the observation rather than the remedy, because a folder
+	// can notice them and then fail to copy them, and the two numbers are worth
+	// being able to disagree.
+	Missing int
 	// Filtered is how many the message selection left out. Like Vanished this
 	// is neither work done nor work failed, but unlike Vanished it can change
 	// its mind: a message excluded by --minage today is copied once it is old
@@ -327,6 +358,22 @@ func (r Report) Vanished() int {
 	n := 0
 	for _, f := range r.Folders {
 		n += f.Vanished
+	}
+	return n
+}
+
+// Missing sums the destination copies that had gone from under a recorded
+// claim.
+//
+// Reported on its own because it is the one number here that describes the
+// destination changing behind the run's back rather than anything the run or
+// the source did. A non-zero value on a healthy account is worth someone
+// asking about: it means mail was deleted from the destination by something
+// that is not this tool.
+func (r Report) Missing() int {
+	n := 0
+	for _, f := range r.Folders {
+		n += f.Missing
 	}
 	return n
 }
@@ -693,9 +740,19 @@ func (s *Syncer) plan(ctx context.Context) (folder.Plan, error) {
 	if err != nil {
 		return folder.Plan{}, fmt.Errorf("listing source folders: %w", err)
 	}
-	dstFolders, dstDelim, err := s.list(ctx, s.dst)
+	// The destination list carries STATUS, the source list does not. The counts
+	// are what lets the fast path notice a folder that has lost copies, and
+	// only the destination can lose them. With LIST-STATUS this is the same
+	// round trip either way; without it, it is one STATUS per destination
+	// folder, paid once per run against a check that would otherwise never fire
+	// on the folders that need it most.
+	dstFolders, dstDelim, err := s.listWithStatus(ctx, s.dst, !s.opts.NoVerifyDest)
 	if err != nil {
 		return folder.Plan{}, fmt.Errorf("listing destination folders: %w", err)
+	}
+	s.destStatus = make(map[string]imapx.Folder, len(dstFolders))
+	for _, f := range dstFolders {
+		s.destStatus[f.Name] = f
 	}
 
 	opts := s.opts.Folders
@@ -716,14 +773,19 @@ func (s *Syncer) plan(ctx context.Context) (folder.Plan, error) {
 }
 
 // list enumerates one account's mailboxes and settles its hierarchy delimiter.
-func (s *Syncer) list(ctx context.Context, p *pool.Pool) (folders []imapx.Folder, delim string, err error) {
+func (s *Syncer) list(ctx context.Context, p *pool.Pool) ([]imapx.Folder, string, error) {
+	return s.listWithStatus(ctx, p, false)
+}
+
+// listWithStatus is list, optionally asking for per-folder message counts.
+func (s *Syncer) listWithStatus(ctx context.Context, p *pool.Pool, withStatus bool) (folders []imapx.Folder, delim string, err error) {
 	lease, err := p.Acquire(ctx, "")
 	if err != nil {
 		return nil, "", fmt.Errorf("acquiring connection: %w", err)
 	}
 	defer func() { lease.Release(err) }()
 
-	folders, err = lease.Conn().ListFolders(ctx, imapx.ListOptions{})
+	folders, err = lease.Conn().ListFolders(ctx, imapx.ListOptions{WithStatus: withStatus})
 	if err != nil {
 		return nil, "", err
 	}
@@ -1212,14 +1274,59 @@ func flagText(flags []string) string {
 	return strings.Join(out, " ")
 }
 
-// unchanged reports whether the fast path applies to this folder.
+// canSkip reports whether the fast path applies to this folder.
+//
+// The source's answer is not enough on its own, and believing it was is what
+// made the first version of the destination check almost useless. Nothing about
+// the source moves when something deletes a copy at the far end, so the folders
+// where verification matters most are exactly the folders whose modification
+// sequence is still sitting where the last run left it. Measured against mox:
+// delete one destination copy and an ordinary run reported "folder unchanged"
+// and copied nothing, while --full repaired it.
+//
+// So the destination gets a vote, and it costs nothing per folder: plan already
+// listed every destination mailbox, and it asked for STATUS while it was there.
+// A claim count above what that mailbox holds is proof copies are gone, and the
+// folder goes down the slow path to find out which.
+func (s *Syncer) canSkip(ctx context.Context, row state.Folder, src imapx.Mailbox, dest string) (bool, error) {
+	if !s.unchanged(row, src) {
+		return false, nil
+	}
+	if s.opts.NoVerifyDest {
+		return true, nil
+	}
+	// A server that would not say, or a folder LIST did not mention, leaves the
+	// fast path exactly as it was before this existed. Reading silence as
+	// "something may be missing" would be the safe-looking choice and the wrong
+	// one: it would send every folder of every run down the slow path on any
+	// server without a usable STATUS, which is the opposite of what a check
+	// justified by costing nothing is allowed to do.
+	//
+	// This is also what enforces --verify-dest=false a second time, because
+	// plan does not ask for STATUS when verification is off and every count
+	// therefore arrives nil. That makes the check above a barrier no test can
+	// distinguish from its absence, and it is kept deliberately: the counts are
+	// generally useful, and the first change that populates them for some other
+	// reason would otherwise turn the opt-out back on without anyone noticing.
+	st, ok := s.destStatus[dest]
+	if !ok || st.NumMessages == nil {
+		return true, nil
+	}
+	claimed, err := s.db.ClaimedCount(ctx, row.ID, src.UIDValidity, st.UIDValidity)
+	if err != nil {
+		return false, fmt.Errorf("counting claimed destination messages: %w", err)
+	}
+	return claimed <= int(*st.NumMessages), nil
+}
+
+// unchanged reports whether the source has moved since the watermark was
+// earned.
 //
 // Every condition here is load-bearing. A watermark of zero is a server that
 // does not report modification sequences, or a folder that has never completed;
 // a UIDVALIDITY that has moved means the stored sequence describes a mailbox
 // that no longer exists; and --full is how someone who suspects the destination
-// has drifted asks for everything to be checked, since nothing about the source
-// can reveal a message deleted at the far end.
+// has drifted asks for everything to be checked.
 func (s *Syncer) unchanged(row state.Folder, src imapx.Mailbox) bool {
 	// A folder whose deletions are not carried out up to this same point has
 	// changed in a way this run cares about, whatever the modseq says.
@@ -1266,7 +1373,11 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	// On an account of 144 folders and 776k messages this is most of a repeat
 	// run: without it every folder pays for enumerating every UID it holds,
 	// against a server that is charging by the round trip.
-	if s.unchanged(row, srcBox) {
+	skip, err := s.canSkip(ctx, row, srcBox, pair.Dest)
+	if err != nil {
+		return nil, err
+	}
+	if skip {
 		lv.report.AlreadyDone = int(srcBox.NumMessages)
 		s.log.Info("folder unchanged", "source", pair.Source, "dest", pair.Dest,
 			"messages", srcBox.NumMessages, "modseq", srcBox.HighestModSeq)
@@ -1280,34 +1391,16 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 	defer func() { dstLease.Release(err) }()
 	dst := dstLease.Conn()
 
-	dstBox, err := dst.Select(ctx, pair.Dest, imapx.SelectOptions{})
+	dstBox, kept, err := s.openDest(ctx, dst, pair, row.ID, srcBox.UIDValidity)
 	if err != nil {
-		return nil, fmt.Errorf("selecting destination mailbox: %w", err)
-	}
-	if dstBox.ReadOnly {
-		return nil, fmt.Errorf("destination mailbox %q is read-only", pair.Dest)
+		return nil, err
 	}
 
-	kept, err := s.db.FenceUIDValidity(ctx, row.ID, srcBox.UIDValidity, dstBox.UIDValidity)
-	if err != nil {
-		return nil, fmt.Errorf("fencing UIDVALIDITY: %w", err)
+	// Settle what the database claims about the destination before diffing
+	// against it.
+	if err := s.reconcile(ctx, src, dst, pair, row.ID, srcBox, dstBox, kept, lv); err != nil {
+		return nil, err
 	}
-	if !kept {
-		// Not an error: the server renumbered the mailbox, which it is entitled
-		// to do. Every UID we hold now refers to a different message or to
-		// none, so the run falls back to identity matching for this folder.
-		s.log.Warn("UIDVALIDITY changed; falling back to identity matching",
-			"source", pair.Source, "src_uidvalidity", srcBox.UIDValidity, "dst_uidvalidity", dstBox.UIDValidity)
-	}
-
-	// Suspects first. An in-flight row may already exist on the destination,
-	// and copying it again is exactly the duplication this tool exists to
-	// avoid.
-	adopted, err := s.recover(ctx, src, dst, row.ID, srcBox, dstBox)
-	if err != nil {
-		return nil, fmt.Errorf("recovering in-flight messages: %w", err)
-	}
-	lv.report.Adopted += adopted
 
 	known, err := s.db.SyncedUIDs(ctx, row.ID, srcBox.UIDValidity)
 	if err != nil {
@@ -1357,6 +1450,154 @@ func (s *Syncer) prepareFolder(ctx context.Context, pair folder.Pair, lv *live) 
 		}
 	}
 	return p, nil
+}
+
+// openDest selects the destination mailbox and settles whether the UID map
+// recorded for it still describes the mailbox that is there.
+//
+// The two belong together because the answer to the second question is only
+// meaningful for the mailbox the first one just opened: UIDVALIDITY is a
+// property of this SELECT, and fencing against a number read at any other
+// moment would be fencing against a different mailbox.
+func (s *Syncer) openDest(ctx context.Context, dst imapx.Conn, pair folder.Pair, folderID int64, srcUIDValidity uint32) (imapx.Mailbox, bool, error) {
+	dstBox, err := dst.Select(ctx, pair.Dest, imapx.SelectOptions{})
+	if err != nil {
+		return imapx.Mailbox{}, false, fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+	if dstBox.ReadOnly {
+		return imapx.Mailbox{}, false, fmt.Errorf("destination mailbox %q is read-only", pair.Dest)
+	}
+
+	kept, err := s.db.FenceUIDValidity(ctx, folderID, srcUIDValidity, dstBox.UIDValidity)
+	if err != nil {
+		return imapx.Mailbox{}, false, fmt.Errorf("fencing UIDVALIDITY: %w", err)
+	}
+	if !kept {
+		// Not an error: the server renumbered the mailbox, which it is entitled
+		// to do. Every UID we hold now refers to a different message or to
+		// none, so the run falls back to identity matching for this folder.
+		s.log.Warn("UIDVALIDITY changed; falling back to identity matching",
+			"source", pair.Source, "src_uidvalidity", srcUIDValidity, "dst_uidvalidity", dstBox.UIDValidity)
+	}
+	return dstBox, kept, nil
+}
+
+// reconcile brings the state database's picture of the destination into line
+// with the destination itself, before anything is diffed against it.
+//
+// Two things can make that picture wrong, and they are opposites. A row may
+// claim less than the destination holds, because an append's outcome was never
+// learned — that is recover, and believing it would copy the message twice. Or
+// a row may claim more than the destination holds, because something deleted a
+// copy behind our back — that is verifyClaims, and believing it loses the
+// message for good.
+//
+// Both must finish before SyncedUIDs is read further down. Each of them can
+// change what the recorded states are, and a diff built from states read
+// beforehand would be a diff against a picture the run had already corrected.
+func (s *Syncer) reconcile(ctx context.Context, src, dst imapx.Conn, pair folder.Pair, folderID int64, srcBox, dstBox imapx.Mailbox, kept bool, lv *live) error {
+	// Suspects first. An in-flight row may already exist on the destination,
+	// and copying it again is exactly the duplication this tool exists to
+	// avoid.
+	adopted, err := s.recover(ctx, src, dst, folderID, srcBox, dstBox)
+	if err != nil {
+		return fmt.Errorf("recovering in-flight messages: %w", err)
+	}
+	lv.report.Adopted += adopted
+
+	// Then the claims, but not when the fence went the other way: !kept means
+	// every row for this folder was just invalidated, so there is no claim left
+	// to check and the whole mailbox is about to be matched by identity anyway.
+	if !kept {
+		return nil
+	}
+	missing, err := s.verifyClaims(ctx, dst, pair, folderID, srcBox, dstBox)
+	if err != nil {
+		return err
+	}
+	lv.report.Missing += missing
+	return nil
+}
+
+// verifyClaims checks that the destination still holds the copies this folder
+// claims, and drops the claims it cannot honour.
+//
+// Without this a copy deleted from the destination behind our back is lost for
+// good. The source UID is recorded as done, so triage counts it as already
+// there on every later run — including --full, which re-diffs the source and
+// never asks the destination anything. Measured before this existed: sync two
+// messages, delete one destination copy, and neither an ordinary run nor a
+// --full run ever put it back.
+//
+// The check is one round trip, so it is not made unconditionally. The count is
+// the gate, and it is sound in one direction only: a destination may hold
+// messages we never put there, so claims *below* the mailbox's message count
+// prove nothing, while claims *above* it prove copies are gone. That catches
+// the case that actually happens — something deleted mail from the destination
+// — for free, and --full buys the complete answer for those who want it.
+//
+// Not reached at all by a folder the fast path skipped, because the source's
+// modification sequence has not moved and nothing here looks at the source.
+// That is a real gap rather than an oversight, and --full is its answer.
+func (s *Syncer) verifyClaims(ctx context.Context, dst imapx.Conn, pair folder.Pair, folderID int64, srcBox, dstBox imapx.Mailbox) (int, error) {
+	if s.opts.NoVerifyDest {
+		return 0, nil
+	}
+
+	claimed, err := s.db.ClaimedCount(ctx, folderID, srcBox.UIDValidity, dstBox.UIDValidity)
+	if err != nil {
+		return 0, fmt.Errorf("counting claimed destination messages: %w", err)
+	}
+	if claimed == 0 {
+		return 0, nil
+	}
+	if !s.opts.Full && claimed <= int(dstBox.NumMessages) {
+		return 0, nil
+	}
+
+	gone, err := s.unhonoured(ctx, dst, folderID, srcBox, dstBox)
+	if err != nil {
+		return 0, err
+	}
+	if len(gone) == 0 {
+		return 0, nil
+	}
+
+	// Dropping the row is the whole repair. triage reads the recorded states
+	// after this returns, finds nothing for these source UIDs, and puts them on
+	// the copy list, so they take the ordinary path as though they had never
+	// been sent.
+	if err := s.db.ForgetMessages(ctx, folderID, srcBox.UIDValidity, gone); err != nil {
+		return 0, fmt.Errorf("dropping claims the destination could not honour: %w", err)
+	}
+	s.log.Warn("destination is missing copies this run recorded; copying them again",
+		"source", pair.Source, "dest", pair.Dest, "missing", len(gone))
+	return len(gone), nil
+}
+
+// unhonoured lists the source UIDs whose recorded destination copy is no longer
+// there.
+func (s *Syncer) unhonoured(ctx context.Context, dst imapx.Conn, folderID int64, srcBox, dstBox imapx.Mailbox) ([]uint32, error) {
+	uids, err := dst.AllUIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("enumerating destination messages: %w", err)
+	}
+	present := make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		present[uid] = struct{}{}
+	}
+
+	mirrors, err := s.db.Mirrored(ctx, folderID, srcBox.UIDValidity, dstBox.UIDValidity)
+	if err != nil {
+		return nil, fmt.Errorf("reading the message map: %w", err)
+	}
+	var gone []uint32
+	for _, m := range mirrors {
+		if _, ok := present[m.DstUID]; !ok {
+			gone = append(gone, m.SrcUID)
+		}
+	}
+	return gone, nil
 }
 
 // triage sorts what the source listed into what still needs copying, counting
@@ -2349,10 +2590,24 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 		return fr, fmt.Errorf("enumerating source messages: %w", err)
 	}
 
+	missing, err := s.dryRunVerify(ctx, pair, row.ID, srcBox)
+	if err != nil {
+		return fr, err
+	}
+
 	todo := make([]uint32, 0, len(uids))
 	for _, uid := range uids {
 		switch known[uid] {
 		case state.StateDone:
+			// A claim the destination cannot honour is work a real run would
+			// do, so it belongs on the copy list rather than in the settled
+			// count. Saying "already done" here is the same silent lie the
+			// verification exists to remove, only quieter for being advisory.
+			if _, gone := missing[uid]; gone {
+				fr.Missing++
+				todo = append(todo, uid)
+				continue
+			}
 			fr.AlreadyDone++
 		case state.StateGone:
 			fr.Vanished++
@@ -2376,6 +2631,49 @@ func (s *Syncer) dryRunFolder(ctx context.Context, pair folder.Pair) (_ FolderRe
 		}
 	}
 	return fr, nil
+}
+
+// dryRunVerify names the source UIDs whose recorded destination copy is gone,
+// without dropping a single claim.
+//
+// The read is the same as a real run's; only the repair is withheld, which is
+// what makes it a dry run. It selects the destination read-only, and only ever
+// on a folder that already exists — pair.CreateDest returned long before this,
+// because a dry run that brings a destination folder into being is the bug
+// v0.1.1 fixed and this is the code path that would repeat it.
+func (s *Syncer) dryRunVerify(ctx context.Context, pair folder.Pair, folderID int64, srcBox imapx.Mailbox) (_ map[uint32]struct{}, err error) {
+	if s.opts.NoVerifyDest {
+		return nil, nil
+	}
+
+	lease, err := s.dst.Acquire(ctx, pair.Dest)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring destination connection: %w", err)
+	}
+	defer func() { lease.Release(err) }()
+
+	dstBox, err := lease.Conn().Select(ctx, pair.Dest, imapx.SelectOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("selecting destination mailbox: %w", err)
+	}
+
+	claimed, err := s.db.ClaimedCount(ctx, folderID, srcBox.UIDValidity, dstBox.UIDValidity)
+	if err != nil {
+		return nil, fmt.Errorf("counting claimed destination messages: %w", err)
+	}
+	if claimed == 0 || (!s.opts.Full && claimed <= int(dstBox.NumMessages)) {
+		return nil, nil
+	}
+
+	gone, err := s.unhonoured(ctx, lease.Conn(), folderID, srcBox, dstBox)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint32]struct{}, len(gone))
+	for _, uid := range gone {
+		out[uid] = struct{}{}
+	}
+	return out, nil
 }
 
 // dryRunFilter moves the messages the selection excludes out of the "to copy"

@@ -812,3 +812,53 @@ func TestMirroredReadsOnlyTheFolderAndUIDValidityAskedFor(t *testing.T) {
 		t.Errorf("Mirrored()[7].DstUID = %d, want 70", got[7].DstUID)
 	}
 }
+
+// TestClaimedCountAsksTheSameQuestionAsMirrored stands over the scoping that
+// makes the count usable as a floor.
+//
+// The caller reads a count above the destination mailbox's message count as
+// proof that copies are gone, and then pays for a full enumeration to find
+// them. A widened count makes that proof false: rows from another folder, an
+// earlier source UIDVALIDITY, or a destination that has since been renumbered
+// would inflate it, and every run would enumerate the destination for nothing.
+// A narrowed one is worse and silent -- the count drops below the mailbox and
+// the check stops looking, which is the state this whole feature exists to
+// remove.
+//
+// It is asserted against len(Mirrored) rather than a literal, because the two
+// must answer the same question: the count decides whether the enumeration
+// happens and Mirrored decides what it finds, so they cannot be allowed to
+// disagree about which rows are in scope.
+func TestClaimedCountAsksTheSameQuestionAsMirrored(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	f := seedFolder(t, db, 111, 222)
+	other := seedFolderNamed(t, db, "Other", 111, 222)
+	seedDone(t, db, f.ID, 111, 7, 222, 70)
+	seedDone(t, db, f.ID, 111, 8, 222, 71)
+	seedDone(t, db, other.ID, 111, 9, 222, 72) // another folder
+	seedDone(t, db, f.ID, 110, 10, 222, 73)    // an earlier source UIDVALIDITY
+	seedDone(t, db, f.ID, 111, 11, 221, 74)    // an earlier destination UIDVALIDITY
+
+	got, err := db.ClaimedCount(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("ClaimedCount() error = %v", err)
+	}
+	if got != 2 {
+		t.Errorf("ClaimedCount() = %d, want 2: a row outside the folder or either "+
+			"UIDVALIDITY was counted as a claim on this destination", got)
+	}
+
+	mirrors, err := db.Mirrored(ctx, f.ID, 111, 222)
+	if err != nil {
+		t.Fatalf("Mirrored() error = %v", err)
+	}
+	if got != len(mirrors) {
+		t.Errorf("ClaimedCount() = %d but Mirrored() returned %d rows; the count that "+
+			"decides whether to enumerate must scope identically to the read that follows it",
+			got, len(mirrors))
+	}
+}
