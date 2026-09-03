@@ -1067,7 +1067,8 @@ against [hilli/homebrew-tap] with the updated cask.
 ```sh
 task release-check   # validate .goreleaser.yaml
 task release-test    # full local snapshot into dist/, nothing published
-git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+task all             # lint, build, test, regenerate docs and completions
+git tag -a v1.2.3 -m "v1.2.3 — what changed" && git push origin v1.2.3
 ```
 
 The workflow needs a `PACKAGES_TOKEN` repository secret with write access to
