@@ -49,8 +49,8 @@ type Options struct {
 	Select imapx.SelectOptions
 
 	// OnShrink, if set, is told when the pool gives up capacity. It exists so a
-	// run can report the width it settled at, which is the only evidence that
-	// says whether growing back would ever be worth building.
+	// run can report the width it finished on, which is what the next run's
+	// connection flag should say.
 	OnShrink func(from, to int, cause error)
 }
 

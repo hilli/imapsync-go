@@ -8,11 +8,11 @@ per connection, so throughput comes from running many connections and slicing
 work across them — folder-parallel *and* intra-folder parallel, so a single
 200k-message INBOX still saturates the available connections.
 
-> **Status:** M0–M5 complete. `probe` reports what a server supports, `sync`
-> performs a correct, resumable, concurrent one-way copy across many
-> connections, `--delete2` mirrors deletions, `--max-size`/`--max-age` and
-> their opposites select which messages move, and `compat` runs imapsync
-> command lines. See [the design document](docs/plans/2026-08-27-imapsync-go-design.md).
+Every section below describes behaviour that exists. What `imapsync-go` does
+with each of imapsync's 218 options is listed in
+[`docs/imapsync-options.md`](docs/imapsync-options.md), which is generated from
+the table the shim executes rather than written by hand, so it cannot drift.
+The reasoning behind the design is in [`docs/plans/`](docs/plans).
 
 ## Install
 
@@ -344,8 +344,9 @@ measurement of that server anyone has:
 ```
 The destination server would not hold 16 connections; the run ended on 12.
 That is where the width finished rather than a fixed limit: it narrows when the
-server refuses and climbs back while it does not. Pass --dest-connections=12
-next time to start nearer and skip the opening refusals.
+server refuses and climbs back while it does not.
+Pass --dest-connections=12 next time to start nearer and skip
+the opening refusals.
 ```
 
 The pool climbs back, one connection at a time, once a refusal is half a minute
@@ -409,7 +410,7 @@ pasted straight back into the flag:
 ```
 Rate limited to 1MiB/second.
 Workers waited 4m12s on it in total, summed across them, having moved
-1.043GiB of message data.
+1.044GiB of message data.
 ```
 
 The wait is summed across workers, so it routinely exceeds the wall clock — with

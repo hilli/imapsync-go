@@ -207,11 +207,20 @@ the flag, `swallowed` is frozen and it drains `cap - swallowed`.
 
 ## 6. Scope
 
-**Cut: growth.** Additive increase is not built. The wall is a stable count, so a
-run that finds it should sit under it. The cost of the omission is stated plainly
-because it is real: **shrinking is permanent for the life of a run**, so a one-off
-crowding at minute three of a nine-hour run costs the remaining nine hours. §8
-lists what a real run must show before growth is worth building.
+**Cut: growth.** *(Superseded — growth was built on 2026-09-02; see the end of
+§8.2. The reasoning below is kept because the premise it rests on turned out to
+be the false one, and that is the finding.)*
+
+Additive increase is not built. The wall is a stable count, so a run that finds
+it should sit under it. The cost of the omission is stated plainly because it is
+real: **shrinking is permanent for the life of a run**, so a one-off crowding at
+minute three of a nine-hour run costs the remaining nine hours. §8 lists what a
+real run must show before growth is worth building.
+
+The premise — "the wall is a stable count" — is what §8.2 disproved. The same
+mox instance refused past 30, held 36, then refused past 29 inside twelve
+minutes, because the limit is what the other clients on the account are not
+using at that moment. There is no fixed number to sit under.
 
 **Cut: per-host width remembered across runs.** §4.2's "per-side, per-host"
 implies persistence. It is wrong as well as extra — the wall is *shared*, so
@@ -415,8 +424,10 @@ even with perfect instrumentation.
 A knob that does nothing is worse than no knob: it is a setting people tune,
 and measure against, and believe. The block is now honoured, with an explicit
 flag beating it and `auto` starting at 16 — a starting guess, not a
-measurement, because a governor that only ever gives capacity up cannot find a
-limit from below. `probe` measures; the config records what was measured.
+measurement. The governor climbs back as well as narrowing, but never past the
+width it was given, so `auto` still cannot discover a limit above 16: it is a
+ceiling on ambition rather than a number to be grown from. `probe` measures; the
+config records what was measured.
 
 ### The third run: the same account at the width it was configured for
 

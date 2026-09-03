@@ -570,22 +570,23 @@ func writeHeaderlessNote(p *printer, report syncer.Report) {
 
 // autoConnections is the width each side opens when nobody has said otherwise.
 //
-// The governor can only ever give capacity up, so "auto" cannot discover a
-// limit from below — it has to start somewhere and be shrunk toward the wall.
-// That makes the starting number a judgement about strangers' servers, not
-// about any particular one: too low wastes a migration's time, too high spends
-// a burst of refused logins on every server that will not hold it, and some
-// servers count refused logins against you.
+// The governor narrows on a refusal and climbs back while there is not one, but
+// it never climbs past the width it was given, so "auto" cannot discover a
+// limit above this number — it is a ceiling on ambition, not a starting point
+// to be grown from. That makes it a judgement about strangers' servers rather
+// than about any particular one: too low wastes a migration's time, too high
+// spends a burst of refused logins on every server that will not hold it, and
+// some servers count refused logins against you.
 //
 // Sixteen is four times the old source default and twice the old destination
 // one, and sits under every ceiling this tool has actually measured (mox 30,
 // iCloud 48), so it costs a well-provisioned server nothing. A server that
 // caps lower — Dovecot ships a limit of 10 per address — refuses the excess
-// once and the pool settles, which is the half of the governor that is proven.
+// once and the pool narrows to fit, without costing a folder.
 //
-// It is a floor on ambition rather than an answer. Anyone who cares about
-// throughput should run `imapsync-go probe`, which measures the real ceiling,
-// and put that number in the config where it will not have to be rediscovered.
+// Anyone who cares about throughput should run `imapsync-go probe`, which
+// measures the real ceiling, and put that number in the config where it will
+// not have to be rediscovered.
 const autoConnections = 16
 
 // resolveDelete2 decides whether this run may delete destination messages.
@@ -1276,12 +1277,19 @@ func statePath(override string) (string, error) {
 	return filepath.Join(dir, "state.db"), nil
 }
 
-// writeConnectionNote reports the width each side settled on.
+// writeConnectionNote reports the width each side finished on.
 //
-// The width a run settles on is worth more than the run: it is the only
-// measurement of what a server will actually hold, and it is what the next
-// run's connection flag should say. Putting it here means nobody has to infer
-// it from a throughput number.
+// That width is worth more than the run: it is the only measurement of what a
+// server will actually hold, and it is what the next run's connection flag
+// should say. Putting it here means nobody has to infer it from a throughput
+// number.
+//
+// It is where the width finished rather than a width the run settled on. The
+// governor narrows on a refusal and climbs back while there is not one, and the
+// ceiling it is chasing moves: the same mox instance refused past 30, held 36,
+// then refused past 29 inside twelve minutes, because the limit is what the
+// other clients on the account are not using at that moment. So the number is a
+// good place to start next time and not a fact about the server.
 //
 // Both outcomes are reported, not just the narrowing one. A run of 776,791
 // messages was unable to answer whether the pool ever shrinks at a realistic
@@ -1294,7 +1302,7 @@ func writeConnectionNote(p *printer, conns connections) {
 	for _, c := range conns {
 		switch {
 		case c.got < c.asked:
-			p.printf("\nThe %s server would not hold %d connections; the run ended on %d.\nThat is where the width finished rather than a fixed limit: it narrows when the\nserver refuses and climbs back while it does not. Pass --%s=%d next time to\nstart nearer and skip the opening refusals.\n",
+			p.printf("\nThe %s server would not hold %d connections; the run ended on %d.\nThat is where the width finished rather than a fixed limit: it narrows when the\nserver refuses and climbs back while it does not.\nPass --%s=%d next time to start nearer and skip\nthe opening refusals.\n",
 				c.side, c.asked, c.got, c.flag, c.got)
 		default:
 			p.printf("\nThe %s server held all %d connections.\n", c.side, c.got)

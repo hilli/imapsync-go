@@ -1258,8 +1258,9 @@ pure function, and the mutations that matter would stop being observable.
   tuned against nothing. Deferring it was right — when a wall was finally
   measured it was on the destination, not the source, and it was a hard
   connection count rather than a throttle, so §4.2's controller would have been
-  built against the wrong thing. A shrink-only governor was built afterwards;
-  see [its design](2026-08-28-connection-governor-design.md).
+  built against the wrong thing. A governor was built afterwards — shrink-only at
+  first, and growing again once a moving ceiling was measured; see
+  [its design](2026-08-28-connection-governor-design.md).
 - **M4** — CONDSTORE fast path, flag sync, `SPECIAL-USE` mapping with name
   fallback (§6). *Done.* `SPECIAL-USE` mapping was already built in M1;
   `--reconcile-every` was dropped in favour of `--full` (§5.6); parallel folder
