@@ -59,7 +59,6 @@ homebrew_casks:
     description: "Concurrent IMAP account synchronisation"
     url:
       template: "https://github.com/hilli/imapsync-go/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
-      verified: "github.com/hilli/imapsync-go/"
     skip_upload: false
     completions:
       bash: completions/imapsync-go.bash
